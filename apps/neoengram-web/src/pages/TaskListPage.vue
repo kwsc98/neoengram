@@ -5,7 +5,7 @@ import { computed, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
 import { queryTaskList, queryTaskSummary } from '@/api/operations';
-import type { TaskKind, TaskState, TaskView } from '@/api/types';
+import type { TaskIntent, TaskState, TaskView } from '@/api/types';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import { formatTime } from '@/utils/format';
@@ -17,7 +17,7 @@ const projectId = ref(String(route.query.project_id ?? ''));
 const artifactId = ref(String(route.query.artifact_id ?? ''));
 const commitId = ref(String(route.query.commit_id ?? ''));
 const selectedStates = ref<TaskState[]>(parseList<TaskState>(route.query.state));
-const selectedKinds = ref<TaskKind[]>(parseList<TaskKind>(route.query.task_kind));
+const selectedKinds = ref<TaskIntent[]>(parseList<TaskIntent>(route.query.intent_kind));
 const cursor = ref<string>();
 const cursorHistory = ref<string[]>([]);
 
@@ -29,27 +29,51 @@ const stateOptions: Array<{ value: TaskState; label: string }> = [
   { value: 'stalled', label: '已停滞' },
   { value: 'succeeded', label: '已完成' },
   { value: 'failed', label: '失败' },
+  { value: 'cancelling', label: '取消中' },
   { value: 'cancelled', label: '已取消' },
 ];
 
-const kindOptions: Array<{ value: TaskKind; label: string }> = [
+const kindOptions: Array<{ value: TaskIntent; label: string }> = [
+  { value: 'project.create', label: '创建项目' },
+  { value: 'project.delete', label: '删除项目' },
+  { value: 'project.restore', label: '恢复项目' },
+  { value: 'artifact.create', label: '创建资产' },
+  { value: 'artifact.delete', label: '删除资产' },
+  { value: 'artifact.restore', label: '恢复资产' },
   { value: 'workspace.create', label: '创建工作区' },
-  { value: 'workspace.materialize', label: '物化工作区' },
-  { value: 'precommit.check', label: 'Pre-commit 校验' },
-  { value: 'add.scan', label: '扫描 Add' },
-  { value: 'commit.create', label: '创建 Commit' },
+  { value: 'workspace.delete', label: '删除工作区' },
+  { value: 'workspace.restore', label: '恢复工作区' },
   { value: 'snapshot.create', label: '创建快照' },
-  { value: 'snapshot.delivery.materialize', label: '物化快照交付' },
+  { value: 'snapshot.delete', label: '删除快照' },
+  { value: 'snapshot.restore', label: '恢复快照' },
+  { value: 'storage_volume.create', label: '登记存储卷' },
+  { value: 'storage_volume.delete', label: '注销存储卷' },
+  { value: 'storage_volume.restore', label: '恢复存储卷' },
+  { value: 's3_access_point.create', label: '创建 S3 入口' },
+  { value: 's3_access_point.delete', label: '删除 S3 入口' },
+  { value: 's3_access_point.enable', label: '启用 S3 入口' },
+  { value: 's3_access_point.disable', label: '停用 S3 入口' },
+  { value: 'commit.validate', label: 'Commit 校验' },
+  { value: 'commit.create', label: '创建 Commit' },
   { value: 'commit.materialize', label: '物化 Commit' },
-  { value: 'integrity.scan', label: '完整性扫描' },
-  { value: 'resource.repair', label: '资源修复' },
-  { value: 'catalog.lifecycle', label: '资源生命周期' },
-  { value: 'storage.lifecycle', label: '存储生命周期' },
-  { value: 'gateway.lifecycle', label: 'Gateway 生命周期' },
-  { value: 's3.lifecycle', label: 'S3 生命周期' },
+  { value: 'agent_enrollment.create', label: '登记 Agent' },
+  { value: 'agent_enrollment.delete', label: '移除 Agent' },
+  { value: 'gateway_pool.create', label: '创建 Gateway 池' },
+  { value: 'gateway_pool.delete', label: '删除 Gateway 池' },
+  { value: 'gateway_replica.create', label: '创建 Gateway 副本' },
+  { value: 'gateway_replica.delete', label: '删除 Gateway 副本' },
+  { value: 's3_credential.create', label: '创建 S3 凭据' },
+  { value: 's3_credential.revoke', label: '撤销 S3 凭据' },
 ];
 
-const activeStates = new Set<TaskState>(['queued', 'running', 'waiting', 'verifying', 'stalled']);
+const activeStates = new Set<TaskState>([
+  'queued',
+  'running',
+  'waiting',
+  'verifying',
+  'stalled',
+  'cancelling',
+]);
 
 const listRequest = computed(() => ({
   tenant_id: tenantId.value,
@@ -58,7 +82,7 @@ const listRequest = computed(() => ({
   ...(artifactId.value ? { artifact_id: artifactId.value } : {}),
   ...(commitId.value ? { commit_id: commitId.value } : {}),
   ...(selectedStates.value.length ? { state: selectedStates.value } : {}),
-  ...(selectedKinds.value.length ? { task_kind: selectedKinds.value } : {}),
+  ...(selectedKinds.value.length ? { intent_kind: selectedKinds.value } : {}),
   ...(cursor.value ? { cursor: cursor.value } : {}),
 }));
 
@@ -86,7 +110,7 @@ const summaryQuery = useQuery({
       ...(artifactId.value ? { artifact_id: artifactId.value } : {}),
       ...(commitId.value ? { commit_id: commitId.value } : {}),
       ...(selectedStates.value.length ? { state: selectedStates.value } : {}),
-      ...(selectedKinds.value.length ? { task_kind: selectedKinds.value } : {}),
+      ...(selectedKinds.value.length ? { intent_kind: selectedKinds.value } : {}),
     }),
 });
 
@@ -100,7 +124,7 @@ watch(
     artifactId.value = String(query.artifact_id ?? '');
     commitId.value = String(query.commit_id ?? '');
     selectedStates.value = parseList<TaskState>(query.state);
-    selectedKinds.value = parseList<TaskKind>(query.task_kind);
+    selectedKinds.value = parseList<TaskIntent>(query.intent_kind);
     cursor.value = undefined;
     cursorHistory.value = [];
   },
@@ -116,7 +140,7 @@ async function applyFilters(): Promise<void> {
       ...(artifactId.value ? { artifact_id: artifactId.value } : {}),
       ...(commitId.value ? { commit_id: commitId.value } : {}),
       ...(selectedStates.value.length ? { state: selectedStates.value.join(',') } : {}),
-      ...(selectedKinds.value.length ? { task_kind: selectedKinds.value.join(',') } : {}),
+      ...(selectedKinds.value.length ? { intent_kind: selectedKinds.value.join(',') } : {}),
     },
   });
 }
@@ -150,7 +174,7 @@ function stateType(state: TaskState): 'success' | 'warning' | 'danger' | 'info' 
   return 'info';
 }
 
-function kindLabel(kind: TaskKind): string {
+function kindLabel(kind: TaskIntent): string {
   return kindOptions.find((option) => option.value === kind)?.label ?? kind;
 }
 
@@ -162,7 +186,7 @@ function progress(task: TaskView): string {
 }
 
 function scope(task: TaskView): string {
-  return task.commit_id ?? task.artifact_id ?? task.playground_id ?? task.snapshot_id ?? '—';
+  return task.primary_resource.resource_id || '—';
 }
 
 function parseList<T extends string>(value: unknown): T[] {
@@ -263,7 +287,7 @@ function parseList<T extends string>(value: unknown): T[] {
           <el-table-column label="任务" min-width="260">
             <template #default="slotProps">
               <button class="resource-link" type="button" @click="openTask(slotProps.row)">
-                <strong>{{ kindLabel(slotProps.row.task_kind) }}</strong>
+                <strong>{{ kindLabel(slotProps.row.intent_kind) }}</strong>
                 <code>{{ slotProps.row.task_id }}</code>
               </button>
             </template>

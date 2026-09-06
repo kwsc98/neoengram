@@ -6,9 +6,9 @@ import {
   supportsArtifactCommitGraph,
   supportsCommitMaterializationV2,
   supportsCommitLayoutSelection,
-  supportsPlaygroundBrowser,
-  supportsPlaygroundMaterialize,
-  supportsPlaygroundPreCommit,
+  supportsWorkspaceBrowser,
+  supportsWorkspaceMaterialize,
+  supportsWorkspacePreCommit,
   supportsSnapshotMaterialize,
   supportsSnapshotDelivery,
   supportsSnapshotDeliveryMode,
@@ -27,9 +27,9 @@ describe('server capability gates', () => {
     const removed = ['aggregate_browser'];
     expect(supportsArtifactCatalog(removed)).toBe(false);
     expect(supportsArtifactCommitGraph(removed)).toBe(false);
-    expect(supportsPlaygroundMaterialize(removed)).toBe(false);
-    expect(supportsPlaygroundBrowser(removed)).toBe(false);
-    expect(supportsPlaygroundPreCommit(removed)).toBe(false);
+    expect(supportsWorkspaceMaterialize(removed)).toBe(false);
+    expect(supportsWorkspaceBrowser(removed)).toBe(false);
+    expect(supportsWorkspacePreCommit(removed)).toBe(false);
     expect(supportsSnapshotMaterialize(removed)).toBe(false);
   });
 
@@ -39,11 +39,11 @@ describe('server capability gates', () => {
     expect(supportsArtifactCommitDiff(['artifact_commit_diff'])).toBe(true);
     expect(supportsCommitMaterializationV2(['artifact_commit_diff'])).toBe(false);
     expect(supportsCommitMaterializationV2(['commit_materialization_v2'])).toBe(true);
-    expect(supportsPlaygroundMaterialize(['playground_materialize'])).toBe(true);
-    expect(supportsPlaygroundBrowser(['playground_materialize'])).toBe(false);
-    expect(supportsPlaygroundBrowser(['playground_browser'])).toBe(true);
-    expect(supportsPlaygroundPreCommit(['playground_precommit'])).toBe(true);
-    expect(supportsPlaygroundMaterialize(['playground_precommit'])).toBe(false);
+    expect(supportsWorkspaceMaterialize(['workspace_materialize'])).toBe(true);
+    expect(supportsWorkspaceBrowser(['workspace_materialize'])).toBe(false);
+    expect(supportsWorkspaceBrowser(['workspace_browser'])).toBe(true);
+    expect(supportsWorkspacePreCommit(['workspace_precommit'])).toBe(true);
+    expect(supportsWorkspaceMaterialize(['workspace_precommit'])).toBe(false);
     expect(supportsSnapshotMaterialize(['commit_materialization_v2'])).toBe(true);
   });
 
@@ -52,9 +52,9 @@ describe('server capability gates', () => {
     expect(supportsArtifactCommitGraph(undefined)).toBe(false);
     expect(supportsArtifactCommitDiff(undefined)).toBe(false);
     expect(supportsCommitMaterializationV2(undefined)).toBe(false);
-    expect(supportsPlaygroundMaterialize(undefined)).toBe(false);
-    expect(supportsPlaygroundBrowser(undefined)).toBe(false);
-    expect(supportsPlaygroundPreCommit(undefined)).toBe(false);
+    expect(supportsWorkspaceMaterialize(undefined)).toBe(false);
+    expect(supportsWorkspaceBrowser(undefined)).toBe(false);
+    expect(supportsWorkspacePreCommit(undefined)).toBe(false);
     expect(supportsSnapshotMaterialize(undefined)).toBe(false);
   });
 

@@ -267,6 +267,7 @@ impl Agent {
         let now = self.clock.now_unix_ms()?;
         let finalized = JobFinalized {
             job_id: record.assignment.job_id.clone(),
+            task_fence: record.assignment.task_fence.clone(),
             assignment_id: record.assignment.assignment_id.clone(),
             assignment_generation: record.assignment.assignment_generation,
             decision_generation: decision.decision_generation,
@@ -401,6 +402,7 @@ impl Agent {
         let publication_digest = prepared.candidate.publication_digest()?;
         let report = JobPrepared::new(
             record.assignment.job_id.clone(),
+            record.assignment.task_fence.clone(),
             record.assignment.assignment_id.clone(),
             record.assignment.assignment_generation,
             record.assignment.expected_index_version.clone(),
@@ -490,6 +492,7 @@ impl Agent {
             let failure = JobFailed {
                 tenant_id: record.assignment.tenant_id.clone(),
                 job_id: record.assignment.job_id.clone(),
+                task_fence: record.assignment.task_fence.clone(),
                 assignment_id: record.assignment.assignment_id.clone(),
                 assignment_generation: record.assignment.assignment_generation,
                 final_state: JobState::Failed,
@@ -591,6 +594,7 @@ impl Agent {
         })?;
         self.reports.send(AgentReport::Accepted(JobAccepted {
             job_id: record.assignment.job_id.clone(),
+            task_fence: record.assignment.task_fence.clone(),
             assignment_id: record.assignment.assignment_id.clone(),
             assignment_generation: record.assignment.assignment_generation,
             accepted_at_unix_ms: UnixMillis::new(accepted_at),
@@ -602,6 +606,7 @@ impl Agent {
     fn send_running(&self, record: &LedgerRecord) -> AgentResult<()> {
         self.reports.send(AgentReport::Progress(JobProgress {
             job_id: record.assignment.job_id.clone(),
+            task_fence: record.assignment.task_fence.clone(),
             assignment_id: record.assignment.assignment_id.clone(),
             assignment_generation: record.assignment.assignment_generation,
             state: JobState::Running,
@@ -649,7 +654,7 @@ fn validate_candidate(record: &LedgerRecord, prepared: &PreparedAdd) -> AgentRes
     let matches_scope = resource.tenant_id == assignment.tenant_id.as_str()
         && resource.project_id == assignment.project_id.as_str()
         && resource.artifact_id == assignment.artifact_id.as_str()
-        && resource.playground_id == assignment.playground_id.as_str()
+        && resource.workspace_id == assignment.workspace_id.as_str()
         && resource.job_id == assignment.job_id.as_str();
     let matches_version = prepared.base_index_version.revision == expected.revision.get()
         && prepared.base_index_version.digest == expected.digest;

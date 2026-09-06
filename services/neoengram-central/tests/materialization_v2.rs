@@ -21,7 +21,7 @@ use neoengram_domain::protocol::{
     object_read_lease_id, staging_lease_id, AgentId, ArtifactId, DecimalU64, EdgeClusterId,
     GatewayPoolId, Generation, IntegrityScanId, LeaseId, MountGeneration, ObjectEncoding,
     ObjectNamespaceId, ObjectReceiptId, PlacementGeneration, PlacementId, PrincipalKind,
-    RouteGeneration, SessionGeneration, StorageVolumeId, TenantId, UnixMillis,
+    RouteGeneration, SessionGeneration, StorageVolumeId, TaskPurpose, TenantId, UnixMillis,
 };
 #[cfg(feature = "authority-sqlite")]
 use sqlx::{sqlite::SqliteConnectOptions, Connection};
@@ -299,6 +299,9 @@ fn job() -> MaterializationJob {
             commit_id: CommitId::from_bytes([9; 32]),
             target_storage_volume_id: StorageVolumeId::new("volume-target").unwrap(),
             coverage_goal: CoverageGoal::Complete,
+            purpose: TaskPurpose::Copy,
+            repair_observation_digest: None,
+            repair_target_placement_generation: None,
         },
         artifact_id: ArtifactId::new("artifact-v2").unwrap(),
         state: MaterializationJobState::Queued,
@@ -390,6 +393,9 @@ fn materialization_receipt(id: &str) -> MaterializationObjectReceipt {
             "task-materialization-v2-attempt-1",
         )
         .unwrap(),
+        task_attempt: Generation::new(1),
+        stage_key: "transfer".to_owned(),
+        stage_attempt: Generation::new(1),
         materialization_id: neoengram_domain::protocol::MaterializationId::new(
             "materialization-v2",
         )
@@ -1254,7 +1260,7 @@ async fn assert_completed_materialization_retry_replans_after_integrity_failure(
         )
         .await
         .unwrap();
-    assert!(!result.replayed);
+    assert!(!result.request_replayed);
     assert_eq!(result.materialization.plan_revision, "2");
     assert_eq!(result.materialization.state, "planning");
     assert_eq!(result.materialization.verified_objects, "1");

@@ -105,13 +105,15 @@ async function submit(): Promise<void> {
   await Promise.all([
     queryClient.invalidateQueries({ queryKey: ['resource-deletions', props.tenantId] }),
     queryClient.invalidateQueries({ queryKey: ['artifacts', props.tenantId] }),
-    queryClient.invalidateQueries({ queryKey: ['playgrounds', props.tenantId] }),
+    queryClient.invalidateQueries({ queryKey: ['workspaces', props.tenantId] }),
     queryClient.invalidateQueries({ queryKey: ['snapshots', props.tenantId] }),
     queryClient.invalidateQueries({ queryKey: ['storage-volumes', props.tenantId] }),
   ]);
   open.value = false;
   emit('deleted', result.data.deletion);
-  ElMessage.success(result.data.replayed ? '已返回原删除任务' : '资源已停止访问并进入回收流程');
+  ElMessage.success(
+    result.data.request_replayed ? '已返回原删除任务' : '资源已停止访问并进入回收流程',
+  );
 }
 </script>
 
@@ -197,7 +199,7 @@ async function submit(): Promise<void> {
 
       <el-form label-position="top" class="dialog-form deletion-confirmation">
         <el-form-item v-if="requiresCascade">
-          <el-checkbox v-model="cascade"> 级联处理该资源依赖的 Snapshot 和 Playground </el-checkbox>
+          <el-checkbox v-model="cascade"> 级联处理该资源依赖的 Snapshot 和 Workspace </el-checkbox>
         </el-form-item>
         <el-form-item v-if="isStorageVolume">
           <el-checkbox v-model="confirmManagedDataErase">

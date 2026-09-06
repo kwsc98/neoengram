@@ -12,8 +12,8 @@ use neoengram_domain::core::{ContentDigest, IndexVersion, LogicalPath};
 use neoengram_domain::protocol::{
     AgentId, AgentMountId, ArtifactId, ArtifactPlacementId, AssignmentGeneration, AssignmentId,
     CommitDataLayout, ControlMessage, EdgeClusterId, Extensions, MountGeneration, OwnerGeneration,
-    PlacementGeneration, PlaygroundId, PrincipalId, PrincipalKind, PrincipalRef, ProjectId,
-    SessionGeneration, StorageVolumeId, TenantId, UnixMillis, WireIndexVersion,
+    PlacementGeneration, PrincipalId, PrincipalKind, PrincipalRef, ProjectId, SessionGeneration,
+    StorageVolumeId, TenantId, UnixMillis, WireIndexVersion, WorkspaceId,
 };
 use tempfile::TempDir;
 
@@ -211,7 +211,7 @@ fn job_spec(job_id: &str, principal: &PrincipalRef) -> AddJobSpec {
         tenant_id: TenantId::new("tenant-a").unwrap(),
         project_id: ProjectId::new("project-a").unwrap(),
         artifact_id: ArtifactId::new("artifact-a").unwrap(),
-        playground_id: PlaygroundId::new("playground-a").unwrap(),
+        workspace_id: WorkspaceId::new("workspace-a").unwrap(),
         expected_index_version: WireIndexVersion::from(
             IndexVersion::from_snapshot(0, &[]).unwrap(),
         ),
@@ -219,6 +219,7 @@ fn job_spec(job_id: &str, principal: &PrincipalRef) -> AddJobSpec {
         deadline_unix_ms: UnixMillis::new(1_000),
         paths: vec![LogicalPath::parse("dataset/file.bin").unwrap()],
         all: false,
+        operation_task_id: None,
         data_layout: CommitDataLayout::FastCdc,
         extensions: Extensions::new(),
     };

@@ -1113,7 +1113,7 @@ fn build_bootstrap_request(
 pub(crate) fn agent_capabilities(config: &AgentConfig, replication_ready: bool) -> Vec<String> {
     let mut capabilities = vec![
         "h2_control_channel_v1".to_owned(),
-        neoengram_domain::protocol::OPERATION_TASK_CAPABILITY_V1.to_owned(),
+        neoengram_domain::protocol::OPERATION_TASK_CAPABILITY_V2.to_owned(),
         "managed_add_v1".to_owned(),
         "single_volume_v1".to_owned(),
         "volume_local_cas_v1".to_owned(),

@@ -271,11 +271,7 @@ pub(crate) fn certificate_state_from_bundle(
         ));
     }
     validate_leaf_certificate(bundle, public_key_spki.as_der())?;
-    if bundle.issuer_chain_der.len() > MAX_AGENT_WORKLOAD_CERTIFICATE_CHAIN_LENGTH {
-        return Err(configuration(
-            "Agent workload certificate chain is too long",
-        ));
-    }
+    validate_issuer_chain(bundle)?;
     let mut certificate_chain_pem = Vec::with_capacity(1 + bundle.issuer_chain_der.len());
     certificate_chain_pem.push(der_to_pem(
         "CERTIFICATE",
@@ -321,6 +317,21 @@ fn validate_leaf_certificate(
             "Agent workload leaf certificate public key is not the Agent key",
         ));
     }
+    let validity = certificate_validity_millis(&certificate, "Agent workload leaf certificate")?;
+    if validity.0 > bundle.not_before_unix_ms.get() || validity.1 < bundle.not_after_unix_ms.get() {
+        return Err(configuration(
+            "Agent workload leaf certificate validity does not cover the bundle window",
+        ));
+    }
+    let eku = certificate
+        .extended_key_usage()
+        .map_err(|_| configuration("Agent workload leaf certificate EKU is invalid"))?
+        .ok_or_else(|| configuration("Agent workload leaf certificate has no EKU"))?;
+    if !eku.value.client_auth {
+        return Err(configuration(
+            "Agent workload leaf certificate is not valid for client authentication",
+        ));
+    }
     let san = certificate
         .subject_alternative_name()
         .map_err(|_| configuration("Agent workload leaf certificate SAN is invalid"))?
@@ -339,6 +350,133 @@ fn validate_leaf_certificate(
         ));
     }
     Ok(())
+}
+
+/// Parses and validates the issuer material before it is persisted as PEM. The configured Gateway
+/// trust bundle remains the source of trust at connection time; these checks ensure a delivered
+/// chain is at least a usable, internally linked X.509 chain and cannot defer malformed material
+/// until the next TLS handshake.
+fn validate_issuer_chain(bundle: &AgentWorkloadCertificateBundle) -> AgentDaemonResult<()> {
+    if bundle.issuer_chain_der.len() > MAX_AGENT_WORKLOAD_CERTIFICATE_CHAIN_LENGTH {
+        return Err(configuration(
+            "Agent workload certificate chain is too long",
+        ));
+    }
+    let (_, leaf) = X509Certificate::from_der(bundle.leaf_certificate_der.as_bytes())
+        .map_err(|_| configuration("Agent workload leaf certificate is not valid DER"))?;
+    let mut chain = Vec::with_capacity(bundle.issuer_chain_der.len());
+    for (index, encoded) in bundle.issuer_chain_der.iter().enumerate() {
+        let (remainder, certificate) =
+            X509Certificate::from_der(encoded.as_bytes()).map_err(|_| {
+                configuration(format!(
+                    "Agent workload issuer certificate {index} is not valid DER"
+                ))
+            })?;
+        if !remainder.is_empty() {
+            return Err(configuration(format!(
+                "Agent workload issuer certificate {index} contains trailing DER data"
+            )));
+        }
+        let _ = certificate_validity_millis(
+            &certificate,
+            &format!("Agent workload issuer certificate {index}"),
+        )?;
+        let basic_constraints = certificate
+            .basic_constraints()
+            .map_err(|_| {
+                configuration(format!(
+                    "Agent workload issuer certificate {index} BasicConstraints is invalid"
+                ))
+            })?
+            .ok_or_else(|| {
+                configuration(format!(
+                    "Agent workload issuer certificate {index} has no BasicConstraints"
+                ))
+            })?;
+        if !basic_constraints.value.ca {
+            return Err(configuration(format!(
+                "Agent workload issuer certificate {index} is not a CA"
+            )));
+        }
+        if let Some(key_usage) = certificate.key_usage().map_err(|_| {
+            configuration(format!(
+                "Agent workload issuer certificate {index} key usage is invalid"
+            ))
+        })? {
+            if !key_usage.value.key_cert_sign() {
+                return Err(configuration(format!(
+                    "Agent workload issuer certificate {index} cannot sign certificates"
+                )));
+            }
+        }
+        chain.push(certificate);
+    }
+
+    let mut child = &leaf;
+    for (index, issuer) in chain.iter().enumerate() {
+        if child.issuer().as_raw() != issuer.subject().as_raw() {
+            return Err(configuration(format!(
+                "Agent workload certificate issuer chain name mismatch at certificate {index}"
+            )));
+        }
+        child
+            .verify_signature(Some(issuer.public_key()))
+            .map_err(|_| {
+                configuration(format!(
+                "Agent workload certificate issuer chain signature mismatch at certificate {index}"
+            ))
+            })?;
+        let child_validity = certificate_validity_millis(
+            child,
+            if index == 0 {
+                "Agent workload leaf certificate"
+            } else {
+                "Agent workload issuer certificate"
+            },
+        )?;
+        let issuer_validity = certificate_validity_millis(
+            issuer,
+            &format!("Agent workload issuer certificate {index}"),
+        )?;
+        if issuer_validity.0 > child_validity.0 || issuer_validity.1 < child_validity.1 {
+            return Err(configuration(format!(
+                "Agent workload issuer certificate {index} validity does not cover its child"
+            )));
+        }
+        child = issuer;
+    }
+
+    // A self-signed final certificate is a root supplied in the delivered chain. Verify it too;
+    // when the root is omitted (as is valid for TLS chains), trust validation remains delegated to
+    // the peer's configured root store.
+    if let Some(root) = chain.last() {
+        if root.issuer().as_raw() == root.subject().as_raw() {
+            root.verify_signature(None).map_err(|_| {
+                configuration("Agent workload issuer chain root signature is invalid")
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn certificate_validity_millis(
+    certificate: &X509Certificate<'_>,
+    description: &str,
+) -> AgentDaemonResult<(u64, u64)> {
+    let not_before = u64::try_from(certificate.validity().not_before.timestamp())
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(1_000))
+        .ok_or_else(|| configuration(format!("{description} notBefore timestamp is invalid")))?;
+    let not_after = u64::try_from(certificate.validity().not_after.timestamp())
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(1_000))
+        .ok_or_else(|| configuration(format!("{description} notAfter timestamp is invalid")))?;
+    if not_after <= not_before {
+        return Err(configuration(format!(
+            "{description} validity window is invalid"
+        )));
+    }
+    Ok((not_before, not_after))
 }
 
 pub(crate) fn rustls_server_auth_client_config(

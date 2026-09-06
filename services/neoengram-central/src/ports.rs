@@ -15,7 +15,7 @@ use neoengram_domain::protocol::{
 };
 use neoengram_domain::protocol::{
     OperationTask, ResourceVersion, SequenceNumber, TaskActor, TaskAttempt, TaskEvent, TaskId,
-    TaskKind, TaskRelation, TaskResourceLink, TaskState,
+    TaskIntent, TaskPurpose, TaskRelation, TaskResourceLink, TaskStage, TaskState,
 };
 
 use crate::{
@@ -28,13 +28,13 @@ use crate::{
     CatalogInsertOutcome, CentralResult, GatewayInsertOutcome, GatewayPoolListRequest,
     GatewayPoolRecord, GatewayReplicaListRequest, GatewayReplicaRecord, IndexKey,
     IndexPublishOutcome, IndexPublishRequest, InitializeIndexSnapshotRequest, JobKey, JobRecord,
-    ObjectPlacementEvidence, PlaygroundInsertRequest, PlaygroundListPage, PlaygroundListRequest,
-    PlaygroundRecord, PreCommitCancelRequest, PreCommitCommitOutcome, PreCommitCommitRequest,
-    PreCommitKey, PreCommitMutationOutcome, PreCommitRecord, PreCommitRestartRequest,
-    PreCommitStartRequest, ProjectListPage, ProjectListRequest, ProjectRecord, PublishedIndex,
-    ReleaseAgentRouteLeaseRequest, RenewAgentRouteLeaseRequest, StagedMetadataBatch,
-    StorageVolumeListPage, StorageVolumeListRequest, StorageVolumeRecord, TenantListPage,
-    TenantListRequest, TenantRecord,
+    ObjectPlacementEvidence, PreCommitCancelRequest, PreCommitCommitOutcome,
+    PreCommitCommitRequest, PreCommitKey, PreCommitMutationOutcome, PreCommitRecord,
+    PreCommitRestartRequest, PreCommitStartRequest, ProjectListPage, ProjectListRequest,
+    ProjectRecord, PublishedIndex, ReleaseAgentRouteLeaseRequest, RenewAgentRouteLeaseRequest,
+    StagedMetadataBatch, StorageVolumeListPage, StorageVolumeListRequest, StorageVolumeRecord,
+    TenantListPage, TenantListRequest, TenantRecord, WorkspaceInsertRequest, WorkspaceListPage,
+    WorkspaceListRequest, WorkspaceRecord,
 };
 
 /// Result of atomically inserting a job or loading the record already stored at its key.
@@ -60,7 +60,7 @@ pub struct TaskMutationOutcome {
 }
 
 /// Stable keyset/list filters for task operations. All optional dimensions are ANDed; values in
-/// `task_kinds` and `states` are ORed within their respective dimension.
+/// `intent_kinds` and `states` are ORed within their respective dimension.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskListRequest {
     pub tenant_id: TenantId,
@@ -68,12 +68,12 @@ pub struct TaskListRequest {
     pub artifact_id: Option<ArtifactId>,
     pub object_namespace_id: Option<neoengram_domain::protocol::ObjectNamespaceId>,
     pub commit_id: Option<neoengram_domain::core::CommitId>,
-    pub playground_id: Option<neoengram_domain::protocol::PlaygroundId>,
+    pub workspace_id: Option<neoengram_domain::protocol::WorkspaceId>,
     pub snapshot_id: Option<neoengram_domain::protocol::SnapshotId>,
     pub storage_volume_id: Option<StorageVolumeId>,
-    pub task_kinds: Vec<TaskKind>,
+    pub intent_kinds: Vec<TaskIntent>,
+    pub purpose: Option<TaskPurpose>,
     pub states: Vec<TaskState>,
-    pub parent_task_id: Option<TaskId>,
     pub created_after_unix_ms: Option<UnixMillis>,
     pub created_before_unix_ms: Option<UnixMillis>,
     pub updated_after_unix_ms: Option<UnixMillis>,
@@ -94,12 +94,12 @@ impl Default for TaskListRequest {
             artifact_id: None,
             object_namespace_id: None,
             commit_id: None,
-            playground_id: None,
+            workspace_id: None,
             snapshot_id: None,
             storage_volume_id: None,
-            task_kinds: Vec::new(),
+            intent_kinds: Vec::new(),
+            purpose: None,
             states: Vec::new(),
-            parent_task_id: None,
             created_after_unix_ms: None,
             created_before_unix_ms: None,
             updated_after_unix_ms: None,
@@ -151,6 +151,7 @@ pub struct TaskSummary {
     pub succeeded: u64,
     pub stalled: u64,
     pub failed: u64,
+    pub cancelling: u64,
     pub cancelled: u64,
 }
 
@@ -165,6 +166,7 @@ impl TaskSummary {
             TaskState::Succeeded => self.succeeded = self.succeeded.saturating_add(1),
             TaskState::Stalled => self.stalled = self.stalled.saturating_add(1),
             TaskState::Failed => self.failed = self.failed.saturating_add(1),
+            TaskState::Cancelling => self.cancelling = self.cancelling.saturating_add(1),
             TaskState::Cancelled => self.cancelled = self.cancelled.saturating_add(1),
         }
     }
@@ -513,65 +515,65 @@ pub trait ControlCatalogRepository: Send + Sync {
         record: StorageVolumeRecord,
     ) -> CentralResult<CatalogInsertOutcome<StorageVolumeRecord>>;
 
-    async fn get_playground(
+    async fn get_workspace(
         &self,
         tenant_id: &TenantId,
         project_id: &neoengram_domain::protocol::ProjectId,
         artifact_id: &neoengram_domain::protocol::ArtifactId,
-        playground_id: &neoengram_domain::protocol::PlaygroundId,
-    ) -> CentralResult<Option<PlaygroundRecord>>;
+        workspace_id: &neoengram_domain::protocol::WorkspaceId,
+    ) -> CentralResult<Option<WorkspaceRecord>>;
     /// Internal lifecycle lookup which remains available after the public resource is fenced.
-    async fn get_playground_for_lifecycle(
+    async fn get_workspace_for_lifecycle(
         &self,
         tenant_id: &TenantId,
         project_id: &neoengram_domain::protocol::ProjectId,
         artifact_id: &neoengram_domain::protocol::ArtifactId,
-        playground_id: &neoengram_domain::protocol::PlaygroundId,
-    ) -> CentralResult<Option<PlaygroundRecord>>;
-    async fn list_playgrounds(
+        workspace_id: &neoengram_domain::protocol::WorkspaceId,
+    ) -> CentralResult<Option<WorkspaceRecord>>;
+    async fn list_workspaces(
         &self,
-        request: &PlaygroundListRequest,
-    ) -> CentralResult<PlaygroundListPage>;
-    async fn insert_playground(
+        request: &WorkspaceListRequest,
+    ) -> CentralResult<WorkspaceListPage>;
+    async fn insert_workspace(
         &self,
-        record: PlaygroundRecord,
-    ) -> CentralResult<CatalogInsertOutcome<PlaygroundRecord>> {
-        self.insert_playground_fenced(PlaygroundInsertRequest {
+        record: WorkspaceRecord,
+    ) -> CentralResult<CatalogInsertOutcome<WorkspaceRecord>> {
+        self.insert_workspace_fenced(WorkspaceInsertRequest {
             record,
             artifact_head: crate::ArtifactHeadExpectation::Any,
         })
         .await
     }
 
-    /// Inserts a Playground while atomically fencing a Head observation made by the service.
+    /// Inserts a Workspace while atomically fencing a Head observation made by the service.
     /// Implementations must resolve an existing idempotent record before evaluating the fence.
-    async fn insert_playground_fenced(
+    async fn insert_workspace_fenced(
         &self,
-        request: PlaygroundInsertRequest,
-    ) -> CentralResult<CatalogInsertOutcome<PlaygroundRecord>>;
+        request: WorkspaceInsertRequest,
+    ) -> CentralResult<CatalogInsertOutcome<WorkspaceRecord>>;
 
-    /// Atomically advances a Playground lifecycle state. Implementations must treat a replay
+    /// Atomically advances a Workspace lifecycle state. Implementations must treat a replay
     /// which already observes `next` as idempotent, while rejecting a transition from another
     /// state. This is the fencing boundary used by asynchronous materialization reports.
     #[allow(clippy::too_many_arguments)]
-    async fn transition_playground_state(
+    async fn transition_workspace_state(
         &self,
         tenant_id: &TenantId,
         project_id: &neoengram_domain::protocol::ProjectId,
         artifact_id: &neoengram_domain::protocol::ArtifactId,
-        playground_id: &neoengram_domain::protocol::PlaygroundId,
-        expected: crate::PlaygroundState,
-        next: crate::PlaygroundState,
+        workspace_id: &neoengram_domain::protocol::WorkspaceId,
+        expected: crate::WorkspaceState,
+        next: crate::WorkspaceState,
         updated_at_unix_ms: UnixMillis,
-    ) -> CentralResult<PlaygroundRecord>;
+    ) -> CentralResult<WorkspaceRecord>;
 
-    /// Atomically advances the fenced Playground Head and the Artifact convenience Head for one
-    /// committed Playground. An exact replay already observed by the Playground succeeds without
+    /// Atomically advances the fenced Workspace Head and the Artifact convenience Head for one
+    /// committed Workspace. An exact replay already observed by the Workspace succeeds without
     /// moving an Artifact Head that another branch may have advanced meanwhile.
-    async fn advance_playground_commit(
+    async fn advance_workspace_commit(
         &self,
-        request: crate::AdvancePlaygroundCommitRequest,
-    ) -> CentralResult<crate::AdvancePlaygroundCommitOutcome>;
+        request: crate::AdvanceWorkspaceCommitRequest,
+    ) -> CentralResult<crate::AdvanceWorkspaceCommitOutcome>;
 
     async fn get_snapshot(
         &self,
@@ -773,6 +775,14 @@ pub trait ControlCatalogRepository: Send + Sync {
         mutation: crate::S3MutationRecord,
         access_point_id: &neoengram_domain::protocol::S3AccessPointId,
         state: crate::S3AccessPointState,
+        updated_at_unix_ms: UnixMillis,
+    ) -> CentralResult<crate::CatalogInsertOutcome<crate::S3AccessPointRecord>>;
+    /// Atomically tombstones an Access Point, revokes all of its credentials, and records the
+    /// public request identity. The row is retained so audit and deletion queries remain useful.
+    async fn delete_s3_access_point_idempotent(
+        &self,
+        mutation: crate::S3MutationRecord,
+        access_point_id: &neoengram_domain::protocol::S3AccessPointId,
         updated_at_unix_ms: UnixMillis,
     ) -> CentralResult<crate::CatalogInsertOutcome<crate::S3AccessPointRecord>>;
     async fn update_s3_access_point_state(
@@ -1520,16 +1530,16 @@ pub trait PlacementRepository: Send + Sync {
         &self,
         tenant_id: &TenantId,
         workspace_id: &neoengram_domain::protocol::WorkspaceId,
-    ) -> CentralResult<Option<crate::WorkspaceRecord>>;
+    ) -> CentralResult<Option<crate::PlacementWorkspaceRecord>>;
     async fn get_workspace_by_request_id(
         &self,
         tenant_id: &TenantId,
         request_id: &neoengram_domain::protocol::RequestId,
-    ) -> CentralResult<Option<crate::WorkspaceRecord>>;
+    ) -> CentralResult<Option<crate::PlacementWorkspaceRecord>>;
     async fn insert_workspace(
         &self,
-        record: crate::WorkspaceRecord,
-    ) -> CentralResult<crate::WorkspaceRecord>;
+        record: crate::PlacementWorkspaceRecord,
+    ) -> CentralResult<crate::PlacementWorkspaceRecord>;
     async fn commit_availability(
         &self,
         tenant_id: &TenantId,
@@ -1592,6 +1602,56 @@ pub trait TaskRepository: Send + Sync {
 
     async fn summary(&self, request: &TaskListRequest) -> CentralResult<TaskSummary>;
 
+    /// Returns the persisted execution stages for one root task in DAG order.
+    async fn stages(
+        &self,
+        tenant_id: &TenantId,
+        task_id: &TaskId,
+    ) -> CentralResult<Vec<TaskStage>> {
+        let _ = (tenant_id, task_id);
+        Ok(Vec::new())
+    }
+
+    /// Returns immutable snapshots of prior stage executions. The current stage projection is
+    /// returned by [`Self::stages`]; history is kept separate so retries never erase audit data.
+    async fn stage_history(
+        &self,
+        tenant_id: &TenantId,
+        task_id: &TaskId,
+    ) -> CentralResult<Vec<TaskStage>> {
+        let _ = (tenant_id, task_id);
+        Ok(Vec::new())
+    }
+
+    /// Inserts one stage as part of task-plan initialization. Implementations must make replay
+    /// of the same stage identity/payload idempotent.
+    async fn insert_stage(
+        &self,
+        tenant_id: &TenantId,
+        stage: TaskStage,
+    ) -> CentralResult<TaskStage> {
+        let _ = (tenant_id, stage);
+        Err(crate::CentralError::new(
+            crate::CentralErrorCode::InvalidState,
+            "task stages are not supported by this repository",
+        ))
+    }
+
+    /// Replaces a stage under optimistic concurrency and retains the stage attempt history in the
+    /// payload/resource version fence.
+    async fn replace_stage(
+        &self,
+        tenant_id: &TenantId,
+        expected_resource_version: ResourceVersion,
+        stage: TaskStage,
+    ) -> CentralResult<TaskStage> {
+        let _ = (tenant_id, expected_resource_version, stage);
+        Err(crate::CentralError::new(
+            crate::CentralErrorCode::InvalidState,
+            "task stages are not supported by this repository",
+        ))
+    }
+
     /// Inserts a task row. The initial Attempt and Created event can be committed atomically with
     /// the task using [`Self::insert_with_history`].
     async fn insert(&self, task: OperationTask) -> CentralResult<TaskInsertOutcome>;
@@ -1604,6 +1664,27 @@ pub trait TaskRepository: Send + Sync {
         attempt: Option<TaskAttempt>,
         event: Option<TaskEvent>,
     ) -> CentralResult<TaskInsertOutcome>;
+
+    /// Atomically inserts a task, its initial attempt/event history, and the complete execution
+    /// plan. Implementations should override this method when the backing store supports a real
+    /// transaction; the default keeps lightweight test repositories correct by rolling the stage
+    /// writes through the same repository lock/API.
+    async fn insert_with_history_and_stages(
+        &self,
+        task: OperationTask,
+        attempt: Option<TaskAttempt>,
+        event: Option<TaskEvent>,
+        stages: Vec<TaskStage>,
+    ) -> CentralResult<TaskInsertOutcome> {
+        neoengram_domain::protocol::validate_task_stages(&stages).map_err(CentralError::from)?;
+        let outcome = self.insert_with_history(task, attempt, event).await?;
+        if let TaskInsertOutcome::Inserted(inserted) = &outcome {
+            for stage in stages {
+                self.insert_stage(&inserted.tenant_id, stage).await?;
+            }
+        }
+        Ok(outcome)
+    }
 
     /// Replaces a task under optimistic concurrency. `task.resource_version` must equal
     /// `expected_resource_version + 1`.
@@ -1681,8 +1762,8 @@ pub trait TaskRepository: Send + Sync {
         now: UnixMillis,
     ) -> CentralResult<TaskMutationOutcome>;
 
-    /// Cancels an active task and appends a Cancelled event. Repeating a cancellation is
-    /// idempotent and returns `replayed = true`.
+    /// Requests cancellation. The task remains `cancelling` until the caller has observed that
+    /// Agent work, leases, and storage operations have converged.
     async fn cancel(
         &self,
         tenant_id: &TenantId,
@@ -1691,12 +1772,48 @@ pub trait TaskRepository: Send + Sync {
         actor: TaskActor,
         now: UnixMillis,
     ) -> CentralResult<TaskMutationOutcome>;
+
+    /// Completes a cancellation after agents, leases, and storage operations have converged.
+    /// Calling this while the task is not `cancelling` is rejected, so an operator cannot skip
+    /// the convergence fence by jumping directly from an active task to a terminal state.
+    async fn complete_cancellation(
+        &self,
+        tenant_id: &TenantId,
+        task_id: &TaskId,
+        expected_resource_version: ResourceVersion,
+        actor: TaskActor,
+        now: UnixMillis,
+    ) -> CentralResult<TaskMutationOutcome> {
+        let current = self.get(tenant_id, task_id).await?.ok_or_else(|| {
+            crate::CentralError::new(
+                crate::CentralErrorCode::ResourceNotFound,
+                "operation task not found",
+            )
+        })?;
+        if current.state != TaskState::Cancelling {
+            return Err(crate::CentralError::new(
+                crate::CentralErrorCode::InvalidState,
+                "operation task must be cancelling before cancellation can complete",
+            ));
+        }
+        self.transition(
+            tenant_id,
+            task_id,
+            expected_resource_version,
+            TaskState::Cancelled,
+            actor,
+            None,
+            Some("cancellation convergence completed".to_owned()),
+            now,
+        )
+        .await
+    }
 }
 
 /// Durable Pre-commit aggregate and immutable Commit repository.
 ///
 /// `commit` consumes a candidate and inserts its Commit in one authority transaction. Publishing
-/// the source Playground Head and Artifact convenience Head remains a separate control-catalog
+/// the source Workspace Head and Artifact convenience Head remains a separate control-catalog
 /// recovery boundary.
 #[async_trait]
 pub trait PreCommitRepository: Send + Sync {
@@ -1705,14 +1822,14 @@ pub trait PreCommitRepository: Send + Sync {
         request: PreCommitStartRequest,
     ) -> CentralResult<PreCommitMutationOutcome>;
     async fn get(&self, key: &PreCommitKey) -> CentralResult<Option<PreCommitRecord>>;
-    /// Returns the current operation for one Playground. Abnormal sessions remain active so the
+    /// Returns the current operation for one Workspace. Abnormal sessions remain active so the
     /// user can inspect and restart them; cancelled and committed history is excluded.
     async fn get_active(
         &self,
         tenant_id: &TenantId,
         project_id: &neoengram_domain::protocol::ProjectId,
         artifact_id: &ArtifactId,
-        playground_id: &neoengram_domain::protocol::PlaygroundId,
+        workspace_id: &neoengram_domain::protocol::WorkspaceId,
     ) -> CentralResult<Option<PreCommitRecord>>;
     /// Stable keyset scan used to recover attempts whose Pre-commit write committed before their
     /// associated Add Job was created or dispatched.
@@ -1722,7 +1839,7 @@ pub trait PreCommitRepository: Send + Sync {
         limit: usize,
     ) -> CentralResult<Vec<PreCommitRecord>>;
     /// Lists committed Pre-commits whose immutable Commit is durable but whose Artifact and
-    /// Playground Head publication has not yet been acknowledged.
+    /// Workspace Head publication has not yet been acknowledged.
     async fn list_unpublished_commits(
         &self,
         after: Option<&PreCommitKey>,
@@ -1897,7 +2014,7 @@ pub trait AuthorityLifecycleRepository: Send + Sync {
 
 #[async_trait]
 pub trait IndexPublisher: Send + Sync {
-    /// Creates one authoritative Playground Index at the exact supplied version and records.
+    /// Creates one authoritative Workspace Index at the exact supplied version and records.
     ///
     /// Implementations must validate that `version.digest` is the canonical digest of `records`.
     /// The absent-to-present transition is atomic; an exact replay returns the stored version,
@@ -1917,7 +2034,7 @@ pub trait IndexPublisher: Send + Sync {
     ) -> CentralResult<IndexPublishOutcome>;
     async fn current_version(&self, key: &IndexKey) -> CentralResult<WireIndexVersion>;
 
-    /// Reads the last authoritative logical Index snapshot for a Playground.
+    /// Reads the last authoritative logical Index snapshot for a Workspace.
     ///
     /// This is deliberately a read-only companion to publication. Implementations that do not
     /// retain logical records may return `InvalidState`; callers must never fall back to the
@@ -2072,7 +2189,7 @@ impl AuthorityStore {
         self.gateway_registry.clone()
     }
 
-    /// Adds the optional Tenant/Artifact/Volume/Playground control catalog.
+    /// Adds the optional Tenant/Artifact/Volume/Workspace control catalog.
     #[must_use]
     pub fn with_control_catalog(mut self, catalog: Arc<dyn ControlCatalogRepository>) -> Self {
         self.control_catalog = Some(catalog);

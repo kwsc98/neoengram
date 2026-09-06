@@ -57,7 +57,8 @@ pub struct CreateTenantRequest {
 #[sensitive(opaque)]
 pub struct CreateTenantResponse {
     pub tenant: TenantView,
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }
@@ -114,7 +115,8 @@ pub struct CreateProjectRequest {
 #[sensitive(opaque)]
 pub struct CreateProjectResponse {
     pub project: ProjectView,
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }
@@ -129,6 +131,7 @@ pub struct ProjectView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub resource_version: String,
+    pub lifecycle: ResourceLifecycleView,
     pub created_at_unix_ms: String,
     pub updated_at_unix_ms: String,
 }
@@ -217,7 +220,8 @@ pub struct NfsReference {
 #[sensitive(opaque)]
 pub struct CreateStorageVolumeResponse {
     pub storage_volume: StorageVolumeView,
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }
@@ -292,7 +296,8 @@ pub enum ArtifactInitialization {
 #[sensitive(opaque)]
 pub struct CreateArtifactResponse {
     pub artifact: ArtifactView,
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }
@@ -319,7 +324,7 @@ pub struct ArtifactView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
-pub struct QueryPlaygroundListRequest {
+pub struct QueryWorkspaceListRequest {
     pub tenant_id: String,
     #[serde(default)]
     pub project_id: Option<String>,
@@ -340,8 +345,8 @@ pub struct QueryPlaygroundListRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
-pub struct QueryPlaygroundListResponse {
-    pub items: Vec<PlaygroundView>,
+pub struct QueryWorkspaceListResponse {
+    pub items: Vec<WorkspaceView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
 }
@@ -349,28 +354,31 @@ pub struct QueryPlaygroundListResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
-pub struct QueryPlaygroundRequest {
+pub struct QueryWorkspaceRequest {
     pub tenant_id: String,
     pub project_id: String,
     pub artifact_id: String,
-    pub playground_id: String,
+    #[serde(rename = "workspace_id")]
+    pub workspace_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
-pub struct QueryPlaygroundResponse {
-    pub playground: PlaygroundView,
+pub struct QueryWorkspaceResponse {
+    #[serde(rename = "workspace")]
+    pub workspace: WorkspaceView,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
-pub struct CreatePlaygroundRequest {
+pub struct CreateWorkspaceRequest {
     pub tenant_id: String,
     pub project_id: String,
     pub artifact_id: String,
-    pub playground_id: String,
+    #[serde(rename = "workspace_id")]
+    pub workspace_id: String,
     pub storage_volume_id: String,
     pub display_name: String,
     #[serde(default)]
@@ -380,9 +388,11 @@ pub struct CreatePlaygroundRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
-pub struct CreatePlaygroundResponse {
-    pub playground: PlaygroundView,
-    pub replayed: bool,
+pub struct CreateWorkspaceResponse {
+    #[serde(rename = "workspace")]
+    pub workspace: WorkspaceView,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }
@@ -390,11 +400,12 @@ pub struct CreatePlaygroundResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
-pub struct PlaygroundView {
+pub struct WorkspaceView {
     pub tenant_id: String,
     pub project_id: String,
     pub artifact_id: String,
-    pub playground_id: String,
+    #[serde(rename = "workspace_id")]
+    pub workspace_id: String,
     pub storage_volume_id: String,
     pub region: String,
     pub display_name: String,

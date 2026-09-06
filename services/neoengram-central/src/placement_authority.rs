@@ -451,7 +451,7 @@ pub struct ReplicationObjectRecord {
 
 /// Durable writable Workspace identity. Object hydration remains an Agent-side concern.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkspaceRecord {
+pub struct PlacementWorkspaceRecord {
     pub tenant_id: TenantId,
     pub workspace_id: WorkspaceId,
     pub project_id: neoengram_domain::protocol::ProjectId,

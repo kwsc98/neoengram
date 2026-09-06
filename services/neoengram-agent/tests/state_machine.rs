@@ -16,11 +16,12 @@ use neoengram_domain::core::{
 use neoengram_domain::protocol::{
     AddAssignment, AgentId, AgentMountId, ArtifactId, ArtifactPlacementId, AssignmentGeneration,
     AssignmentId, CommitDataLayout, ControlError, DecimalU64, DecisionGeneration, EdgeClusterId,
-    ErrorCode, Extensions, FencingToken, IndexDeltaRecord, IndexRevision, JobDecision, JobId,
-    JobState, LeaseGrant, LeaseId, LeaseMode, MetadataBatchDescriptor, MetadataBatchId,
+    ErrorCode, Extensions, FencingToken, Generation, IndexDeltaRecord, IndexRevision, JobDecision,
+    JobId, JobState, LeaseGrant, LeaseId, LeaseMode, MetadataBatchDescriptor, MetadataBatchId,
     MetadataBatchPage, MetadataBatchRecords, MetadataBatchScope, MountGeneration, OwnerGeneration,
-    PlacementGeneration, PlaygroundId, PrincipalId, PrincipalKind, PrincipalRef, ProjectId,
-    PublishDecision, StorageVolumeId, TenantId, UnixMillis, WireIndexVersion,
+    PlacementGeneration, PrincipalId, PrincipalKind, PrincipalRef, ProjectId, PublishDecision,
+    StorageVolumeId, TaskExecutionFence, TaskId, TenantId, UnixMillis, WireIndexVersion,
+    WorkspaceId,
 };
 use neoengram_runtime::engine::{AddStatistics, ManagedResource, PreparedAdd};
 
@@ -931,6 +932,13 @@ fn test_agent(assignment: &AddAssignment, executor: impl AddExecutor + 'static) 
 fn assignment(seed: u8) -> AddAssignment {
     let mut assignment = AddAssignment {
         job_id: JobId::new(format!("job-{seed}")).unwrap(),
+        task_fence: TaskExecutionFence::new(
+            TaskId::new(format!("task-job-{seed}")).unwrap(),
+            Generation::new(1),
+            "scan_changes",
+            Generation::new(1),
+            Generation::new(1),
+        ),
         assignment_id: AssignmentId::new(format!("assignment-{seed}")).unwrap(),
         assignment_generation: AssignmentGeneration::new(1),
         agent_id: AgentId::new("agent-a").unwrap(),
@@ -942,7 +950,7 @@ fn assignment(seed: u8) -> AddAssignment {
         tenant_id: TenantId::new("tenant-a").unwrap(),
         project_id: ProjectId::new("project-a").unwrap(),
         artifact_id: ArtifactId::new("artifact-a").unwrap(),
-        playground_id: PlaygroundId::new("playground-a").unwrap(),
+        workspace_id: WorkspaceId::new("workspace-a").unwrap(),
         edge_cluster_id: EdgeClusterId::new("cluster-a").unwrap(),
         storage_volume_id: StorageVolumeId::new("volume-a").unwrap(),
         artifact_placement_id: ArtifactPlacementId::new("placement-a").unwrap(),
@@ -1004,7 +1012,7 @@ fn prepared_with_mutations(
             tenant_id: assignment.tenant_id.to_string(),
             project_id: assignment.project_id.to_string(),
             artifact_id: assignment.artifact_id.to_string(),
-            playground_id: assignment.playground_id.to_string(),
+            workspace_id: assignment.workspace_id.to_string(),
             job_id: assignment.job_id.to_string(),
         },
         IndexVersion::new(
@@ -1034,7 +1042,7 @@ fn mutation_receipt(assignment: &AddAssignment, prepared: &PreparedAdd) -> Trans
         tenant_id: assignment.tenant_id.clone(),
         project_id: assignment.project_id.clone(),
         artifact_id: assignment.artifact_id.clone(),
-        playground_id: assignment.playground_id.clone(),
+        workspace_id: assignment.workspace_id.clone(),
         job_id: assignment.job_id.clone(),
         base_index_version: assignment.expected_index_version.clone(),
         extensions: Extensions::new(),
@@ -1137,6 +1145,7 @@ fn mutation_receipt(assignment: &AddAssignment, prepared: &PreparedAdd) -> Trans
 fn publish_decision(assignment: &AddAssignment) -> JobDecision {
     JobDecision {
         job_id: assignment.job_id.clone(),
+        task_fence: assignment.task_fence.clone(),
         assignment_id: assignment.assignment_id.clone(),
         assignment_generation: assignment.assignment_generation,
         decision_generation: DecisionGeneration::new(1),
@@ -1160,6 +1169,7 @@ fn reject_decision(assignment: &AddAssignment) -> JobDecision {
 fn reject_decision_with_state(assignment: &AddAssignment, final_state: JobState) -> JobDecision {
     JobDecision {
         job_id: assignment.job_id.clone(),
+        task_fence: assignment.task_fence.clone(),
         assignment_id: assignment.assignment_id.clone(),
         assignment_generation: assignment.assignment_generation,
         decision_generation: DecisionGeneration::new(1),

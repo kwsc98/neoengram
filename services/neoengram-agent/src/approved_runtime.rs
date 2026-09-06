@@ -182,6 +182,15 @@ pub(crate) fn build_replication_network(
     let client_ca_file = config.replication.tls_ca_file.clone().ok_or_else(|| {
         AgentDaemonError::Configuration("replication TLS CA is not configured".to_owned())
     })?;
+    let gateway_workload_trust_domain = config
+        .gateway_workload_trust_domain
+        .clone()
+        .ok_or_else(|| {
+            AgentDaemonError::Configuration(
+                "replication requires gateway_workload_trust_domain for Gateway peer identity validation"
+                    .to_owned(),
+            )
+        })?;
     let server_name = config
         .replication
         .gateway_endpoint
@@ -201,6 +210,7 @@ pub(crate) fn build_replication_network(
         client_ca_file,
         server_name,
     })
+    .map(|network| network.with_gateway_workload_trust_domain(gateway_workload_trust_domain))
     .map_err(|error| {
         AgentDaemonError::Configuration(format!(
             "replication QUIC network could not start: {error}"
@@ -1814,10 +1824,11 @@ mod tests {
         AgentMountId, AgentSessionCloseResponse, AgentSessionOpenResponse, ArtifactId,
         AssignmentGeneration, AssignmentId, AssignmentOperation, CentralSignedPayload,
         CertificateGeneration, ControlError, DecimalU64, DeliveryGeneration, Ed25519PublicKeySpki,
-        Ed25519Signature, ErrorCode, GatewayOpaqueBytes, HardlinkPolicy, JobAssignment, JobId,
-        MountGeneration, OwnerGeneration, PlacementGeneration, PrincipalId, PrincipalKind,
+        Ed25519Signature, ErrorCode, GatewayOpaqueBytes, Generation, HardlinkPolicy, JobAssignment,
+        JobId, MountGeneration, OwnerGeneration, PlacementGeneration, PrincipalId, PrincipalKind,
         PrincipalRef, ProjectId, SessionId, SnapshotDeliveryAction, SnapshotDeliveryAssignment,
-        SnapshotDeliveryMode, SnapshotId, StorageVolumeId, CURRENT_WIRE_VERSION,
+        SnapshotDeliveryMode, SnapshotId, StorageVolumeId, TaskExecutionFence, TaskId,
+        CURRENT_WIRE_VERSION,
     };
     use ring::{
         rand::SystemRandom,
@@ -2657,6 +2668,13 @@ mod tests {
             enqueued_at_unix_ms: UnixMillis::new(10),
             report: AgentReport::Accepted(neoengram_domain::protocol::JobAccepted {
                 job_id: JobId::new("job-reconnect-send-failure").unwrap(),
+                task_fence: TaskExecutionFence::new(
+                    TaskId::new("task-job-reconnect-send-failure").unwrap(),
+                    Generation::new(1),
+                    "scan_changes",
+                    Generation::new(1),
+                    Generation::new(1),
+                ),
                 assignment_id: AssignmentId::new("assignment-reconnect-send-failure").unwrap(),
                 assignment_generation: AssignmentGeneration::new(1),
                 accepted_at_unix_ms: UnixMillis::new(10),
@@ -2892,6 +2910,13 @@ mod tests {
             enqueued_at_unix_ms: UnixMillis::new(10),
             report: AgentReport::Accepted(neoengram_domain::protocol::JobAccepted {
                 job_id: JobId::new("job-before-close").unwrap(),
+                task_fence: TaskExecutionFence::new(
+                    TaskId::new("task-job-before-close").unwrap(),
+                    Generation::new(1),
+                    "scan_changes",
+                    Generation::new(1),
+                    Generation::new(1),
+                ),
                 assignment_id: AssignmentId::new("assignment-before-close").unwrap(),
                 assignment_generation: AssignmentGeneration::new(1),
                 accepted_at_unix_ms: UnixMillis::new(10),
@@ -3094,6 +3119,13 @@ mod tests {
             .unwrap();
         let mut assignment = SnapshotDeliveryAssignment {
             job_id: JobId::new("job-snapshot-a").unwrap(),
+            task_fence: TaskExecutionFence::new(
+                TaskId::new("task-job-snapshot-a").unwrap(),
+                Generation::new(1),
+                "delivery_materialize",
+                Generation::new(1),
+                Generation::new(1),
+            ),
             assignment_id: AssignmentId::new("assignment-snapshot-a").unwrap(),
             assignment_generation: AssignmentGeneration::new(1),
             agent_id: AgentId::new("agent-a").unwrap(),

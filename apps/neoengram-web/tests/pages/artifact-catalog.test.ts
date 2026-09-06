@@ -13,11 +13,11 @@ import ArtifactDetailPage from '@/pages/ArtifactDetailPage.vue';
 import { useTenantsStore } from '@/stores/tenants';
 
 const api = vi.hoisted(() => ({
-  createPlayground: vi.fn(),
+  createWorkspace: vi.fn(),
   queryApiVersion: vi.fn(),
   queryArtifact: vi.fn(),
   queryArtifactCommitGraph: vi.fn(),
-  queryPlaygroundList: vi.fn(),
+  queryWorkspaceList: vi.fn(),
   querySnapshotList: vi.fn(),
   queryStorageVolumeList: vi.fn(),
 }));
@@ -53,11 +53,7 @@ async function mountPage(
   artifactView: ArtifactView = artifact,
   capabilities = ['artifact_catalog'],
   commitGraph?: CommitGraphView,
-  permissions: TenantView['permissions'] = [
-    'artifact.read',
-    'playground.create',
-    'snapshot.create',
-  ],
+  permissions: TenantView['permissions'] = ['artifact.read', 'workspace.create', 'snapshot.create'],
 ) {
   api.queryApiVersion.mockResolvedValue({
     data: {
@@ -74,9 +70,9 @@ async function mountPage(
     data: { artifact: artifactView },
     requestId: 'request-artifact',
   });
-  api.queryPlaygroundList.mockResolvedValue({
+  api.queryWorkspaceList.mockResolvedValue({
     data: { items: [] },
-    requestId: 'request-playgrounds',
+    requestId: 'request-workspaces',
   });
   api.queryArtifactCommitGraph.mockResolvedValue({
     data: {
@@ -161,7 +157,7 @@ async function mountPage(
         name: 'commit-detail',
         component: { template: '<div />' },
       },
-      { path: '/playground', name: 'playground-detail', component: { template: '<div />' } },
+      { path: '/workspace', name: 'workspace-detail', component: { template: '<div />' } },
       {
         path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/snapshots/:snapshotId',
         name: 'snapshot-detail',
@@ -193,11 +189,11 @@ afterEach(() => {
 });
 
 describe('Artifact catalog detail', () => {
-  it('loads the authoritative Artifact and Playground relation without advanced APIs', async () => {
+  it('loads the authoritative Artifact and Workspace relation without advanced APIs', async () => {
     const { queryClient, wrapper } = await mountPage();
 
     expect(api.queryArtifact).toHaveBeenCalledWith('tenant-a', 'project-a', 'artifact-a');
-    expect(api.queryPlaygroundList).toHaveBeenCalledWith({
+    expect(api.queryWorkspaceList).toHaveBeenCalledWith({
       tenant_id: 'tenant-a',
       project_id: 'project-a',
       artifact_id: 'artifact-a',
@@ -206,7 +202,7 @@ describe('Artifact catalog detail', () => {
     expect(api.queryArtifactCommitGraph).not.toHaveBeenCalled();
     expect(api.querySnapshotList).not.toHaveBeenCalled();
     expect(wrapper.findComponent(PageHeading).props('title')).toBe('Authoritative data');
-    expect(wrapper.findAll('button').some((button) => button.text() === '创建 Playground')).toBe(
+    expect(wrapper.findAll('button').some((button) => button.text() === '创建 Workspace')).toBe(
       false,
     );
 
@@ -214,16 +210,16 @@ describe('Artifact catalog detail', () => {
     queryClient.clear();
   });
 
-  it('allows Playground creation when the server advertises materialization', async () => {
+  it('allows Workspace creation when the server advertises materialization', async () => {
     const emptyArtifact: ArtifactView = { ...artifact };
     delete emptyArtifact.head_commit_id;
     const { queryClient, wrapper } = await mountPage(
       '/tenants/tenant-a/projects/project-a/artifacts/artifact-a',
       emptyArtifact,
-      ['artifact_catalog', 'playground_materialize'],
+      ['artifact_catalog', 'workspace_materialize'],
     );
 
-    expect(wrapper.findAll('button').some((button) => button.text() === '创建 Playground')).toBe(
+    expect(wrapper.findAll('button').some((button) => button.text() === '创建 Workspace')).toBe(
       true,
     );
 
@@ -231,14 +227,14 @@ describe('Artifact catalog detail', () => {
     queryClient.clear();
   });
 
-  it('keeps non-empty Playground derivation available with explicit capabilities', async () => {
+  it('keeps non-empty Workspace derivation available with explicit capabilities', async () => {
     const { queryClient, wrapper } = await mountPage(
       '/tenants/tenant-a/projects/project-a/artifacts/artifact-a',
       artifact,
-      ['artifact_catalog', 'artifact_commit_graph', 'playground_materialize'],
+      ['artifact_catalog', 'artifact_commit_graph', 'workspace_materialize'],
     );
 
-    expect(wrapper.findAll('button').some((button) => button.text() === '创建 Playground')).toBe(
+    expect(wrapper.findAll('button').some((button) => button.text() === '创建 Workspace')).toBe(
       true,
     );
 
@@ -273,14 +269,14 @@ describe('Artifact catalog detail', () => {
     queryClient.clear();
   });
 
-  it('submits the historical Commit selected while creating a Playground', async () => {
-    api.createPlayground.mockResolvedValue({
+  it('submits the historical Commit selected while creating a Workspace', async () => {
+    api.createWorkspace.mockResolvedValue({
       data: {
-        playground: {
+        workspace: {
           tenant_id: 'tenant-a',
           project_id: 'project-a',
           artifact_id: 'artifact-a',
-          playground_id: 'historical-review',
+          workspace_id: 'historical-review',
           storage_volume_id: 'volume-a',
           region: 'cn-shanghai',
           display_name: 'Historical review',
@@ -291,19 +287,20 @@ describe('Artifact catalog detail', () => {
           created_at_unix_ms: '1',
           updated_at_unix_ms: '1',
         },
-        replayed: false,
+        request_replayed: false,
+        execution_reused: false,
       },
-      requestId: 'request-create-playground',
+      requestId: 'request-create-workspace',
     });
     const { queryClient, wrapper } = await mountPage(
       '/tenants/tenant-a/projects/project-a/artifacts/artifact-a',
       artifact,
-      ['artifact_catalog', 'playground_materialize', 'artifact_commit_graph'],
+      ['artifact_catalog', 'workspace_materialize', 'artifact_commit_graph'],
     );
 
     await wrapper
       .findAll('button')
-      .find((button) => button.text() === '创建 Playground')!
+      .find((button) => button.text() === '创建 Workspace')!
       .trigger('click');
     await flushPromises();
 
@@ -319,16 +316,16 @@ describe('Artifact catalog detail', () => {
     await flushPromises();
     await wrapper
       .findAll('button')
-      .filter((button) => button.text() === '创建 Playground')
+      .filter((button) => button.text() === '创建 Workspace')
       .at(-1)!
       .trigger('click');
     await flushPromises();
 
-    expect(api.createPlayground.mock.calls[0]?.[0]).toEqual({
+    expect(api.createWorkspace.mock.calls[0]?.[0]).toEqual({
       tenant_id: 'tenant-a',
       project_id: 'project-a',
       artifact_id: 'artifact-a',
-      playground_id: 'historical-review',
+      workspace_id: 'historical-review',
       storage_volume_id: 'volume-a',
       display_name: 'Historical review',
       base_commit_id: historicalCommitId,
@@ -453,7 +450,7 @@ describe('Artifact catalog detail', () => {
       [
         'artifact_catalog',
         'artifact_commit_graph',
-        'playground_materialize',
+        'workspace_materialize',
         'commit_materialization_v2',
       ],
     );
@@ -466,7 +463,7 @@ describe('Artifact catalog detail', () => {
 
     expect(api.queryArtifact).toHaveBeenCalledTimes(2);
     expect(api.queryArtifactCommitGraph).toHaveBeenCalledTimes(2);
-    expect(api.queryPlaygroundList).toHaveBeenCalledTimes(2);
+    expect(api.queryWorkspaceList).toHaveBeenCalledTimes(2);
     expect(api.querySnapshotList).toHaveBeenCalledTimes(2);
 
     wrapper.unmount();

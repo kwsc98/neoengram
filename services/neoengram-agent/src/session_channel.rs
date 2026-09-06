@@ -613,10 +613,10 @@ mod tests {
     use neoengram_domain::protocol::{
         AgentId, ArtifactId, CentralSignedPayload, CertificateGeneration, ControlError, DecimalU64,
         Ed25519Signature, EdgeClusterId, ErrorCode, Extensions, GatewayOpaqueBytes, GatewayPoolId,
-        MessageId, MountGeneration, ObjectSet, PlacementId, RouteGeneration, SequenceNumber,
-        SessionGeneration, SessionId, SignedTransferTicket, StorageVolumeId, TransferEndpoint,
-        TransferId, TransferTicket, UnixMillis, CURRENT_WIRE_VERSION,
-        MAX_AGENT_CHANNEL_FRAME_BYTES,
+        Generation, MessageId, MountGeneration, ObjectSet, PlacementId, RouteGeneration,
+        SequenceNumber, SessionGeneration, SessionId, SignedTransferTicket, StorageVolumeId,
+        TaskExecutionFence, TaskId, TransferEndpoint, TransferId, TransferTicket, UnixMillis,
+        CURRENT_WIRE_VERSION, MAX_AGENT_CHANNEL_FRAME_BYTES,
     };
     use neoengram_domain::{CommitId, ContentDigest};
 
@@ -871,6 +871,13 @@ mod tests {
                 "replication-redelivery",
             )
             .unwrap(),
+            task_fence: TaskExecutionFence::new(
+                TaskId::new("task-replication-redelivery").unwrap(),
+                Generation::new(attempt),
+                "transfer",
+                Generation::new(1),
+                Generation::new(1),
+            ),
             tenant_id,
             artifact_id,
             commit_id,

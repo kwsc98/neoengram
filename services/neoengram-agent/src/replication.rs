@@ -126,6 +126,9 @@ impl MountedVolumeMaterializationExecutor {
         let report = MaterializationReport::Failed {
             operation_task_id: ticket.operation_task_id.clone(),
             task_attempt_id: ticket.task_attempt_id.clone(),
+            task_attempt: ticket.task_attempt,
+            stage_key: ticket.stage_key.clone(),
+            stage_attempt: ticket.stage_attempt,
             materialization_id: ticket.materialization_id.clone(),
             batch_id: ticket.batch_id.clone(),
             plan_revision: ticket.plan_revision,
@@ -751,6 +754,7 @@ impl ReplicationProgressSink for DurableReplicationProgressSink {
         self.enqueue(ReplicationProgressReport::State {
             replication_id: self.assignment.replication_id.clone(),
             tenant_id: self.assignment.tenant_id.clone(),
+            task_fence: self.assignment.task_fence.clone(),
             attempt: self.assignment.attempt,
             state,
             completed_objects,
@@ -788,6 +792,7 @@ impl ReplicationProgressSink for DurableReplicationProgressSink {
         self.enqueue(ReplicationProgressReport::Object {
             replication_id: self.assignment.replication_id.clone(),
             tenant_id: self.assignment.tenant_id.clone(),
+            task_fence: self.assignment.task_fence.clone(),
             attempt: self.assignment.attempt,
             object_id: *object_id,
             offset,
@@ -819,6 +824,7 @@ impl ReplicationProgressSink for DurableReplicationProgressSink {
         self.enqueue(ReplicationProgressReport::Published {
             replication_id: self.assignment.replication_id.clone(),
             tenant_id: self.assignment.tenant_id.clone(),
+            task_fence: self.assignment.task_fence.clone(),
             attempt: self.assignment.attempt,
             commit_id: *commit_id,
             object_set_digest: *object_set_digest,

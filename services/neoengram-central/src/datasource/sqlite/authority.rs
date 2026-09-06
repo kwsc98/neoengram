@@ -20,11 +20,11 @@ const LOCK_FILE_NAME: &str = "authority.lock";
 // authority identities and schema versions are rejected so no v1 replication facts can be
 // mistaken for namespace-scoped object placements.
 const SQLITE_APPLICATION_ID: i64 = 0x4e45_4155;
-// v20 adds the unified operation task, attempt, event, resource-link, and relation
+// v21 adds the unified operation task, attempt, event, resource-link, relation, and stage
 // authority tables. The
-// authority schema is clean-slate: an existing v18 database must be explicitly
+// authority schema is clean-slate: an existing v20 database must be explicitly
 // reset/rebuilt rather than migrated implicitly.
-const SQLITE_SCHEMA_VERSION: i64 = 20;
+const SQLITE_SCHEMA_VERSION: i64 = 21;
 const LEGACY_DATABASE_FILES: &[&str] = &[
     "agent-registry.sqlite3",
     "gateway-registry.sqlite3",
@@ -35,7 +35,7 @@ const LEGACY_DATABASE_FILES: &[&str] = &[
     "authority.db",
 ];
 
-// In schema v20, `object_placements` is the only canonical namespace-scoped placement table.
+// In schema v21, `object_placements` is the only canonical namespace-scoped placement table.
 // Managed Add still writes its older receipt shape to `managed_object_placement_evidence` until
 // that wire report carries the full v2 descriptor. The whole-Commit replication tables below are
 // transitional internal storage for still-compiled v1 service paths; they must not be read as v2
@@ -69,7 +69,7 @@ CREATE TABLE metadata_batch_descriptors (
     batch_id TEXT NOT NULL,
     job_id TEXT NOT NULL,
     artifact_id TEXT NOT NULL,
-    playground_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
     payload BLOB NOT NULL,
     PRIMARY KEY (tenant_id, batch_id)
 ) STRICT;
@@ -114,28 +114,28 @@ CREATE TABLE managed_object_placement_evidence (
     PRIMARY KEY (tenant_id, receipt_id)
 ) STRICT;
 
-CREATE TABLE playground_indexes (
+CREATE TABLE workspace_indexes (
     tenant_id TEXT NOT NULL,
     project_id TEXT NOT NULL,
     artifact_id TEXT NOT NULL,
-    playground_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
     revision TEXT NOT NULL CHECK (revision <> '' AND revision NOT GLOB '*[^0-9]*'),
     digest BLOB NOT NULL CHECK (length(digest) = 32),
-    PRIMARY KEY (tenant_id, project_id, artifact_id, playground_id)
+    PRIMARY KEY (tenant_id, project_id, artifact_id, workspace_id)
 ) STRICT;
 
-CREATE TABLE playground_index_records (
+CREATE TABLE workspace_index_records (
     tenant_id TEXT NOT NULL,
     project_id TEXT NOT NULL,
     artifact_id TEXT NOT NULL,
-    playground_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
     path TEXT NOT NULL,
     manifest_id BLOB NOT NULL CHECK (length(manifest_id) = 32),
     total_size TEXT NOT NULL CHECK (total_size <> '' AND total_size NOT GLOB '*[^0-9]*'),
     chunk_count TEXT NOT NULL CHECK (chunk_count <> '' AND chunk_count NOT GLOB '*[^0-9]*'),
-    PRIMARY KEY (tenant_id, project_id, artifact_id, playground_id, path),
-    FOREIGN KEY (tenant_id, project_id, artifact_id, playground_id)
-        REFERENCES playground_indexes (tenant_id, project_id, artifact_id, playground_id)
+    PRIMARY KEY (tenant_id, project_id, artifact_id, workspace_id, path),
+    FOREIGN KEY (tenant_id, project_id, artifact_id, workspace_id)
+        REFERENCES workspace_indexes (tenant_id, project_id, artifact_id, workspace_id)
         ON DELETE CASCADE
 ) STRICT;
 
@@ -182,7 +182,7 @@ CREATE TABLE precommit_records (
     precommit_request_id TEXT NOT NULL,
     project_id TEXT NOT NULL,
     artifact_id TEXT NOT NULL,
-    playground_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
     current_job_id TEXT NOT NULL,
     state TEXT NOT NULL CHECK (
         state IN ('running', 'ready', 'abnormal', 'cancelled', 'committed')
@@ -228,7 +228,7 @@ CREATE TABLE lifecycle_cleanup_records (
     deletion_id TEXT NOT NULL,
     target_id TEXT NOT NULL,
     target_kind TEXT NOT NULL CHECK (
-        target_kind IN ('storage_volume', 'artifact', 'playground', 'snapshot')
+        target_kind IN ('project', 'storage_volume', 'artifact', 'workspace', 'snapshot')
     ),
     action TEXT NOT NULL CHECK (
         action IN ('quiesce', 'quarantine', 'restore', 'purge', 'finalize')
@@ -672,17 +672,29 @@ CREATE INDEX materialization_receipts_object_lookup
 CREATE TABLE operation_tasks (
     tenant_id TEXT NOT NULL,
     task_id TEXT NOT NULL,
-    task_kind TEXT NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'waiting', 'verifying', 'succeeded', 'stalled', 'failed', 'cancelled')),
-    phase TEXT NOT NULL,
-    project_id TEXT,
-    artifact_id TEXT,
-    object_namespace_id TEXT,
-    commit_id BLOB CHECK (commit_id IS NULL OR length(commit_id) = 32),
-    playground_id TEXT,
-    snapshot_id TEXT,
-    storage_volume_id TEXT,
-    parent_task_id TEXT,
+    intent_kind TEXT NOT NULL CHECK (intent_kind IN (
+        'project.create', 'project.delete', 'project.restore',
+        'artifact.create', 'artifact.delete', 'artifact.restore',
+        'workspace.create', 'workspace.delete', 'workspace.restore',
+        'snapshot.create', 'snapshot.delete', 'snapshot.restore',
+        'storage_volume.create', 'storage_volume.delete', 'storage_volume.restore',
+        's3_access_point.create', 's3_access_point.delete',
+        's3_access_point.enable', 's3_access_point.disable',
+        'commit.validate', 'commit.create', 'commit.materialize',
+        'agent_enrollment.create', 'agent_enrollment.approve', 'agent_enrollment.reject',
+        'agent_enrollment.recover', 'agent_enrollment.delete',
+        'gateway_pool.create', 'gateway_pool.update', 'gateway_pool.drain', 'gateway_pool.delete',
+        'gateway_replica.create', 'gateway_replica.activate', 'gateway_replica.drain',
+        'gateway_replica.revoke', 'gateway_replica.delete',
+        's3_credential.create', 's3_credential.revoke'
+    )),
+    purpose TEXT CHECK (purpose IS NULL OR purpose IN ('copy', 'repair')),
+    primary_resource_kind TEXT NOT NULL,
+    primary_resource_id TEXT NOT NULL,
+    execution_id TEXT NOT NULL,
+    execution_key_digest BLOB NOT NULL CHECK (length(execution_key_digest) = 32),
+    state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'waiting', 'verifying', 'succeeded', 'stalled', 'failed', 'cancelling', 'cancelled')),
+    current_stage_key TEXT NOT NULL,
     request_id TEXT NOT NULL,
     request_digest BLOB NOT NULL CHECK (length(request_digest) = 32),
     actor BLOB NOT NULL,
@@ -691,8 +703,6 @@ CREATE TABLE operation_tasks (
     progress_total TEXT NOT NULL CHECK (progress_total <> '' AND progress_total NOT GLOB '*[^0-9]*'),
     progress_completed_bytes TEXT NOT NULL CHECK (progress_completed_bytes <> '' AND progress_completed_bytes NOT GLOB '*[^0-9]*'),
     progress_total_bytes TEXT NOT NULL CHECK (progress_total_bytes <> '' AND progress_total_bytes NOT GLOB '*[^0-9]*'),
-    detail_kind TEXT,
-    detail_id TEXT,
     deadline_unix_ms TEXT NOT NULL CHECK (deadline_unix_ms <> '' AND deadline_unix_ms NOT GLOB '*[^0-9]*'),
     issue BLOB,
     created_at_unix_ms TEXT NOT NULL CHECK (created_at_unix_ms <> '' AND created_at_unix_ms NOT GLOB '*[^0-9]*'),
@@ -700,28 +710,47 @@ CREATE TABLE operation_tasks (
     started_at_unix_ms TEXT CHECK (started_at_unix_ms IS NULL OR (started_at_unix_ms <> '' AND started_at_unix_ms NOT GLOB '*[^0-9]*')),
     finished_at_unix_ms TEXT CHECK (finished_at_unix_ms IS NULL OR (finished_at_unix_ms <> '' AND finished_at_unix_ms NOT GLOB '*[^0-9]*')),
     resource_version TEXT NOT NULL CHECK (resource_version <> '' AND resource_version NOT GLOB '*[^0-9]*'),
-    origin TEXT NOT NULL CHECK (origin IN ('user', 'system', 'legacy')),
+    origin TEXT NOT NULL CHECK (origin IN ('user', 'system')),
     executable INTEGER NOT NULL CHECK (executable IN (0, 1)),
     payload BLOB NOT NULL,
     PRIMARY KEY (tenant_id, task_id),
     UNIQUE (tenant_id, request_id),
-    CHECK (origin <> 'legacy' OR executable = 0)
+    UNIQUE (tenant_id, execution_id),
+    CHECK (
+        (intent_kind = 'commit.materialize' AND purpose IN ('copy', 'repair'))
+        OR (intent_kind <> 'commit.materialize' AND purpose IS NULL)
+    )
 ) STRICT;
 
 CREATE INDEX operation_tasks_tenant_state_updated
     ON operation_tasks (tenant_id, state, updated_at_unix_ms, task_id);
-CREATE INDEX operation_tasks_project_state_updated
-    ON operation_tasks (tenant_id, project_id, state, updated_at_unix_ms, task_id);
-CREATE INDEX operation_tasks_artifact_commit_state
-    ON operation_tasks (tenant_id, artifact_id, commit_id, state, updated_at_unix_ms, task_id);
+CREATE INDEX operation_tasks_intent_resource_state
+    ON operation_tasks (tenant_id, intent_kind, primary_resource_kind, primary_resource_id, state, updated_at_unix_ms, task_id);
+CREATE INDEX operation_tasks_execution_lookup
+    ON operation_tasks (tenant_id, execution_key_digest, task_id);
+
+-- Request identity aliases are separate from the canonical operation row. A semantically reused
+-- request points at the canonical task here, so a later replay of that same request is reported
+-- as request_replayed rather than being mistaken for a new execution discovery.
+CREATE TABLE task_request_identities (
+    tenant_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    request_digest BLOB NOT NULL CHECK (length(request_digest) = 32),
+    task_id TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, request_id),
+    FOREIGN KEY (tenant_id, task_id) REFERENCES operation_tasks (tenant_id, task_id) ON DELETE CASCADE
+) STRICT;
+
+CREATE INDEX task_request_identities_task_lookup
+    ON task_request_identities (tenant_id, task_id);
 
 CREATE TABLE task_attempts (
     tenant_id TEXT NOT NULL,
     task_id TEXT NOT NULL,
     attempt_id TEXT NOT NULL,
     attempt TEXT NOT NULL CHECK (attempt <> '' AND attempt NOT GLOB '*[^0-9]*'),
-    state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'waiting', 'verifying', 'succeeded', 'stalled', 'failed', 'cancelled')),
-    phase TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'waiting', 'verifying', 'succeeded', 'stalled', 'failed', 'cancelling', 'cancelled')),
+    current_stage_key TEXT NOT NULL,
     created_at_unix_ms TEXT NOT NULL CHECK (created_at_unix_ms <> '' AND created_at_unix_ms NOT GLOB '*[^0-9]*'),
     updated_at_unix_ms TEXT NOT NULL CHECK (updated_at_unix_ms <> '' AND updated_at_unix_ms NOT GLOB '*[^0-9]*'),
     started_at_unix_ms TEXT CHECK (started_at_unix_ms IS NULL OR (started_at_unix_ms <> '' AND started_at_unix_ms NOT GLOB '*[^0-9]*')),
@@ -744,7 +773,7 @@ CREATE TABLE task_events (
     sequence TEXT NOT NULL CHECK (sequence <> '' AND sequence NOT GLOB '*[^0-9]*'),
     attempt TEXT NOT NULL CHECK (attempt <> '' AND attempt NOT GLOB '*[^0-9]*'),
     kind TEXT NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'waiting', 'verifying', 'succeeded', 'stalled', 'failed', 'cancelled')),
+    state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'waiting', 'verifying', 'succeeded', 'stalled', 'failed', 'cancelling', 'cancelled')),
     occurred_at_unix_ms TEXT NOT NULL CHECK (occurred_at_unix_ms <> '' AND occurred_at_unix_ms NOT GLOB '*[^0-9]*'),
     resource_version TEXT NOT NULL CHECK (resource_version <> '' AND resource_version NOT GLOB '*[^0-9]*'),
     payload BLOB NOT NULL,
@@ -755,6 +784,64 @@ CREATE TABLE task_events (
 
 CREATE INDEX task_events_sequence_page
     ON task_events (tenant_id, task_id, sequence);
+
+CREATE TABLE task_stages (
+    tenant_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    stage_key TEXT NOT NULL,
+    stage_kind TEXT NOT NULL,
+    ordinal TEXT NOT NULL CHECK (ordinal <> '' AND ordinal NOT GLOB '*[^0-9]*'),
+    state TEXT NOT NULL CHECK (state IN ('pending', 'ready', 'running', 'waiting', 'verifying', 'succeeded', 'skipped', 'no_op', 'stalled', 'failed', 'cancelling', 'cancelled')),
+    stage_attempt TEXT NOT NULL CHECK (stage_attempt <> '' AND stage_attempt NOT GLOB '*[^0-9]*'),
+    outcome TEXT CHECK (outcome IS NULL OR outcome IN ('succeeded', 'skipped', 'no_op', 'reused', 'failed', 'cancelled')),
+    progress_completed TEXT NOT NULL CHECK (progress_completed <> '' AND progress_completed NOT GLOB '*[^0-9]*'),
+    progress_total TEXT NOT NULL CHECK (progress_total <> '' AND progress_total NOT GLOB '*[^0-9]*'),
+    progress_completed_bytes TEXT NOT NULL CHECK (progress_completed_bytes <> '' AND progress_completed_bytes NOT GLOB '*[^0-9]*'),
+    progress_total_bytes TEXT NOT NULL CHECK (progress_total_bytes <> '' AND progress_total_bytes NOT GLOB '*[^0-9]*'),
+    detail_kind TEXT,
+    detail_id TEXT,
+    issue BLOB,
+    created_at_unix_ms TEXT NOT NULL CHECK (created_at_unix_ms <> '' AND created_at_unix_ms NOT GLOB '*[^0-9]*'),
+    updated_at_unix_ms TEXT NOT NULL CHECK (updated_at_unix_ms <> '' AND updated_at_unix_ms NOT GLOB '*[^0-9]*'),
+    started_at_unix_ms TEXT CHECK (started_at_unix_ms IS NULL OR (started_at_unix_ms <> '' AND started_at_unix_ms NOT GLOB '*[^0-9]*')),
+    finished_at_unix_ms TEXT CHECK (finished_at_unix_ms IS NULL OR (finished_at_unix_ms <> '' AND finished_at_unix_ms NOT GLOB '*[^0-9]*')),
+    resource_version TEXT NOT NULL CHECK (resource_version <> '' AND resource_version NOT GLOB '*[^0-9]*'),
+    payload BLOB NOT NULL,
+    PRIMARY KEY (tenant_id, task_id, stage_key),
+    FOREIGN KEY (tenant_id, task_id) REFERENCES operation_tasks (tenant_id, task_id) ON DELETE CASCADE
+) STRICT;
+
+-- Immutable snapshots of every prior stage execution. The current task_stages row is a mutable
+-- projection; this table keeps retry/transition history available for audit without creating child
+-- tasks or promoting object batches to first-class stages.
+CREATE TABLE task_stage_history (
+    tenant_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    stage_key TEXT NOT NULL,
+    stage_attempt TEXT NOT NULL CHECK (stage_attempt <> '' AND stage_attempt NOT GLOB '*[^0-9]*'),
+    resource_version TEXT NOT NULL CHECK (resource_version <> '' AND resource_version NOT GLOB '*[^0-9]*'),
+    recorded_at_unix_ms TEXT NOT NULL CHECK (recorded_at_unix_ms <> '' AND recorded_at_unix_ms NOT GLOB '*[^0-9]*'),
+    payload BLOB NOT NULL,
+    PRIMARY KEY (tenant_id, task_id, stage_key, resource_version),
+    FOREIGN KEY (tenant_id, task_id) REFERENCES operation_tasks (tenant_id, task_id) ON DELETE CASCADE
+) STRICT;
+
+CREATE INDEX task_stage_history_lookup
+    ON task_stage_history (tenant_id, task_id, stage_key, stage_attempt, resource_version);
+
+CREATE TABLE task_stage_dependencies (
+    tenant_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    stage_key TEXT NOT NULL,
+    dependency_key TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, task_id, stage_key, dependency_key),
+    FOREIGN KEY (tenant_id, task_id, stage_key) REFERENCES task_stages (tenant_id, task_id, stage_key) ON DELETE CASCADE,
+    FOREIGN KEY (tenant_id, task_id, dependency_key) REFERENCES task_stages (tenant_id, task_id, stage_key) ON DELETE CASCADE,
+    CHECK (stage_key <> dependency_key)
+) STRICT;
+
+CREATE INDEX task_stages_order
+    ON task_stages (tenant_id, task_id, ordinal, stage_key);
 
 CREATE TABLE task_resource_links (
     tenant_id TEXT NOT NULL,
@@ -985,7 +1072,7 @@ async fn initialize_or_validate(pool: &SqlitePool, initialize: bool) -> CentralR
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
-        sqlx::query("PRAGMA user_version = 20")
+        sqlx::query("PRAGMA user_version = 21")
             .execute(&mut *transaction)
             .await
             .map_err(storage_error)?;
@@ -1020,7 +1107,13 @@ async fn validate_current_schema(pool: &SqlitePool) -> CentralResult<()> {
 
     let mut expected_objects = BTreeSet::new();
     let schema = schema_sql();
-    for expected_statement in schema
+    let schema_without_comments = schema
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for expected_statement in schema_without_comments
         .split(';')
         .map(str::trim)
         .filter(|statement| !statement.is_empty())
@@ -1066,7 +1159,14 @@ fn schema_object(statement: &str) -> CentralResult<(&'static str, &str)> {
 }
 
 fn normalize_schema_sql(sql: &str) -> String {
-    sql.chars()
+    // SQLite omits SQL comments from sqlite_schema.sql. Strip line comments from the embedded
+    // schema before comparing it so comments remain useful documentation without changing the
+    // schema identity check.
+    sql.lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("--"))
+        .collect::<String>()
+        .chars()
         .filter(|character| !character.is_ascii_whitespace())
         .collect()
 }

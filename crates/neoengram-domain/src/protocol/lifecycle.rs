@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AgentId, ArtifactId, ContentDigest, DecimalU64, DeletionId, DeletionProofId,
-    LifecycleAssignmentId, LifecycleEventId, LifecycleGeneration, PlaygroundId, ProjectId,
-    RequestId, ResourceVersion, RetentionHoldId, SnapshotId, StorageVolumeId, TenantId, UnixMillis,
+    LifecycleAssignmentId, LifecycleEventId, LifecycleGeneration, ProjectId, RequestId,
+    ResourceVersion, RetentionHoldId, SnapshotId, StorageVolumeId, TenantId, UnixMillis,
+    WorkspaceId,
 };
 
 /// Fixed recovery window used by lifecycle v1.
@@ -33,6 +34,9 @@ pub enum ResourceLifecycleState {
 )]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResourceRef {
+    Project {
+        project_id: ProjectId,
+    },
     StorageVolume {
         storage_volume_id: StorageVolumeId,
     },
@@ -40,17 +44,19 @@ pub enum ResourceRef {
         project_id: ProjectId,
         artifact_id: ArtifactId,
     },
-    Playground {
+    #[serde(rename = "workspace")]
+    Workspace {
         project_id: ProjectId,
         artifact_id: ArtifactId,
-        playground_id: PlaygroundId,
+        #[serde(rename = "workspace_id")]
+        workspace_id: WorkspaceId,
     },
     Snapshot {
         snapshot_id: SnapshotId,
     },
 }
 
-/// Persisted lifecycle fields shared by Artifact, StorageVolume, Playground, and Snapshot.
+/// Persisted lifecycle fields shared by Artifact, StorageVolume, Workspace, and Snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceLifecycle {

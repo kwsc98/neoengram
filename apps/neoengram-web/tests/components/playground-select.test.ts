@@ -4,22 +4,22 @@ import { ElOption, ElSelect } from 'element-plus';
 import ElementPlus from 'element-plus';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { PlaygroundView } from '@/api/types';
-import PlaygroundSelect from '@/components/PlaygroundSelect.vue';
+import type { WorkspaceView } from '@/api/types';
+import WorkspaceSelect from '@/components/WorkspaceSelect.vue';
 
-const api = vi.hoisted(() => ({ queryPlaygroundList: vi.fn() }));
+const api = vi.hoisted(() => ({ queryWorkspaceList: vi.fn() }));
 
 vi.mock('@/api/operations', () => api);
 
-function playground(overrides: Partial<PlaygroundView> = {}): PlaygroundView {
+function workspace(overrides: Partial<WorkspaceView> = {}): WorkspaceView {
   return {
     tenant_id: 'tenant-a',
     project_id: 'project-a',
     artifact_id: 'artifact-a',
-    playground_id: 'playground-a',
+    workspace_id: 'workspace-a',
     storage_volume_id: 'volume-a',
     region: 'cn-shanghai',
-    display_name: 'Playground A',
+    display_name: 'Workspace A',
     index_version: { revision: '7', digest: 'a'.repeat(64) },
     state: 'ready',
     storage_availability: 'ready',
@@ -33,25 +33,25 @@ function playground(overrides: Partial<PlaygroundView> = {}): PlaygroundView {
 
 afterEach(() => vi.clearAllMocks());
 
-describe('PlaygroundSelect', () => {
-  it('emits the complete PlaygroundView returned by the tenant-scoped list query', async () => {
-    const option = playground();
-    api.queryPlaygroundList.mockResolvedValue({
+describe('WorkspaceSelect', () => {
+  it('emits the complete WorkspaceView returned by the tenant-scoped list query', async () => {
+    const option = workspace();
+    api.queryWorkspaceList.mockResolvedValue({
       data: { items: [option] },
-      requestId: 'request-playgrounds',
+      requestId: 'request-workspaces',
     });
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const wrapper = mount(PlaygroundSelect, {
+    const wrapper = mount(WorkspaceSelect, {
       props: { tenantId: 'tenant-a', modelValue: undefined },
       global: { plugins: [ElementPlus, [VueQueryPlugin, { queryClient }]] },
     });
     await flushPromises();
 
-    expect(api.queryPlaygroundList).toHaveBeenCalledWith({ tenant_id: 'tenant-a', page_size: 50 });
+    expect(api.queryWorkspaceList).toHaveBeenCalledWith({ tenant_id: 'tenant-a', page_size: 50 });
     expect(wrapper.findAllComponents(ElOption)).toHaveLength(1);
     wrapper
       .findComponent(ElSelect)
-      .vm.$emit('update:modelValue', 'project-a\u0000artifact-a\u0000playground-a');
+      .vm.$emit('update:modelValue', 'project-a\u0000artifact-a\u0000workspace-a');
     await flushPromises();
 
     expect(wrapper.emitted('update:modelValue')?.at(-1)).toEqual([option]);
@@ -60,13 +60,13 @@ describe('PlaygroundSelect', () => {
     queryClient.clear();
   });
 
-  it('disables a Playground whose lifecycle is ready but storage is unavailable', async () => {
-    api.queryPlaygroundList.mockResolvedValue({
-      data: { items: [playground({ storage_availability: 'unavailable' })] },
-      requestId: 'request-playgrounds',
+  it('disables a Workspace whose lifecycle is ready but storage is unavailable', async () => {
+    api.queryWorkspaceList.mockResolvedValue({
+      data: { items: [workspace({ storage_availability: 'unavailable' })] },
+      requestId: 'request-workspaces',
     });
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const wrapper = mount(PlaygroundSelect, {
+    const wrapper = mount(WorkspaceSelect, {
       props: { tenantId: 'tenant-a', modelValue: undefined },
       global: { plugins: [ElementPlus, [VueQueryPlugin, { queryClient }]] },
     });
@@ -80,21 +80,21 @@ describe('PlaygroundSelect', () => {
   });
 
   it('explains an abnormal lifecycle before reporting a ready StorageVolume', async () => {
-    api.queryPlaygroundList.mockResolvedValue({
+    api.queryWorkspaceList.mockResolvedValue({
       data: {
-        items: [playground({ state: 'abnormal', storage_availability: 'ready' })],
+        items: [workspace({ state: 'abnormal', storage_availability: 'ready' })],
       },
-      requestId: 'request-playgrounds',
+      requestId: 'request-workspaces',
     });
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const wrapper = mount(PlaygroundSelect, {
+    const wrapper = mount(WorkspaceSelect, {
       props: { tenantId: 'tenant-a', modelValue: undefined },
       global: { plugins: [ElementPlus, [VueQueryPlugin, { queryClient }]] },
     });
     await flushPromises();
 
     expect(wrapper.findComponent(ElOption).props('disabled')).toBe(true);
-    expect(wrapper.findComponent(ElOption).text()).toContain('Playground 生命周期异常');
+    expect(wrapper.findComponent(ElOption).text()).toContain('Workspace 生命周期异常');
     expect(wrapper.findComponent(ElOption).text()).not.toContain('存储可达');
 
     wrapper.unmount();

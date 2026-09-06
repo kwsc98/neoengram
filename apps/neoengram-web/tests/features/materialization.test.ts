@@ -51,6 +51,7 @@ function materialization(
     object_namespace_id: requestScope.artifactId,
     commit_id: requestScope.commitId,
     target_storage_volume_id: 'volume-a',
+    purpose: 'copy',
     plan_revision: '1',
     coverage_goal: 'complete',
     state,
@@ -69,15 +70,49 @@ function materialization(
 function task(value: MaterializationView, state: TaskView['state'] = 'queued'): TaskView {
   return {
     task_id: value.materialization_id,
-    task_kind: 'commit.materialize',
+    intent_kind: 'commit.materialize',
+    purpose: value.purpose,
     state,
-    phase: value.state,
     tenant_id: value.tenant_id,
-    project_id: requestScope.projectId,
-    ...(value.artifact_id ? { artifact_id: value.artifact_id } : {}),
-    object_namespace_id: value.object_namespace_id,
-    commit_id: value.commit_id,
-    storage_volume_id: value.target_storage_volume_id,
+    primary_resource: { resource_kind: 'materialization', resource_id: value.materialization_id },
+    resource_links: [
+      { resource_kind: 'project', resource_id: requestScope.projectId, role: 'related' },
+      ...(value.artifact_id
+        ? [{ resource_kind: 'artifact', resource_id: value.artifact_id, role: 'related' as const }]
+        : []),
+      {
+        resource_kind: 'object_namespace',
+        resource_id: value.object_namespace_id,
+        role: 'related',
+      },
+      { resource_kind: 'commit', resource_id: value.commit_id, role: 'source' },
+      {
+        resource_kind: 'storage_volume',
+        resource_id: value.target_storage_volume_id,
+        role: 'target',
+      },
+    ],
+    execution_id: `execution-${value.materialization_id}`,
+    execution_key_digest: value.object_set_digest,
+    execution_reused: false,
+    current_stage: {
+      stage_key: state === 'succeeded' ? 'finalize' : 'transfer',
+      stage_kind: state === 'succeeded' ? 'finalize' : 'transfer',
+      ordinal: state === 'succeeded' ? '6' : '3',
+      dependencies: state === 'succeeded' ? ['publish_coverage'] : ['plan'],
+      state: state === 'queued' ? 'ready' : state,
+      stage_attempt: value.plan_revision,
+      progress: {
+        completed: value.verified_objects,
+        total: value.total_objects,
+        completed_bytes: value.verified_bytes,
+        total_bytes: value.total_bytes,
+      },
+      created_at_unix_ms: '1',
+      updated_at_unix_ms: '1',
+      resource_version: '1',
+    },
+    stages: [],
     request_id: 'request-test',
     request_digest: 'e'.repeat(64),
     actor: 'test-user',
@@ -88,8 +123,6 @@ function task(value: MaterializationView, state: TaskView['state'] = 'queued'): 
       completed_bytes: value.verified_bytes,
       total_bytes: value.total_bytes,
     },
-    detail_kind: 'materialization',
-    detail_id: value.materialization_id,
     deadline_unix_ms: '9999999999999',
     created_at_unix_ms: '1',
     updated_at_unix_ms: '1',
@@ -129,18 +162,20 @@ function prepareQueries(
   api.queryCommitCoverage.mockResolvedValue(result<QueryCommitCoverageResponse>({ coverage }));
   api.queryCommitAvailabilityV2.mockResolvedValue(result(availability));
   api.materializeCommit.mockResolvedValue(
-    result({ materialization: materialization('queued'), replayed: false }),
+    result({ materialization: materialization('queued'), request_replayed: false }),
   );
   api.retryTask.mockResolvedValue(
     result<TaskMutationResponse>({
       task: task(materialization('queued', { plan_revision: '2' })),
-      replayed: false,
+      request_replayed: false,
+      execution_reused: false,
     }),
   );
   api.cancelTask.mockResolvedValue(
     result<TaskMutationResponse>({
       task: task(materialization('cancelled'), 'cancelled'),
-      replayed: false,
+      request_replayed: false,
+      execution_reused: false,
     }),
   );
 }
@@ -204,7 +239,7 @@ describe('Commit materialization feature', () => {
       tenant_id: requestScope.tenantId,
       object_namespace_id: requestScope.artifactId,
       commit_id: requestScope.commitId,
-      task_kind: ['commit.materialize'],
+      intent_kind: ['commit.materialize'],
       page_size: 100,
     });
     expect(api.queryCommitCoverage).toHaveBeenCalledWith({
@@ -230,6 +265,7 @@ describe('Commit materialization feature', () => {
         object_namespace_id: requestScope.artifactId,
         commit_id: requestScope.commitId,
         target_storage_volume_id: 'volume-target',
+        purpose: 'copy',
         coverage_goal: 'complete',
       }),
     );
@@ -270,6 +306,22 @@ describe('Commit materialization feature', () => {
       throw new Error('retry request was not captured');
     }
     expect(api.materializeCommit).not.toHaveBeenCalled();
+    wrapper.unmount();
+    queryClient.clear();
+  });
+
+  it('does not create a duplicate task when the target already has an active task', async () => {
+    prepareQueries([
+      materialization('materializing', { target_storage_volume_id: 'volume-target' }),
+    ]);
+    const { queryClient, state, wrapper } = await mountFeature();
+
+    const action = await state.value!.materializeOrRepair('volume-target');
+
+    expect(action.mode).toBe('in_flight');
+    expect(action.materialization?.target_storage_volume_id).toBe('volume-target');
+    expect(api.materializeCommit).not.toHaveBeenCalled();
+    expect(api.retryTask).not.toHaveBeenCalled();
     wrapper.unmount();
     queryClient.clear();
   });

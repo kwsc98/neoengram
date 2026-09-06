@@ -21,8 +21,8 @@ use neoengram_domain::protocol::{
     object_read_lease_id, staging_lease_id, AgentId, ArtifactId, CommitObject, DecimalU64,
     Generation, MaterializationBatchId, MaterializationId, ObjectNamespaceId, ObjectSet,
     ObjectTicketId, OperationTask, PlacementGeneration, RequestId, StorageVolumeId, TaskAttemptId,
-    TaskId, TaskKind, TaskResourceKind, TaskResourceRole, TaskScope, TaskState, TenantId,
-    UnixMillis,
+    TaskId, TaskIntent, TaskPurpose, TaskResourceKind, TaskResourceRole, TaskScope, TaskState,
+    TenantId, UnixMillis,
 };
 
 use crate::dto::{
@@ -113,6 +113,42 @@ fn materialization_id_for_key(key: &MaterializationJobKey) -> Result<Materializa
         .map_err(|error| invalid_request(format!("materialization key: {error}")))?;
     MaterializationId::new(format!("materialization-{}", &digest.to_hex()[..32]))
         .map_err(|error| invalid_request(format!("materialization_id: {error}")))
+}
+
+/// Derives an execution-specific materialization identity. Copy plans retain the stable key
+/// identity, while repair plans include the observation fence so a later corruption observation
+/// cannot be deduplicated against an earlier successful repair.
+fn materialization_id_for_request(
+    key: &MaterializationJobKey,
+    purpose: TaskPurpose,
+    repair_observation_digest: Option<&str>,
+    target_placement_generation: Option<&str>,
+) -> Result<MaterializationId, Error> {
+    if purpose == TaskPurpose::Copy {
+        return materialization_id_for_key(key);
+    }
+    let fence = repair_observation_digest
+        .or(target_placement_generation)
+        .ok_or_else(|| {
+            invalid_request(
+                "repair requires repair_observation_digest or target_placement_generation",
+            )
+        })?;
+    let key_digest = neoengram_domain::protocol::jcs_blake3(key)
+        .map_err(|error| invalid_request(format!("materialization key: {error}")))?;
+    let material = format!("repair\0{}\0{}", key_digest, fence);
+    let digest = ContentDigest::hash(material.as_bytes());
+    MaterializationId::new(format!("materialization-{}", &digest.to_hex()[..32]))
+        .map_err(|error| invalid_request(format!("materialization_id: {error}")))
+}
+
+fn task_attempt_generation(value: &TaskAttemptId) -> Generation {
+    value
+        .as_str()
+        .rsplit_once("-attempt-")
+        .and_then(|(_, suffix)| suffix.parse::<u64>().ok())
+        .map(Generation::new)
+        .unwrap_or_else(|| Generation::new(1))
 }
 
 fn state_name(state: MaterializationJobState) -> &'static str {
@@ -247,6 +283,7 @@ fn view(job: &MaterializationJob, object_set: &NamespaceObjectSet) -> Materializ
         object_namespace_id: job.key.object_namespace_id.to_string(),
         commit_id: job.key.commit_id.to_string(),
         target_storage_volume_id: job.key.target_storage_volume_id.to_string(),
+        purpose: job.key.purpose,
         plan_revision: job.plan_revision.to_string(),
         coverage_goal: job.key.coverage_goal,
         state: state_name(job.state).to_owned(),
@@ -1276,6 +1313,43 @@ impl CatalogService {
         let commit_digest = parse_commit(request.commit_id)?;
         let target_volume_id =
             parse_volume(request.target_storage_volume_id, "target_storage_volume_id")?;
+        let purpose = request.purpose;
+        let repair_observation_digest = request
+            .repair_observation_digest
+            .as_deref()
+            .map(|value| {
+                value.parse::<ContentDigest>().map_err(|_| {
+                    invalid_request("repair_observation_digest must be a 64-character digest")
+                })
+            })
+            .transpose()?;
+        let repair_target_placement_generation = request
+            .target_placement_generation
+            .as_deref()
+            .map(|value| {
+                parse_generation(value.to_owned(), "target_placement_generation")
+                    .map(|generation| PlacementGeneration::new(generation.get()))
+            })
+            .transpose()?;
+        match purpose {
+            TaskPurpose::Copy
+                if repair_observation_digest.is_some()
+                    || repair_target_placement_generation.is_some() =>
+            {
+                return Err(invalid_request(
+                    "copy materialization cannot carry a repair fence",
+                ));
+            }
+            TaskPurpose::Repair
+                if repair_observation_digest.is_some()
+                    == repair_target_placement_generation.is_some() =>
+            {
+                return Err(invalid_request(
+                    "repair requires exactly one repair_observation_digest or target_placement_generation",
+                ));
+            }
+            _ => {}
+        }
         let goal = request.coverage_goal.unwrap_or(CoverageGoal::Complete);
         goal.validate()
             .map_err(|error| invalid_request(format!("coverage_goal: {error}")))?;
@@ -1285,20 +1359,29 @@ impl CatalogService {
             commit_id: CommitId::from_digest(commit_digest),
             target_storage_volume_id: target_volume_id.clone(),
             coverage_goal: goal,
+            purpose,
+            repair_observation_digest,
+            repair_target_placement_generation,
         };
         let operation_request_id = RequestId::new(request.request_id.clone())
             .map_err(|error| invalid_request(format!("request_id: {error}")))?;
-        let materialization_id = materialization_id_for_key(&key)?;
-        let (mut task, _task_replayed) = self
+        let materialization_id = materialization_id_for_request(
+            &key,
+            purpose,
+            request.repair_observation_digest.as_deref(),
+            request.target_placement_generation.as_deref(),
+        )?;
+        let (mut task, task_replayed) = self
             .begin_operation_task(
-                TaskKind::CommitMaterialize,
+                TaskIntent::CommitMaterialize,
                 TaskScope {
                     tenant_id: tenant_id.clone(),
                     project_id: Some(project_id.clone()),
                     artifact_id: Some(artifact_id.clone()),
                     object_namespace_id: Some(namespace.clone()),
                     commit_id: Some(CommitId::from_digest(commit_digest)),
-                    playground_id: None,
+                    workspace_id: None,
+
                     snapshot_id: None,
                     storage_volume_id: Some(target_volume_id.clone()),
                 },
@@ -1309,91 +1392,155 @@ impl CatalogService {
                 Some(materialization_id.as_str()),
             )
             .await?;
-        self.link_operation_resource(
+        self.operation_result(
             &task,
-            TaskResourceKind::Materialization,
-            materialization_id.to_string(),
-            TaskResourceRole::Primary,
+            identity,
+            self.link_operation_resource(
+                &task,
+                TaskResourceKind::Materialization,
+                materialization_id.to_string(),
+                TaskResourceRole::Primary,
+            )
+            .await,
         )
         .await?;
-        let repository = self.placement.as_ref().ok_or_else(|| {
-            application_error(
-                ErrorCategory::Unavailable,
-                "placement_authority_unavailable",
-                "PLACEMENT_AUTHORITY_UNAVAILABLE",
-                "placement authority is not configured",
-                true,
+        let repository = self
+            .operation_result(
+                &task,
+                identity,
+                self.placement.as_ref().ok_or_else(|| {
+                    application_error(
+                        ErrorCategory::Unavailable,
+                        "placement_authority_unavailable",
+                        "PLACEMENT_AUTHORITY_UNAVAILABLE",
+                        "placement authority is not configured",
+                        true,
+                    )
+                }),
             )
-        })?;
+            .await?;
         let object_set = self
-            .materialization_object_set(
-                &tenant_id,
-                &project_id,
-                &artifact_id,
-                commit_digest,
-                &namespace,
+            .operation_result(
+                &task,
+                identity,
+                self.materialization_object_set(
+                    &tenant_id,
+                    &project_id,
+                    &artifact_id,
+                    commit_digest,
+                    &namespace,
+                )
+                .await,
             )
             .await?;
         let volume = self
-            .repository
-            .get_storage_volume(&tenant_id, &target_volume_id)
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(|| not_found("storage volume"))?;
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .get_storage_volume(&tenant_id, &target_volume_id)
+                    .await
+                    .map_err(map_central_error)
+                    .and_then(|record| record.ok_or_else(|| not_found("storage volume"))),
+            )
+            .await?;
         if !volume.lifecycle.is_active() || volume.state != crate::StorageVolumeState::Ready {
-            return Err(application_error(
+            let error = application_error(
                 ErrorCategory::Conflict,
                 "storage_volume_not_ready",
                 "STORAGE_VOLUME_NOT_READY",
                 "target StorageVolume is not ready",
                 true,
-            ));
+            );
+            self.fail_operation_task(&task, identity, &error).await;
+            return Err(error);
         }
         if matches!(volume.access_mode, crate::StorageAccessMode::ReadOnlyMany) {
-            return Err(application_error(
+            let error = application_error(
                 ErrorCategory::Conflict,
                 "storage_volume_not_writable",
                 "STORAGE_VOLUME_NOT_WRITABLE",
                 "target StorageVolume is read-only",
                 false,
-            ));
+            );
+            self.fail_operation_task(&task, identity, &error).await;
+            return Err(error);
         }
-        if let Some(existing) = repository
-            .get_materialization_by_key(&key)
-            .await
-            .map_err(map_central_error)?
-        {
+        let existing = self
+            .operation_result(
+                &task,
+                identity,
+                repository
+                    .get_materialization_by_key(&key)
+                    .await
+                    .map_err(map_central_error),
+            )
+            .await?;
+        if let Some(existing) = existing {
+            let task_execution_reused = task.as_ref().is_some_and(|value| value.execution_reused);
+            let task_matches_detail = task
+                .as_ref()
+                .is_some_and(|value| value.task_id == existing.operation_task_id.to_string());
+            let execution_reused = task_execution_reused || !task_matches_detail;
             return Ok(CreateCommitMaterializationResponse {
                 materialization: view(&existing, &object_set),
-                replayed: true,
+                request_replayed: (task_replayed || task.is_none() || task_matches_detail)
+                    && !execution_reused,
+                execution_reused,
                 task,
             });
         }
         let placements = self
-            .v2_placements(&tenant_id, &namespace, &object_set)
+            .operation_result(
+                &task,
+                identity,
+                self.v2_placements(&tenant_id, &namespace, &object_set)
+                    .await,
+            )
             .await?;
         let coverage = self
-            .target_coverage(
-                &tenant_id,
-                &namespace,
-                CommitId::from_digest(commit_digest),
-                &target_volume_id,
-                &object_set,
-                &placements,
+            .operation_result(
+                &task,
+                identity,
+                self.target_coverage(
+                    &tenant_id,
+                    &namespace,
+                    CommitId::from_digest(commit_digest),
+                    &target_volume_id,
+                    &object_set,
+                    &placements,
+                )
+                .await,
             )
             .await?;
         let now = self.clock.now();
-        let deadline = now
-            .get()
-            .checked_add(MATERIALIZATION_PLAN_DEADLINE_MS)
-            .ok_or_else(|| invalid_request("materialization deadline overflowed"))?;
+        let deadline = self
+            .operation_result(
+                &task,
+                identity,
+                now.get()
+                    .checked_add(MATERIALIZATION_PLAN_DEADLINE_MS)
+                    .ok_or_else(|| invalid_request("materialization deadline overflowed")),
+            )
+            .await?;
         let id = materialization_id;
-        let total_bytes = object_set
-            .total_bytes()
-            .map_err(|error| invalid_request(format!("object total size: {error}")))?;
+        let total_bytes = self
+            .operation_result(
+                &task,
+                identity,
+                object_set
+                    .total_bytes()
+                    .map_err(|error| invalid_request(format!("object total size: {error}"))),
+            )
+            .await?;
         let total_objects = object_set.object_count() as u64;
-        goal.validate_against_totals(total_objects, total_bytes)
-            .map_err(|error| invalid_request(format!("coverage_goal: {error}")))?;
+        self.operation_result(
+            &task,
+            identity,
+            goal.validate_against_totals(total_objects, total_bytes)
+                .map_err(|error| invalid_request(format!("coverage_goal: {error}"))),
+        )
+        .await?;
         let target_present = object_set
             .objects
             .iter()
@@ -1469,23 +1616,37 @@ impl CatalogService {
             goal.satisfied_by(verified_objects, verified_bytes, total_objects, total_bytes);
         if !goal_satisfied && missing_bytes > 0 {
             if let Some(capacity) = &self.storage_availability {
-                if let Some(available_bytes) = capacity
-                    .current_available_bytes(&tenant_id, &target_volume_id)
-                    .await
-                    .map_err(map_central_error)?
-                {
-                    let required_bytes = materialization_capacity_requirement(
-                        required_refs
-                            .iter()
-                            .map(|object| object.size.get())
-                            .try_fold(0_u64, |total, size| total.checked_add(size))
-                            .ok_or_else(|| {
-                                invalid_request("materialization capacity requirement overflow")
-                            })?,
-                        volume.copy_reserve_bytes.get(),
-                    )?;
+                let available = self
+                    .operation_result(
+                        &task,
+                        identity,
+                        capacity
+                            .current_available_bytes(&tenant_id, &target_volume_id)
+                            .await
+                            .map_err(map_central_error),
+                    )
+                    .await?;
+                if let Some(available_bytes) = available {
+                    let required_bytes = self
+                        .operation_result(
+                            &task,
+                            identity,
+                            materialization_capacity_requirement(
+                                required_refs
+                                    .iter()
+                                    .map(|object| object.size.get())
+                                    .try_fold(0_u64, |total, size| total.checked_add(size))
+                                    .ok_or_else(|| {
+                                        invalid_request(
+                                            "materialization capacity requirement overflow",
+                                        )
+                                    })?,
+                                volume.copy_reserve_bytes.get(),
+                            ),
+                        )
+                        .await?;
                     if available_bytes < required_bytes {
-                        return Err(application_error(
+                        let error = application_error(
                             ErrorCategory::ResourceExhausted,
                             "materialization_capacity_insufficient",
                             "MATERIALIZATION_CAPACITY_INSUFFICIENT",
@@ -1493,7 +1654,9 @@ impl CatalogService {
                                 "target StorageVolume requires {required_bytes} available bytes including staging and concurrency reserve, but reports {available_bytes}"
                             ),
                             true,
-                        ));
+                        );
+                        self.fail_operation_task(&task, identity, &error).await;
+                        return Err(error);
                     }
                 }
             }
@@ -1697,41 +1860,76 @@ impl CatalogService {
         let mut staging_leases = Vec::new();
         if !planned_batches.is_empty() {
             for batch in &planned_batches {
-                let (reads, staging) =
-                    Self::build_batch_leases(&job, batch, &planned_objects, &placements)?;
+                let (reads, staging) = self
+                    .operation_result(
+                        &task,
+                        identity,
+                        Self::build_batch_leases(&job, batch, &planned_objects, &placements),
+                    )
+                    .await?;
                 object_read_leases.extend(reads);
                 staging_leases.extend(staging);
             }
         }
-        let outcome = repository
-            .insert_materialization_plan(MaterializationPlan {
-                job: job.clone(),
-                batches: planned_batches,
-                objects: planned_objects,
-                object_read_leases,
-                staging_leases,
-                coverage,
-            })
-            .await
-            .map_err(map_central_error)?;
+        let outcome = self
+            .operation_result(
+                &task,
+                identity,
+                repository
+                    .insert_materialization_plan(MaterializationPlan {
+                        job: job.clone(),
+                        batches: planned_batches,
+                        objects: planned_objects,
+                        object_read_leases,
+                        staging_leases,
+                        coverage,
+                    })
+                    .await
+                    .map_err(map_central_error),
+            )
+            .await?;
         let (stored, replayed) = match outcome {
             MaterializationPlanInsertOutcome::Inserted(stored) => (stored, false),
             MaterializationPlanInsertOutcome::Existing(stored) => (stored, true),
         };
+        let task_execution_reused = task.as_ref().is_some_and(|value| value.execution_reused);
+        let task_matches_detail = task
+            .as_ref()
+            .is_some_and(|value| value.task_id == stored.operation_task_id.to_string());
+        // A detail replay is an execution replay when it resolves to another canonical task;
+        // only an exact request identity is reported as request_replayed.
+        let execution_reused = task_execution_reused || (replayed && !task_matches_detail);
+        if execution_reused {
+            if let Some(value) = task.as_mut() {
+                value.execution_reused = true;
+            }
+        }
+        let previous_task = task.clone();
         task = if stored.state == MaterializationJobState::Complete {
-            self.complete_operation_task(task, identity).await?
-        } else {
-            self.transition_operation_task(
-                task,
-                TaskState::Running,
+            self.operation_result(
+                &previous_task,
                 identity,
-                Some("materialization plan accepted".to_owned()),
+                self.complete_operation_task(task, identity).await,
+            )
+            .await?
+        } else {
+            self.operation_result(
+                &previous_task,
+                identity,
+                self.transition_operation_task(
+                    task,
+                    TaskState::Running,
+                    identity,
+                    Some("materialization plan accepted".to_owned()),
+                )
+                .await,
             )
             .await?
         };
         Ok(CreateCommitMaterializationResponse {
             materialization: view(&stored, &object_set),
-            replayed,
+            request_replayed: (replayed || task_replayed) && !execution_reused,
+            execution_reused,
             task,
         })
     }
@@ -1879,6 +2077,9 @@ impl CatalogService {
             ticket_id,
             operation_task_id: job.operation_task_id.clone(),
             task_attempt_id: job.task_attempt_id.clone(),
+            task_attempt: task_attempt_generation(&job.task_attempt_id),
+            stage_key: "transfer".to_owned(),
+            stage_attempt: batch.batch_attempt,
             materialization_id: batch.materialization_id.clone(),
             batch_id: batch.batch_id.clone(),
             plan_revision: batch.plan_revision,
@@ -2099,7 +2300,10 @@ impl CatalogService {
             if goal_satisfied {
                 return Ok(RetryCommitMaterializationResponse {
                     materialization: view(&current, &object_set),
-                    replayed: true,
+                    // The retry request is a fresh request identity. A complete, still-satisfied
+                    // plan is therefore a semantic no-op rather than an exact request replay.
+                    request_replayed: false,
+                    execution_reused: true,
                 });
             }
         }
@@ -2170,7 +2374,8 @@ impl CatalogService {
         };
         Ok(RetryCommitMaterializationResponse {
             materialization: view(&stored_job, &object_set),
-            replayed,
+            request_replayed: replayed,
+            execution_reused: false,
         })
     }
 

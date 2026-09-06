@@ -23,6 +23,9 @@ pub struct ResourceLifecycleView {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 #[sensitive(kind = "enum")]
 pub enum ResourceRefBody {
+    Project {
+        project_id: String,
+    },
     StorageVolume {
         storage_volume_id: String,
     },
@@ -30,10 +33,12 @@ pub enum ResourceRefBody {
         project_id: String,
         artifact_id: String,
     },
-    Playground {
+    #[serde(rename = "workspace")]
+    Workspace {
         project_id: String,
         artifact_id: String,
-        playground_id: String,
+        #[serde(rename = "workspace_id")]
+        workspace_id: String,
     },
     Snapshot {
         snapshot_id: String,
@@ -230,7 +235,8 @@ pub struct ReleaseRetentionHoldRequest {
 #[sensitive(opaque)]
 pub struct DeletionMutationResponse {
     pub deletion: DeletionOperationView,
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }
@@ -241,7 +247,8 @@ pub struct DeletionMutationResponse {
 pub struct CreateRetentionHoldResponse {
     pub deletion: DeletionOperationView,
     pub retention_hold: RetentionHoldView,
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }
@@ -252,7 +259,8 @@ pub struct CreateRetentionHoldResponse {
 pub struct ReleaseRetentionHoldResponse {
     pub deletion: DeletionOperationView,
     pub retention_hold: RetentionHoldView,
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }

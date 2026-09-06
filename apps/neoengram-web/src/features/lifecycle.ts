@@ -4,12 +4,14 @@ export type LifecycleTagType = 'success' | 'warning' | 'danger' | 'info';
 
 export function resourceRefId(resource: ResourceRef): string {
   switch (resource.type) {
+    case 'project':
+      return resource.project_id;
     case 'storage_volume':
       return resource.storage_volume_id;
     case 'artifact':
       return resource.artifact_id;
-    case 'playground':
-      return resource.playground_id;
+    case 'workspace':
+      return resource.workspace_id;
     case 'snapshot':
       return resource.snapshot_id;
   }
@@ -17,21 +19,24 @@ export function resourceRefId(resource: ResourceRef): string {
 
 export function resourceRefLabel(resource: ResourceRef): string {
   switch (resource.type) {
+    case 'project':
+      return 'Project';
     case 'storage_volume':
       return 'StorageVolume';
     case 'artifact':
       return 'Artifact';
-    case 'playground':
-      return 'Playground';
+    case 'workspace':
+      return 'Workspace';
     case 'snapshot':
       return 'Snapshot';
   }
 }
 
 export function resourceRefScope(resource: ResourceRef): string {
+  if (resource.type === 'project') return resource.project_id;
   if (resource.type === 'artifact') return `${resource.project_id} / ${resource.artifact_id}`;
-  if (resource.type === 'playground') {
-    return `${resource.project_id} / ${resource.artifact_id} / ${resource.playground_id}`;
+  if (resource.type === 'workspace') {
+    return `${resource.project_id} / ${resource.artifact_id} / ${resource.workspace_id}`;
   }
   return resourceRefId(resource);
 }

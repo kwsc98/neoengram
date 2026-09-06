@@ -4,15 +4,16 @@ use std::sync::Arc;
 
 use neoengram_central::{
     open_sqlite_authority, CentralErrorCode, InMemoryComponents, SqliteAuthorityConfig,
-    TaskEventListRequest, TaskInsertOutcome, TaskListRequest, TaskRelationRecord, TaskRepository,
-    TaskResourceLinkRecord,
+    TaskCoordinator, TaskEventListRequest, TaskInsertOutcome, TaskListRequest, TaskRelationRecord,
+    TaskRepository, TaskResourceLinkRecord,
 };
-use neoengram_domain::core::ContentDigest;
+use neoengram_domain::core::{CommitId, ContentDigest};
 use neoengram_domain::protocol::{
-    Extensions, Generation, OperationTask, PrincipalId, PrincipalKind, PrincipalRef, RequestId,
-    SequenceNumber, TaskActor, TaskAttempt, TaskAttemptId, TaskEvent, TaskEventId, TaskEventKind,
-    TaskId, TaskIssue, TaskKind, TaskRelation, TaskRelationKind, TaskResourceKind,
-    TaskResourceLink, TaskResourceRole, TaskScope, TaskState, TenantId, UnixMillis,
+    ArtifactId, Extensions, Generation, ObjectNamespaceId, OperationTask, PrincipalId,
+    PrincipalKind, PrincipalRef, ProjectId, RequestId, SequenceNumber, StorageVolumeId, TaskActor,
+    TaskAttempt, TaskAttemptId, TaskEvent, TaskEventId, TaskEventKind, TaskId, TaskIntent,
+    TaskIssue, TaskPurpose, TaskRelation, TaskRelationKind, TaskResourceKind, TaskResourceLink,
+    TaskResourceRef, TaskResourceRole, TaskScope, TaskState, TenantId, UnixMillis,
 };
 use tempfile::TempDir;
 
@@ -27,7 +28,11 @@ fn actor() -> TaskActor {
 fn task(tenant: &str, task_id: &str, request_id: &str, digest_byte: u8) -> OperationTask {
     OperationTask::new(
         TaskId::new(task_id).unwrap(),
-        TaskKind::CommitMaterialize,
+        TaskIntent::CommitMaterialize,
+        Some(TaskPurpose::Copy),
+        TaskResourceRef::new(TaskResourceKind::Materialization, task_id),
+        format!("execution-{task_id}"),
+        ContentDigest::from_bytes([digest_byte; 32]),
         TaskScope::new(TenantId::new(tenant).unwrap()),
         RequestId::new(request_id).unwrap(),
         ContentDigest::from_bytes([digest_byte; 32]),
@@ -50,7 +55,7 @@ fn created_event(task: &OperationTask) -> TaskEvent {
         actor: task.actor.clone(),
         message: Some("created".to_owned()),
         issue: None,
-        progress: Some(task.progress_summary),
+        progress: Some(task.progress),
         occurred_at_unix_ms: task.created_at_unix_ms,
         resource_version: task.resource_version,
     }
@@ -93,6 +98,27 @@ async fn run_repository_contract(repository: Arc<dyn TaskRepository>) {
     conflict.request_digest = ContentDigest::from_bytes([0x22; 32]);
     let error = repository.insert(conflict).await.unwrap_err();
     assert_eq!(error.code(), CentralErrorCode::ConcurrentUpdate);
+
+    // A different request with the same semantic execution resolves to the canonical task on
+    // first discovery, then becomes an ordinary request replay on its next submission.
+    let mut reused_request = task("tenant-a", "task-b", "request-semantic-b", 0x22);
+    reused_request.execution_id = first.execution_id.clone();
+    reused_request.execution_key_digest = first.execution_key_digest;
+    reused_request.primary_resource = first.primary_resource.clone();
+    let reused = match repository.insert(reused_request.clone()).await.unwrap() {
+        TaskInsertOutcome::Existing(value) => value,
+        TaskInsertOutcome::Inserted(_) => panic!("semantic execution unexpectedly inserted twice"),
+    };
+    assert_eq!(reused.task_id, first.task_id);
+    assert!(reused.execution_reused);
+    assert!(!reused.request_replayed);
+    let replayed = match repository.insert(reused_request).await.unwrap() {
+        TaskInsertOutcome::Existing(value) => value,
+        TaskInsertOutcome::Inserted(_) => panic!("semantic alias unexpectedly inserted twice"),
+    };
+    assert_eq!(replayed.task_id, first.task_id);
+    assert!(replayed.execution_reused);
+    assert!(replayed.request_replayed);
 
     // Task, current Attempt, and event change atomically under one CAS in both backends.
     let running = repository
@@ -198,13 +224,47 @@ async fn run_repository_contract(repository: Arc<dyn TaskRepository>) {
         .await
         .unwrap()
         .task;
+    // Refining a diagnosis without changing the coarse state updates the root and its current
+    // Attempt under one CAS; an Agent must never observe two different issues for one attempt.
+    let refined_issue = TaskIssue {
+        code: "source_unavailable".to_owned(),
+        message: "source remained disconnected after retry window".to_owned(),
+        retryable: true,
+        detail: Some("route-generation=7".to_owned()),
+    };
+    let refined_failed = repository
+        .transition(
+            &first.tenant_id,
+            &first.task_id,
+            failed.resource_version,
+            TaskState::Failed,
+            actor(),
+            Some(refined_issue.clone()),
+            Some("failure diagnosis refined".to_owned()),
+            UnixMillis::new(4),
+        )
+        .await
+        .unwrap();
+    assert!(!refined_failed.replayed);
+    assert_eq!(refined_failed.task.issue, Some(refined_issue.clone()));
+    assert_eq!(
+        repository
+            .attempts(&first.tenant_id, &first.task_id)
+            .await
+            .unwrap()
+            .iter()
+            .find(|attempt| attempt.attempt == failed.attempt)
+            .unwrap()
+            .issue,
+        Some(refined_issue)
+    );
     let retry = repository
         .retry(
             &first.tenant_id,
             &first.task_id,
-            failed.resource_version,
+            refined_failed.task.resource_version,
             actor(),
-            UnixMillis::new(4),
+            UnixMillis::new(5),
         )
         .await
         .unwrap();
@@ -234,7 +294,8 @@ async fn run_repository_contract(repository: Arc<dyn TaskRepository>) {
         4
     );
 
-    // Cancel is idempotent and its second invocation does not append another event.
+    // Cancellation is a convergence fence: the request first enters `cancelling`, then a
+    // separate completion CAS moves the root and current attempt to the terminal state.
     let cancel = repository
         .cancel(
             &first.tenant_id,
@@ -245,14 +306,25 @@ async fn run_repository_contract(repository: Arc<dyn TaskRepository>) {
         )
         .await
         .unwrap();
-    assert_eq!(cancel.task.state, TaskState::Cancelled);
+    assert_eq!(cancel.task.state, TaskState::Cancelling);
+    let completed = repository
+        .complete_cancellation(
+            &first.tenant_id,
+            &first.task_id,
+            cancel.task.resource_version,
+            actor(),
+            UnixMillis::new(6),
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed.task.state, TaskState::Cancelled);
     let replay = repository
         .cancel(
             &first.tenant_id,
             &first.task_id,
             None,
             actor(),
-            UnixMillis::new(6),
+            UnixMillis::new(7),
         )
         .await
         .unwrap();
@@ -277,7 +349,7 @@ async fn run_repository_contract(repository: Arc<dyn TaskRepository>) {
             .unwrap()
             .items
             .len(),
-        5
+        6
     );
 
     // Resource links are idempotent and relation insertion rejects cycles.
@@ -304,10 +376,10 @@ async fn run_repository_contract(repository: Arc<dyn TaskRepository>) {
             .unwrap()
             .items
             .len(),
-        6
+        7
     );
 
-    let second = insert_initial(&repository, task("tenant-a", "task-b", "request-b", 0x33)).await;
+    let second = insert_initial(&repository, task("tenant-a", "task-b", "request-b-2", 0x33)).await;
     let third = insert_initial(&repository, task("tenant-a", "task-c", "request-c", 0x44)).await;
     assert!(!repository
         .add_relation(TaskRelationRecord {
@@ -337,7 +409,7 @@ async fn run_repository_contract(repository: Arc<dyn TaskRepository>) {
             relation: TaskRelation {
                 task_id: first.task_id.clone(),
                 related_task_id: second.task_id.clone(),
-                relation: TaskRelationKind::Parent,
+                relation: TaskRelationKind::CausedBy,
             },
         })
         .await
@@ -360,6 +432,69 @@ async fn run_repository_contract(repository: Arc<dyn TaskRepository>) {
         .iter()
         .all(|item| item.tenant_id == first.tenant_id));
     assert!(!page.items.iter().any(|item| item.task_id == other.task_id));
+}
+
+#[tokio::test]
+async fn sqlite_task_coordinator_persists_scope_links_for_filtered_queries() {
+    let directory = TempDir::new().unwrap();
+    let authority = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
+        .await
+        .unwrap();
+    let repository = authority.authority_store().tasks().unwrap();
+    let components = InMemoryComponents::new(100);
+    let coordinator = TaskCoordinator::new(repository.clone(), components.clock.clone());
+    let tenant_id = TenantId::new("tenant-scope-index").unwrap();
+    let commit_id = CommitId::from_bytes([8; 32]);
+    let scope = TaskScope {
+        tenant_id: tenant_id.clone(),
+        project_id: Some(ProjectId::new("project-scope-index").unwrap()),
+        artifact_id: Some(ArtifactId::new("artifact-scope-index").unwrap()),
+        object_namespace_id: Some(ObjectNamespaceId::new("namespace-scope-index").unwrap()),
+        commit_id: Some(commit_id),
+        workspace_id: None,
+        snapshot_id: None,
+        storage_volume_id: Some(StorageVolumeId::new("volume-scope-index").unwrap()),
+    };
+    let (task, replayed) = coordinator
+        .create_root(
+            TaskIntent::CommitMaterialize,
+            scope,
+            RequestId::new("scope-index-request").unwrap(),
+            &serde_json::json!({ "purpose": "copy", "commit_id": commit_id.to_string() }),
+            actor(),
+            Some("materialization"),
+            Some("materialization-scope-index"),
+        )
+        .await
+        .unwrap();
+    assert!(!replayed);
+
+    let page = repository
+        .list(&TaskListRequest {
+            tenant_id,
+            project_id: Some(ProjectId::new("project-scope-index").unwrap()),
+            artifact_id: Some(ArtifactId::new("artifact-scope-index").unwrap()),
+            object_namespace_id: Some(ObjectNamespaceId::new("namespace-scope-index").unwrap()),
+            commit_id: Some(commit_id),
+            storage_volume_id: Some(StorageVolumeId::new("volume-scope-index").unwrap()),
+            intent_kinds: vec![TaskIntent::CommitMaterialize],
+            purpose: Some(TaskPurpose::Copy),
+            ..TaskListRequest::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].task_id, task.task_id);
+    assert!(page.items[0].resource_links.iter().any(|link| {
+        link.resource_kind == TaskResourceKind::ObjectNamespace
+            && link.resource_id == "namespace-scope-index"
+    }));
+    assert!(page.items[0].resource_links.iter().any(|link| {
+        link.resource_kind == TaskResourceKind::StorageVolume
+            && link.resource_id == "volume-scope-index"
+            && link.role == TaskResourceRole::Target
+    }));
+    authority.close().await;
 }
 
 #[tokio::test]
@@ -414,7 +549,7 @@ async fn sqlite_task_repository_contract_and_reopen() {
             .unwrap()
             .items
             .len(),
-        6
+        7
     );
     reopened.close().await;
 }

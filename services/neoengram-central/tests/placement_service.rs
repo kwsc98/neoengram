@@ -282,8 +282,7 @@ fn commit_record(
         tenant_id: tenant_id.clone(),
         project_id: ProjectId::new("project-a").unwrap(),
         artifact_id: ArtifactId::new("artifact-a").unwrap(),
-        source_playground_id: neoengram_domain::protocol::PlaygroundId::new("playground-a")
-            .unwrap(),
+        source_workspace_id: neoengram_domain::protocol::WorkspaceId::new("workspace-a").unwrap(),
         source_precommit_id: neoengram_central::PreCommitId::new("precommit-a").unwrap(),
         commit_request_id: RequestId::new("commit-request-a").unwrap(),
         commit_id: CommitId::from_digest(commit_id),
@@ -381,7 +380,7 @@ impl PreCommitRepository for CommitLookupRepository {
         _tenant_id: &TenantId,
         _project_id: &ProjectId,
         _artifact_id: &ArtifactId,
-        _playground_id: &neoengram_domain::protocol::PlaygroundId,
+        _workspace_id: &neoengram_domain::protocol::WorkspaceId,
     ) -> CentralResult<Option<PreCommitRecord>> {
         Self::unused()
     }

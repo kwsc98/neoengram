@@ -476,7 +476,7 @@ impl LocalLockManager {
     fn lock_path(&self, identity: &MutationIdentity) -> PathBuf {
         let key = format!(
             "{}\0{}\0{}",
-            identity.tenant_id, identity.artifact_id, identity.playground_id
+            identity.tenant_id, identity.artifact_id, identity.workspace_id
         );
         self.root.as_path().join(format!(
             "{}.mutation.lock",
@@ -499,7 +499,7 @@ impl LockManager for LocalLockManager {
         file.try_lock_exclusive().map_err(|error| {
             EngineError::new(
                 ErrorCode::Conflict,
-                "playground mutation lock is already held",
+                "workspace mutation lock is already held",
             )
             .with_source(error)
         })?;
@@ -617,7 +617,7 @@ mod tests {
         MutationIdentity {
             tenant_id: "tenant-a".to_owned(),
             artifact_id: "artifact-a".to_owned(),
-            playground_id: "playground-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
             job_id: "job-a".to_owned(),
             storage_volume_id: "volume-a".to_owned(),
             owner_generation: 1,

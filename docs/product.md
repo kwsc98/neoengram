@@ -41,7 +41,7 @@ NeoEngram 是面向大规模训练数据、模型权重和其他文件型数据�
 一句话产品定义：
 
 ```text
-在中心管理逻辑数据资产和不可变版本，在区域存储上提供可写 Playground 和只读 Snapshot，
+在中心管理逻辑数据资产和不可变版本，在区域存储上提供可写 Workspace 和只读 Snapshot，
 由受控 Agent 完成元数据采集、版本发布和数据交付。
 ```
 
@@ -57,7 +57,7 @@ NeoEngram 是面向大规模训练数据、模型权重和其他文件型数据�
 ### 1.2 产品目标
 
 - 从一个 Tenant 视角统一浏览数据资产、工作区、快照和存储；
-- 让数据生产者从 Playground 发起可解释、可取消、可重跑的 Commit；
+- 让数据生产者从 Workspace 发起可解释、可取消、可重跑的 Commit；
 - 让消费者为固定 Commit 在选定区域创建 Snapshot，并由系统为其建立唯一、只读且可校验的 SnapshotDelivery；
 - 把逻辑文件、Schema、Dataset Profile、质量和变化统计变成中心可查询元数据；
 - 所有创建、检查、Commit、物化、重试和失败都具备稳定身份、状态和审计记录；
@@ -77,19 +77,19 @@ NeoEngram 是面向大规模训练数据、模型权重和其他文件型数据�
 | 主题            | 产品结论                                                                                                |
 | --------------- | ------------------------------------------------------------------------------------------------------- |
 | 中心入口        | UI、CLI 和自动化系统只调用中心，中心决定授权、调度和最终状态                                            |
-| Agent 定位      | Agent 是受控执行器和观测者，不拥有 Tenant、Artifact、Commit、Playground 或 Snapshot                     |
+| Agent 定位      | Agent 是受控执行器和观测者，不拥有 Tenant、Artifact、Commit、Workspace 或 Snapshot                     |
 | Artifact        | Artifact 是逻辑数据资产，不拥有单一 Region 或 StorageVolume；产品目标支持空创建或从源 Commit 派生，当前 Central 仅实现空创建 |
-| Commit          | 用户的普通版本发布只能从 Playground 产生；派生 Artifact 的无 parent、带来源血缘 root Commit 是目标能力，当前尚未实现 |
+| Commit          | 用户的普通版本发布只能从 Workspace 产生；派生 Artifact 的无 parent、带来源血缘 root Commit 是目标能力，当前尚未实现 |
 | 版本标签        | 用户只看到 Commit ID 和 Tags；Ref 可以作为内部 CAS 实现，但不进入产品界面和用户请求                     |
-| Playground      | Playground 是唯一可写数据视图，创建时必须选择一个 StorageVolume，Region 由 Volume 派生                  |
-| Playground 状态 | 主状态表达 `Creating`、`Ready` 或 `Abnormal`；Pre-commit 是并列的当前操作状态                           |
+| Workspace      | Workspace 是唯一可写数据视图，创建时必须选择一个 StorageVolume，Region 由 Volume 派生                  |
+| Workspace 状态 | 主状态表达 `Creating`、`Ready` 或 `Abnormal`；Pre-commit 是并列的当前操作状态                           |
 | Pre-commit      | 只有用户显式发起才创建会话；失败重试复用会话 ID 并递增 attempt，打开页面绝不自动触发                    |
 | Snapshot        | Snapshot 有独立 ID，固定一个 Commit 及一个目标 EdgeCluster/StorageVolume/交付模式；物理读取视图由唯一 SnapshotDelivery 管理 |
 | SnapshotDelivery | Snapshot 的唯一物理只读投影；固定一个目标 StorageVolume 和一种交付模式，可异步物化、校验、重试和删除 |
 | Snapshot 状态   | 聚合状态表达 `Creating`、`Ready` 或 `Abnormal`；Delivery `Ready` 后 Snapshot 才 `Ready`，物化和校验属于 Delivery 阶段 |
 | 元数据          | 中心保存权威 Index 和已发布元数据；用户可以查看文件元数据及可视化 Diff                                  |
 | OperationTask   | 所有写操作产生统一任务；即时操作也记录 `queued -> running -> succeeded`，领域明细仍留在各自表中         |
-| 数据路径        | Agent 直接读写获批 StorageVolume 中的 Playground 和对象 CAS，Chunk 不经过中心 API 进程                         |
+| 数据路径        | Agent 直接读写获批 StorageVolume 中的 Workspace 和对象 CAS，Chunk 不经过中心 API 进程                         |
 | Agent 放置      | 0.0.1 Kubernetes 部署中一个业务 PVC 对应一个 StorageVolume 和一个常驻 AgentInstance                    |
 | 区域入口        | 每个 EdgeCluster 一个多副本 GatewayPool；Central 主动连接 Gateway，Agent 只连接本集群 Gateway          |
 | Agent 接入      | Agent 经本集群 Gateway 主动出站注册；首次接入必须经 TenantAdmin 审批，审批前不能成为 Volume Owner 或领取 Job |
@@ -113,7 +113,7 @@ flowchart TB
         direction TB
         API["API / Auth / Tenant RBAC"]
         CATALOG["产品资源目录<br/>Tenant · Project · Artifact<br/>Commit · Tags<br/><b>Artifact 无固定 Region / Storage</b>"]
-        WORKFLOW["工作流与状态<br/>Playground · Pre-commit<br/>Snapshot · OperationTask"]
+        WORKFLOW["工作流与状态<br/>Workspace · Pre-commit<br/>Snapshot · OperationTask"]
         META["元数据与可视化<br/>Index · File Metadata<br/>Profile · Diff"]
         OPS["调度与治理<br/>Scheduler · Lease<br/>Quota · Audit"]
         DB[("Authority Store<br/>业务资源 / 状态 / 审计<br/>Object placement evidence（无 payload）")]
@@ -133,15 +133,15 @@ flowchart TB
         direction LR
         GW_A["GatewayPool A<br/>多副本区域入口"]
         AGENT_A["Agent A<br/>受控执行器"]
-        VOLUME_A[("StorageVolume A<br/>PVC / NFS<br/>Playground + immutable object CAS")]
-        PG_A["Playground<br/>RW · 单 Region / Volume"]
+        VOLUME_A[("StorageVolume A<br/>PVC / NFS<br/>Workspace + immutable object CAS")]
+        WS_A["Workspace<br/>RW · 单 Region / Volume"]
         SS_A["SnapshotDelivery A<br/>RO · Commit C1 · Volume A"]
         POD_A["Business / Training Pod"]
         GW_A <-->|"Agent 主动 H2+mTLS"| AGENT_A
         AGENT_A -->|"scan / materialize / verify"| VOLUME_A
-        VOLUME_A --- PG_A
+        VOLUME_A --- WS_A
         VOLUME_A --- SS_A
-        POD_A <-->|"直接 POSIX RW"| PG_A
+        POD_A <-->|"直接 POSIX RW"| WS_A
         SS_A -->|"直接 POSIX RO"| POD_A
     end
 
@@ -149,15 +149,15 @@ flowchart TB
         direction LR
         GW_B["GatewayPool B<br/>多副本区域入口"]
         AGENT_B["Agent B<br/>受控执行器"]
-        VOLUME_B[("StorageVolume B<br/>PVC / NFS<br/>Playground + immutable object CAS")]
-        PG_B["Playground<br/>RW · 单 Region / Volume"]
+        VOLUME_B[("StorageVolume B<br/>PVC / NFS<br/>Workspace + immutable object CAS")]
+        WS_B["Workspace<br/>RW · 单 Region / Volume"]
         SS_B["SnapshotDelivery B<br/>RO · Commit C1 · Volume B"]
         POD_B["Business / Training Pod"]
         GW_B <-->|"Agent 主动 H2+mTLS"| AGENT_B
         AGENT_B -->|"scan / materialize / verify"| VOLUME_B
-        VOLUME_B --- PG_B
+        VOLUME_B --- WS_B
         VOLUME_B --- SS_B
-        POD_B <-->|"直接 POSIX RW"| PG_B
+        POD_B <-->|"直接 POSIX RW"| WS_B
         SS_B -->|"直接 POSIX RO"| POD_B
     end
 
@@ -177,12 +177,12 @@ flowchart TB
     class DB authority;
     class GW_A,GW_B,AGENT_A,AGENT_B agent;
     class VOLUME_A,VOLUME_B storage;
-    class PG_A,PG_B,SS_A,SS_B view;
+    class WS_A,WS_B,SS_A,SS_B view;
 ```
 
 图中的路径必须保持分离：UI/CLI 只走中心 API；Central 主动连接区域 GatewayPool，Agent 只主动连接
 本集群 Gateway，并通过该链路接收任务、上报状态和元数据；不可变对象由 Agent 写入用户
-StorageVolume 上 tenant/artifact 隔离的 CAS；业务 Pod 直接访问本区域 StorageVolume 上的 Playground
+StorageVolume 上 tenant/artifact 隔离的 CAS；业务 Pod 直接访问本区域 StorageVolume 上的 Workspace
 或 SnapshotDelivery。Gateway Registry、管理面、Replica activation、H2/mTLS、命令签名和一跳 forwarding 已进入
 G1；双 Replica listener/H2/peer harness 和真实 Registry RouteLease 接管契约已分别通过，但完整业务
 E2E、外部生产 issuer/KMS-HSM、真实集群故障/就绪与切换尚未完成，控制面仍按失败关闭策略运行；旧
@@ -194,7 +194,7 @@ Agent 直连 Server 已删除。后续跨
 | 角色              | 核心诉求                       | 典型权限                                                  |
 | ----------------- | ------------------------------ | --------------------------------------------------------- |
 | Tenant Admin      | 管理租户边界和存储             | 登记和查看 StorageVolume；配额、保留策略和完整审计属于 P1 |
-| Data Producer     | 修改数据、检查变化并发布版本   | 创建 Playground、查看元数据、发起 Pre-commit、创建 Commit |
+| Data Producer     | 修改数据、检查变化并发布版本   | 创建 Workspace、查看元数据、发起 Pre-commit、创建 Commit |
 | Data Consumer     | 获取可复现的只读数据           | 浏览 Artifact/Commit，创建 Snapshot 并查看逻辑文件与元数据 |
 | Platform Operator | 保证 Agent、存储和任务健康     | 查看基础设施状态、重试任务、处理异常和接管流程            |
 | Auditor           | 追溯版本和公开交付活动         | 只读访问 Commit、Diff、Snapshot 和 Snapshot 活动；审计为 P1 |
@@ -211,7 +211,7 @@ Tenant
 ├── Project[*]
 │   └── Artifact[*]                         逻辑资产，无固定存储位置
 │       ├── Commit[*]                       不可变、单 parent、可带 Tags
-│       ├── Playground[*]                   可写、单 Region、单 StorageVolume
+│       ├── Workspace[*]                   可写、单 Region、单 StorageVolume
 │       │   └── Pre-commit / OperationTask[*] 当前操作与历史活动
 │       └── Snapshot[*]                     独立 ID；固定 Commit + 一个目标 Volume/模式
 │           └── SnapshotDelivery[1]         唯一目标 Volume + 模式 + 物化状态
@@ -235,28 +235,28 @@ EdgeCluster
 | StorageVolume | Tenant 可用的一块区域存储     | `storage_volume_id`、Region、EdgeCluster、类型、后端引用、健康状态     | 可登记、停用                   |
 | Artifact      | 有版本历史的逻辑文件系统      | `artifact_id`、Project、名称、描述、初始化模式、可选来源 Commit        | 元信息可变，内容经 Commit 演进 |
 | Commit        | 一次不可变发布                | `commit_id`、parent、可选 derived-from、标题、描述、Tags、创建者、时间 | 不可变                         |
-| Playground    | Artifact 的可写工作区         | `playground_id`、base/head Commit、StorageVolume、Region、IndexVersion | 内容可变，放置固定             |
+| Workspace    | Artifact 的可写工作区         | `workspace_id`、base/head Commit、StorageVolume、Region、IndexVersion | 内容可变，放置固定             |
 | Pre-commit    | Commit 前的一次检查会话       | 会话 ID、触发者、进度、候选 Index、检查和 Diff                         | 临时，可取消、可重跑           |
 | Snapshot      | Commit 的只读交付聚合          | `snapshot_id`、fixed Commit、目标 EdgeCluster/StorageVolume/模式、主状态、完整性摘要 | Commit 与目标绑定不可变；状态由 Delivery 驱动 |
 | SnapshotDelivery | Snapshot 的唯一物理只读交付 | `delivery_id`、Snapshot、StorageVolume、模式、物化状态、完整性摘要      | 目标和模式固定；状态可推进       |
 | OperationTask | 一次写操作的统一生命周期与审计记录 | `task_id`、类型、scope、状态、Attempt、进度、错误、主体和时间      | 状态推进；事件追加写入         |
 | Tag           | Commit 的人类可读标签         | 名称、Commit、创建者、时间                                             | 显式管理，不代表分支           |
 
-Standalone 模式中的 `repository` 对应 Artifact，`workspace` 对应 Playground。产品 API、界面和新文档
-统一使用 Artifact 与 Playground。
+Standalone 模式中的 `repository` 对应 Artifact，`workspace` 对应 Workspace。产品 API、界面和新文档
+统一使用 Artifact 与 Workspace。
 
 ### 4.3 放置不变量
 
 1. Artifact 是逻辑资产，创建时不选择 StorageVolume，也不在列表或概览中显示一个虚假的 Region。
-2. 一个 Playground 只引用一个 StorageVolume；Region 从 StorageVolume 派生，不能由用户另填。
-3. Playground 创建后不能直接更换 StorageVolume。迁移必须是显式、可恢复且可审计的流程。
+2. 一个 Workspace 只引用一个 StorageVolume；Region 从 StorageVolume 派生，不能由用户另填。
+3. Workspace 创建后不能直接更换 StorageVolume。迁移必须是显式、可恢复且可审计的流程。
 4. Snapshot 引用一个固定 Commit，并在创建时绑定一个目标 EdgeCluster/StorageVolume/模式；这些字段创建后不可修改。
 5. 一个 Snapshot 只能有一个 SnapshotDelivery；Delivery 固定同一目标 StorageVolume 和模式，重试不能静默改变目标或模式。
 6. 跨区域交付通过为同一 Commit 创建另一个 Snapshot 表示；不能向已有 Snapshot 追加第二个 Delivery。
 7. Snapshot 创建请求和 Delivery mutation 都使用稳定 request identity；相同 payload 重放返回同一资源。
-8. 多个 Artifact、Playground 或 SnapshotDelivery 可以在权限和根目录隔离的前提下共享一个 Tenant 的 Volume。
+8. 多个 Artifact、Workspace 或 SnapshotDelivery 可以在权限和根目录隔离的前提下共享一个 Tenant 的 Volume。
 9. Agent、挂载路径、PVC claim、NFS export 和对象位置属于基础设施信息，不参与 Artifact 的逻辑身份。
-10. 只有 `state=ready` 的 StorageVolume 可以承接新 Playground、Commit replication 或 Snapshot 创建的
+10. 只有 `state=ready` 的 StorageVolume 可以承接新 Workspace、Commit replication 或 Snapshot 创建的
     SnapshotDelivery；`degraded` 和 `unavailable` 均禁止新的物理放置，
     但不影响已有资源的公开元数据查询。
 11. 0.0.1 Kubernetes 部署中，一个已准备好的业务 PVC 只登记为一个 StorageVolume，并由一个常驻
@@ -265,7 +265,7 @@ Standalone 模式中的 `repository` 对应 Artifact，`workspace` 对应 Playgr
     不能仅凭相同 PVC 名称继承旧身份或 generation。
 
 技术层可以使用 `ArtifactPlacement` 记录某个 Artifact 在特定 EdgeCluster/Volume 上已有的受管根和
-generation。它由 Playground、Commit replication、SnapshotDelivery 物化或迁移流程创建和维护，一个 Artifact 可以存在多个
+generation。它由 Workspace、Commit replication、SnapshotDelivery 物化或迁移流程创建和维护，一个 Artifact 可以存在多个
 区域的内部 placement；它不是 Artifact 的公开字段。Snapshot 的目标 Volume 是本次物理交付的固定选择，
 不代表 Artifact 拥有唯一存储。
 
@@ -287,7 +287,7 @@ Tenant 是全局上下文。用户选择 Tenant 后进入以下一级导航：
 | ---------- | ---------------------------- | ------------------------------- |
 | 概览       | 当前租户和服务是否可用       | Tenant、系统健康、资源导航      |
 | 数据资产   | 有哪些数据资产和版本         | Artifact、Commit、Tag           |
-| 工作区     | 哪些数据正在被修改           | Playground、Pre-commit          |
+| 工作区     | 哪些数据正在被修改           | Workspace、Pre-commit          |
 | 快照与交付 | 哪些固定版本可被消费、如何物化 | Snapshot、SnapshotDelivery、Region、StorageVolume |
 | 活动（P1） | 哪些异步操作正在运行或失败   | Job、阶段、错误、审计关联       |
 | 存储资源   | 租户在哪些区域有可用存储     | StorageVolume、Region、健康状态 |
@@ -317,7 +317,7 @@ P1 运维信息。存储页分为“已登记”和“待审批”：TenantAdmin
 - NFS server/export，或 PVC namespace/claim 等后端引用；
 - 访问模式和 Tenant 边界。
 
-中心只登记和验证，不在该流程中创建 PVC/NFS。只有 `ready` Volume 可以创建新的 Playground、Commit
+中心只登记和验证，不在该流程中创建 PVC/NFS。只有 `ready` Volume 可以创建新的 Workspace、Commit
 replication 或 Snapshot（Snapshot 创建会原子创建对应 Delivery）；`degraded` 与 `unavailable` 均不可
 作为新的放置目标，但已有资源的中心元数据仍可查看。
 
@@ -358,7 +358,7 @@ StorageVolume 或 Default Ref。
 
 创建 Artifact 要求 Project、Artifact ID、名称和描述，不选择存储，并且只能选择一种初始化方式：
 
-- **创建空 Artifact**：Artifact 初始为空且没有 Commit；首个 Playground 从空基线创建，第一次发布生成
+- **创建空 Artifact**：Artifact 初始为空且没有 Commit；首个 Workspace 从空基线创建，第一次发布生成
   root Commit；
 - **从 Commit 派生**：选择同一 Tenant 内有读取权限的另一个 Artifact 及其明确 Commit。目标产品要求中心为新
   Artifact 创建独立的 root Commit，复用已 Durable 的不可变对象，并记录
@@ -366,29 +366,29 @@ StorageVolume 或 Default Ref。
   当前 OpenAPI 已冻结该 discriminator，但 Central 对 `derived` 初始化返回
   `409 ARTIFACT_DERIVED_INITIALIZATION_UNSUPPORTED`，只能创建空 Artifact。
 
-派生操作不创建 Playground、Snapshot 或区域 placement，也不选择 StorageVolume。新 Artifact 后续拥有
+派生操作不创建 Workspace、Snapshot 或区域 placement，也不选择 StorageVolume。新 Artifact 后续拥有
 独立版本历史；跨 Artifact 来源只作为血缘，不能成为普通 parent。Artifact 详情包含：
 
 - **概览**：描述、当前 Commit、Tags、文件/逻辑大小汇总、元数据摘要；
 - **版本**：可分叉的单 parent Commit 树、父 Commit、标题、描述、Tags、创建者、时间和 Diff 入口；
-- **工作区**：该 Artifact 下的 Playground 和创建入口；
+- **工作区**：该 Artifact 下的 Workspace 和创建入口；
 - **快照**：该 Artifact 下的 Snapshot，以及从明确 Commit 创建 Snapshot 的入口。
 
-“当前 Commit”是产品层的默认基线便捷指针，不向用户暴露 Ref 名称，也不限制其他 Playground
+“当前 Commit”是产品层的默认基线便捷指针，不向用户暴露 Ref 名称，也不限制其他 Workspace
 从历史 Commit 形成兄弟分支。第一版不提供命名分支选择、merge 或 Ref 管理。
 
 ### 6.4 工作区
 
-Playground 列表显示 Artifact、Region、StorageVolume、持久生命周期、实时存储可达性、当前操作和更新时间。创建入口位于
+Workspace 列表显示 Artifact、Region、StorageVolume、持久生命周期、实时存储可达性、当前操作和更新时间。创建入口位于
 Artifact 详情，用户必须选择：
 
-- Playground ID 和名称；
+- Workspace ID 和名称；
 - 一个 Ready 且有权限的 StorageVolume；
 - 可选当前 Artifact 内的 base Commit。空 Artifact 未选择时从空内容创建；不能把其他 Artifact 的 Commit
-  直接作为 Playground base，跨 Artifact 初始化的目标入口必须走“从 Commit 派生 Artifact”；当前 Central
+  直接作为 Workspace base，跨 Artifact 初始化的目标入口必须走“从 Commit 派生 Artifact”；当前 Central
   对该初始化返回 `409 ARTIFACT_DERIVED_INITIALIZATION_UNSUPPORTED`。
 
-Playground 详情是数据生产主工作台，包含：
+Workspace 详情是数据生产主工作台，包含：
 
 - **变化**：当前中心 Index 与 Head Commit 的文件 Diff；
 - **文件**：中心 Index 文件清单和路径搜索；
@@ -396,7 +396,7 @@ Playground 详情是数据生产主工作台，包含：
 - 文件级元数据抽屉：逻辑路径、大小、格式、Schema、统计、质量和 freshness；
 - 顶部主动作：`发起 Pre-commit` 或 `查看 Pre-commit`。
 
-Playground 页面不能直接出现一个绕过检查的“Commit”按钮。
+Workspace 页面不能直接出现一个绕过检查的“Commit”按钮。
 
 ### 6.5 Pre-commit 与 Commit
 
@@ -419,7 +419,7 @@ Commit 弹窗至少包含：
 - 候选 IndexVersion 与 Head CAS 冲突提示。Head 由服务端在 Pre-commit attempt 内部冻结，不作为
   公开请求字段。
 
-Commit 成功页提供返回 Playground、查看版本历史和为该 Commit 创建 Snapshot 的入口。
+Commit 成功页提供返回 Workspace、查看版本历史和为该 Commit 创建 Snapshot 的入口。
 
 版本历史中的 Commit 节点进入独立的 Commit 详情页，而不是在 Artifact 页面内展开一个短期抽屉。
 详情页固定在 `/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/commits/:commitId`，集中展示：
@@ -473,11 +473,11 @@ Multipart、Versioning 或内部 Chunk key。
 ### 6.7 操作任务与活动
 
 统一任务页通过 `/api/task/list/query` 和 `/api/task/summary/query` 按 Tenant、Project、Artifact、Commit、
-任务类型和状态查询，不使用页面静态数组。任务详情通过 `/api/task/query` 展示父子任务、Attempt 和事件
+任务类型和状态查询，不使用页面静态数组。任务详情通过 `/api/task/query` 展示阶段 DAG、Attempt 和事件
 时间线；重试与取消复用同一 `task_id`。资源详情链接到相同任务视图，物化不再使用专用公开查询接口。
 
 `control_jobs`、`MaterializationJob` 和 Pre-commit 记录仍是领域执行明细，不是并列的用户任务入口。
-Agent 扫描等动作从 Playground 或 Pre-commit 业务动作进入，由根 OperationTask 关联对应子任务。
+扫描、校验、物化和发布等动作都记录为同一个根 OperationTask 的阶段；批次和对象仍留在领域明细中。
 
 ## 7. 关键用户流程
 
@@ -490,7 +490,7 @@ Agent 扫描等动作从 Playground 或 Pre-commit 业务动作进入，由根 O
   -> 确认 Volume Ready
   -> 创建 Project
   -> 创建空 Artifact（当前可用；Derived 为目标能力，当前返回 409），或从另一个 Artifact 的明确 Commit 派生
-  -> 从 Artifact 创建 Playground 并选择一个 Volume
+  -> 从 Artifact 创建 Workspace 并选择一个 Volume
 ```
 
 Artifact 创建不依赖存储。空 Artifact 没有初始 Commit；目标产品中的派生 Artifact 获得记录来源血缘的独立
@@ -502,8 +502,8 @@ Gateway 转发，Central 仍执行审批和权限判定；Gateway 的 TLS 身份
 ### 7.2 数据修改与 Commit
 
 ```text
-业务 Pod/工具修改 Playground 文件
-  -> Playground 展示中心最近一次观测的变化和元数据
+业务 Pod/工具修改 Workspace 文件
+  -> Workspace 展示中心最近一次观测的变化和元数据
   -> 发起 Pre-commit
   -> Agent 执行新一轮扫描并上报元数据候选
   -> 中心生成候选 IndexVersion，执行摘要和一致性检查
@@ -511,12 +511,12 @@ Gateway 转发，Central 仍执行审批和权限判定；Gateway 的 TLS 身份
   -> 填写标题、描述和 Tags
   -> 中心复核候选 IndexVersion，并对 Pre-commit 内部冻结的 Head 执行 CAS
   -> 创建不可变 Commit
-  -> Playground 回到 Ready/空闲，Head Commit 更新
+  -> Workspace 回到 Ready/空闲，Head Commit 更新
 ```
 
-用户发布普通 Commit 只能从 Playground 发起。派生 Artifact 时由中心创建的无 parent root Commit 是目标初始化
+用户发布普通 Commit 只能从 Workspace 发起。派生 Artifact 时由中心创建的无 parent root Commit 是目标初始化
 结果（当前 Central 尚未实现），不是绕过 Pre-commit 的普通发布入口。Artifact 详情可以展示 Commit，也可以从 Commit 创建
-Playground、Snapshot 或派生 Artifact，但不能直接编辑内容并 Commit。
+Workspace、Snapshot 或派生 Artifact，但不能直接编辑内容并 Commit。
 
 ### 7.3 Pre-commit 触发、重跑与取消
 
@@ -526,9 +526,9 @@ Playground、Snapshot 或派生 Artifact，但不能直接编辑内容并 Commit
   `precommit_id`；
 - abnormal/cancelled 会话点击 `失败重试` 时调用 restart，保持 `precommit_id`、递增 attempt，并为新
   attempt 重新冻结当前 IndexVersion 与内部 Head；
-- 用户点击 `取消 Pre-commit` 时停止后续检查，丢弃未发布候选，Playground 保持 Ready；
+- 用户点击 `取消 Pre-commit` 时停止后续检查，丢弃未发布候选，Workspace 保持 Ready；
 - 页面刷新或重新进入只恢复当前会话，不自动创建新扫描；
-- 扫描失败不会把 Playground 主状态改成 Scanning；Pre-commit 进入 `abnormal/idle`；
+- 扫描失败不会把 Workspace 主状态改成 Scanning；Pre-commit 进入 `abnormal/idle`；
 - Commit 成功或取消后清除当前操作，历史仍进入活动和审计。
 
 ### 7.4 Snapshot 交付
@@ -550,9 +550,9 @@ Commit。本流程的文件浏览/活动/Profile API 仍须以 Central handler
 
 ## 8. 状态模型
 
-### 8.1 Playground 生命周期、存储可达性与当前操作
+### 8.1 Workspace 生命周期、存储可达性与当前操作
 
-Playground 使用三个正交维度，避免把资源生命周期、实时存储可达性和临时任务混在一个枚举里。
+Workspace 使用三个正交维度，避免把资源生命周期、实时存储可达性和临时任务混在一个枚举里。
 
 | 维度       | 状态          | 含义                                                | 允许行为                                 |
 | ---------- | ------------- | --------------------------------------------------- | ---------------------------------------- |
@@ -566,10 +566,10 @@ Playground 使用三个正交维度，避免把资源生命周期、实时存储
 | 当前操作     | `Idle`        | `active_precommit_id` 为空                          | 可在生命周期和存储均 Ready 时发起检查    |
 | 当前操作     | `Pre-commit`  | 存在活动检查会话，可能正在运行或等待 Commit         | 详情页查询会话后决定动作                  |
 
-创建任务成功后 Playground 从 `Creating` 进入 `Ready`；创建或基础设施校验失败进入 `Abnormal`。
-Playground 创建取消、重试和通用 Mutation 属于 P1，P0 不伪造相应动作。`Scanning` 不是 Playground
+创建任务成功后 Workspace 从 `Creating` 进入 `Ready`；创建或基础设施校验失败进入 `Abnormal`。
+Workspace 创建取消、重试和通用 Mutation 属于 P1，P0 不伪造相应动作。`Scanning` 不是 Workspace
 生命周期状态，只有显式 Pre-commit 才具有 scanning phase。Agent 心跳超时或重启不会把已经物化的
-Playground 从 `Ready` 改成 `Abnormal`；此时只把存储可达性派生为 `Unavailable`，恢复心跳后可自动回到
+Workspace 从 `Ready` 改成 `Abnormal`；此时只把存储可达性派生为 `Unavailable`，恢复心跳后可自动回到
 `Ready`。已经冻结且满足提交条件的候选保存在中心，可以继续审查和 Commit；重新扫描、重试和新放置仍需
 实时存储可达。
 
@@ -626,8 +626,8 @@ Central handler，只能作为目标/contract-only Web surface，不能从 Snaps
 | ---------------- | ------------------------------------------------------------------- | -------------------------- |
 | Artifact         | 当前 Commit、版本数、文件/大小汇总、Profile 摘要                    | Artifact 概览              |
 | Commit           | parent、标题、描述、Tags、作者、时间、内容摘要                      | 版本详情                   |
-| Playground Index | 逻辑路径、格式、大小、行数和观测时间                               | Playground 文件/变化       |
-| Dataset Profile  | Schema、source、分片参数、质量规则和验证状态                        | Playground/Snapshot 元数据 |
+| Workspace Index | 逻辑路径、格式、大小、行数和观测时间                               | Workspace 文件/变化       |
+| Dataset Profile  | Schema、source、分片参数、质量规则和验证状态                        | Workspace/Snapshot 元数据 |
 | Snapshot         | Snapshot ID、fixed Commit、逻辑主状态、数据健康和完整性摘要       | Snapshot 详情              |
 | SnapshotDelivery | delivery ID、目标 Region/Volume、模式、物化状态和完整性摘要        | Snapshot 详情              |
 | OperationTask/Audit | 主体、动作、资源、Attempt、阶段、错误、request/trace ID           | 操作任务与审计             |
@@ -637,7 +637,7 @@ Central handler，只能作为目标/contract-only Web surface，不能从 Snaps
 
 ### 9.2 Diff 类型
 
-- Playground Diff：当前 IndexVersion 与 Head/Parent Commit；
+- Workspace Diff：当前 IndexVersion 与 Head/Parent Commit；
 - Commit Diff：目标 Commit 与其唯一 parent，根 Commit 与空基线；
 - 可选比较 Diff：两个明确 Commit，由高级入口发起，不改变默认 parent 语义；
 - Metadata Diff：Schema、字段类型、Profile 和逻辑统计变化。
@@ -649,7 +649,7 @@ Central handler，只能作为目标/contract-only Web surface，不能从 Snaps
 ## 10. 一致性、幂等与冲突体验
 
 - 所有 mutation 使用稳定 request identity，响应丢失后相同请求返回同一结果；
-- Playground Commit 必须校验请求中的 candidate IndexVersion，并对服务端在对应 Pre-commit attempt
+- Workspace Commit 必须校验请求中的 candidate IndexVersion，并对服务端在对应 Pre-commit attempt
   内部冻结的 Head 执行 CAS；公开请求不增加 `source_head_commit_id`；
 - 冲突时不自动覆盖，页面保留用户填写的 Commit 信息并引导重新检测；
 - Commit 一旦创建不可修改；描述和 Tags 是否允许后置管理需要独立权限和审计策略；
@@ -661,7 +661,7 @@ Central handler，只能作为目标/contract-only Web surface，不能从 Snaps
 
 ### 11.1 最小权限动作
 
-建议至少拆分：`artifact.read/create/update`、`commit.read/create`、`playground.read/create/mutate`、
+建议至少拆分：`artifact.read/create/update`、`commit.read/create`、`workspace.read/create/mutate`、
 `snapshot.read/create/delete`、`storage.read/register/admin`、`job.read/retry/cancel`、`metadata.read` 和
 `audit.read`。从 Commit 派生 Artifact 同时要求目标范围的 `artifact.create` 和源 Commit 的读取权限；
 创建 Snapshot 要求读取目标 Commit、使用目标 StorageVolume 的权限；创建后只能重试或删除其唯一 Delivery。
@@ -673,7 +673,7 @@ Central handler，只能作为目标/contract-only Web surface，不能从 Snaps
 
 - StorageVolume 登记、停用和内部 ownership 变化；
 - GatewayPool/Replica 创建、激活、drain、撤销、证书轮换和 Agent route generation 变化；
-- Artifact、Playground、Pre-commit、Commit、Tag 和 Snapshot 创建；
+- Artifact、Workspace、Pre-commit、Commit、Tag 和 Snapshot 创建；
 - Pre-commit/Job 重跑、取消和失败；
 - Snapshot 的 P1 Lease、挂载关系、保留和删除；
 - 权限拒绝、跨租户隐藏和管理员操作。
@@ -684,11 +684,11 @@ TransferTicket、数据端点凭证、数据内容或物理绝对路径。
 
 ### 11.3 产品指标（P1）
 
-- Time to First Playground；
+- Time to First Workspace；
 - Pre-commit P50/P95 时长、取消率、重跑率和阻断率；
 - Commit 成功率、CAS 冲突率和幂等重放率；
 - SnapshotDelivery Time to Ready、物化吞吐、对象复用率和校验失败率；
-- Playground 元数据新鲜度和 Abnormal 持续时间；
+- Workspace 元数据新鲜度和 Abnormal 持续时间；
 - StorageVolume 容量、健康和 Owner 切换次数；
 - GatewayPool/Replica readiness、Agent RouteLease/fencing、跨 Replica forwarding 和连接背压；
 - 从失败活动进入正确资源并完成恢复的比例。
@@ -700,7 +700,7 @@ TransferTicket、数据端点凭证、数据内容或物理绝对路径。
 | Tenant 切换与创建                 | 公开 API 驱动 | MSW 与真实模式使用相同 query/mutation；真实 server 已注册对应路由   |
 | StorageVolume 登记与区域展示      | 公开 API 驱动 | 只展示公开字段，只有 ready Volume 可用于新放置                    |
 | Artifact 创建与详情               | 公开 API 驱动 | 契约支持空/derived discriminator；当前 Central 仅实现空 Artifact，derived 返回稳定 409 |
-| Playground 创建和详情             | 公开 API 驱动 | 单 Volume；文件、变化、元数据和 Profile 来自拆分查询               |
+| Workspace 创建和详情             | 公开 API 驱动 | 单 Volume；文件、变化、元数据和 Profile 来自拆分查询               |
 | Pre-commit                        | 公开 API 驱动 | 浏览器不推进状态；start/restart/cancel/query 使用服务端会话        |
 | Commit 描述、Tags、parent 和 Diff | 公开 API 驱动 | 消费 ready/idle 候选；Head 由服务端内部冻结并执行 CAS              |
 | Snapshot 逻辑与物理交付           | 公开 API 驱动 | 创建时绑定目标 Volume/模式并原子生成唯一 Delivery；Delivery Ready 后 Snapshot 才可读       |
@@ -727,20 +727,20 @@ Snapshot 文件/活动/Profile 路径为 `routed_by_central = false`。Central c
    `ready/idle` Pre-commit 与候选 IndexVersion，并对服务端内部冻结的 Head 执行 CAS。
 3. Pre-commit 已提供 start/query/restart/cancel 以及 attempt、阶段、进度、checks、warnings、blockers
    和冻结 Diff 摘要；start 创建新 ID，restart 仅对 abnormal/cancelled 会话复用 ID 并递增 attempt。
-4. Playground 已提供文件、变化、文件元数据和 Dataset Profile 的拆分页查询。
+4. Workspace 已提供文件、变化、文件元数据和 Dataset Profile 的拆分页查询。
 5. Snapshot 已使用独立 ID 固定 Commit，并在创建时绑定目标 Volume/模式；系统原子生成唯一
    SnapshotDelivery，提供交付重试、状态和完整性摘要。Snapshot 文件清单、活动和 Dataset Profile 仍是
    contract-only Web surface。
 
 这些条目表示公开契约与 Web Mock 已对齐；其中 `routed_by_central = false` 的 action 不代表 Rust server
-已经可调用。Rust server 已注册 Tenant、StorageVolume、Enrollment、Artifact、Playground、Snapshot、OperationTask
+已经可调用。Rust server 已注册 Tenant、StorageVolume、Enrollment、Artifact、Workspace、Snapshot、OperationTask
 与 Gateway 管理纵切，Agent 已实现 bootstrap/status、session、Job/metadata transport 和 Gateway 转发基础
 链路。它们仍不能证明完整公开 API、生产凭据、双 Replica 业务 E2E、切换或生产数据面已经完成。
 
 ### P1：完整运营闭环
 
 1. StorageVolume 容量、capability、底层诊断、更新、停用和 operator 详情；
-2. Playground 删除、恢复、迁移、扫描和 mutation Job；
+2. Workspace 删除、恢复、迁移、扫描和 mutation Job；
 3. Snapshot 删除、保留策略、Lease 和挂载关系；
 4. Tag 创建/删除策略、Artifact 元信息更新/归档；
 5. OperationTask 的跨领域状态聚合、批次诊断和系统任务补齐；
@@ -762,7 +762,7 @@ Snapshot 文件/活动/Profile 路径为 `routed_by_central = false`。Central c
    记录，TenantAdmin 审批事务创建或绑定 Unavailable Volume；获批 Agent 的证书、
    session、健康 RW mount 和 heartbeat 完成后 Volume 才进入 Ready；
 3. Data Producer 创建不带存储位置的空 Artifact；
-4. Producer 选择上海 Volume 创建 Playground；
+4. Producer 选择上海 Volume 创建 Workspace；
 5. Agent 扫描后，中心展示文件、Schema 和当前 Commit 的 Diff；
 6. Producer 发起 Pre-commit，取消后通过 start 创建新会话；失败样例则通过 restart 保持会话 ID 并
    递增 attempt；
@@ -773,24 +773,24 @@ Snapshot 文件/活动/Profile 路径为 `routed_by_central = false`。Central c
 10. Snapshot 列表显示该 Snapshot 及其唯一 Delivery；如果需要其他区域，应为同一 Commit 创建另一个 Snapshot；
 11. Consumer 用该 Commit 派生一个新 Artifact（目标场景；当前 Central 返回 `409 ARTIFACT_DERIVED_INITIALIZATION_UNSUPPORTED`）；
     新 Artifact 无固定 Region，目标上拥有独立 root Commit 和来源血缘；
-12. Auditor 能从 Snapshot/Delivery 追溯 Commit、parent、Tags、Diff、来源 Playground、OperationTask 和操作主体。
+12. Auditor 能从 Snapshot/Delivery 追溯 Commit、parent、Tags、Diff、来源 Workspace、OperationTask 和操作主体。
 
 ### 14.2 必须覆盖的异常
 
-- Volume 为 `degraded` 或 `unavailable` 时均禁止创建 Playground/Snapshot（以及其 Delivery），但仍可浏览中心元数据；
+- Volume 为 `degraded` 或 `unavailable` 时均禁止创建 Workspace/Snapshot（以及其 Delivery），但仍可浏览中心元数据；
 - Pre-commit 期间 Agent 失联，状态可恢复且不会产生重复 Commit；
 - Agent 首次注册未审批、被拒绝或凭证已撤销时，Volume 不得 Ready，Agent 不得成为 Owner 或领取 Job；
 - 单个 GatewayReplica 退出时 Agent 可重连同 Pool 其他 Replica；旧 RouteLease 失效或撤销前不得产生
   第二个活动 owner，GatewayPool 整体不可用时该集群操作失败关闭但 Volume 数据不受损；
 - Agent Pod 重建并复用原状态 PVC 时保持同一 AgentInstance；状态盘丢失时必须创建新的 pending 身份；
 - 人工接管未确认旧 Agent 停止时不得推进 owner generation；cooperative 模式不宣称抵御失陷旧写者；
-- Pre-commit 取消后 Playground 保持 Ready，旧候选不能被提交；
+- Pre-commit 取消后 Workspace 保持 Ready，旧候选不能被提交；
 - Commit 前 IndexVersion 或 Head 变化，返回冲突且不覆盖；
 - Snapshot 创建响应丢失，相同 request identity 重放返回同一 `snapshot_id`；
 - SnapshotDelivery 创建响应丢失，相同 request identity 重放返回同一 `delivery_id`；
 - 同一 Snapshot 只能有一个 SnapshotDelivery；不能在另一个 Volume 追加第二个 Delivery；
 - SnapshotDelivery 校验/物化失败时 Delivery 进入 Failed、Snapshot 保持 Abnormal/不可读，不能误标为 Ready；
-- Playground 创建失败时进入 Abnormal，重试期间回到 Creating；
+- Workspace 创建失败时进入 Abnormal，重试期间回到 Creating；
 - 用户不能通过 URL 或 ID 读取其他 Tenant 的资源存在性；
 - 桌面和移动端的长路径、Commit ID、Tag 和错误信息不溢出。
 
@@ -800,8 +800,8 @@ Snapshot 文件/活动/Profile 路径为 `routed_by_central = false`。Central c
 
 1. **契约对齐**：先冻结本文的资源、放置、状态和身份语义，再修改 OpenAPI 和生成类型；
 2. **Gateway 控制面**：完成每集群 GatewayPool、Agent 经 Gateway enrollment/session 和一次性切换；
-3. **只读浏览**：接入真实 Tenant、Storage、Artifact、Commit、Diff、Playground、Snapshot 查询；
-4. **存储与工作区**：完成 StorageVolume 登记、空 Artifact 创建、Playground 创建和真实元数据浏览；另行实现并验收派生 Artifact 初始化；
+3. **只读浏览**：接入真实 Tenant、Storage、Artifact、Commit、Diff、Workspace、Snapshot 查询；
+4. **存储与工作区**：完成 StorageVolume 登记、空 Artifact 创建、Workspace 创建和真实元数据浏览；另行实现并验收派生 Artifact 初始化；
 5. **发布闭环**：完成 Pre-commit、Commit 描述/Tags、parent Diff、冲突和审计；
 6. **交付闭环**：完成独立 Snapshot ID、目标 Volume 物化、唯一 SnapshotDelivery、校验、读取和失败恢复；
 7. **运营闭环**：完成 OperationTask、审计、权限、配额、保留、删除、可观测性和灾备。
@@ -813,12 +813,12 @@ Snapshot 文件/活动/Profile 路径为 `routed_by_central = false`。Central c
 
 1. P1 Snapshot 用途和 SnapshotDelivery 保留策略是否可修改，修改是否改变审计或计费身份？
 2. Tag 是否租户/Artifact 内唯一，移动和删除 Tag 需要什么权限与审计？
-3. 用户 Pod 是否允许 RW 挂载 Playground；若允许，外部写与受管 mutation 如何协调？
+3. 用户 Pod 是否允许 RW 挂载 Workspace；若允许，外部写与受管 mutation 如何协调？
 4. 第一批支持的 PVC/NFS 产品、能力探测和强 fencing 等级是什么？
 5. Dataset Profile 的最小规范和元数据可视化哪些进入 v1，哪些后置？
 6. Project、成员和权限管理由 NeoEngram 提供页面，还是接入现有企业平台？
 7. 派生 Artifact 是否需要支持跨 Tenant 授权复制；若支持，对象去重、计费和来源可见性如何隔离？
 
 这些问题不会改变已经冻结的核心语义：Artifact 无固定放置，产品目标上只能为空或从明确 Commit 派生（当前仅空初始化可运行），普通
-Commit 从 Playground 发布、Snapshot 固定 Commit 并绑定一个目标交付、一个 Snapshot 只有一个 SnapshotDelivery、Agent
+Commit 从 Workspace 发布、Snapshot 固定 Commit 并绑定一个目标交付、一个 Snapshot 只有一个 SnapshotDelivery、Agent
 不拥有业务资源、用户界面不出现 Ref。

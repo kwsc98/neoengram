@@ -3,6 +3,7 @@ import {
   ArrowRight,
   Check,
   CopyDocument,
+  Delete,
   FolderOpened,
   Key,
   Plus,
@@ -16,6 +17,7 @@ import { useRoute, useRouter } from 'vue-router';
 
 import {
   createS3AccessPoint,
+  deleteS3AccessPoint,
   disableS3AccessPoint,
   enableS3AccessPoint,
   queryS3AccessPointList,
@@ -107,6 +109,7 @@ const snapshotsQuery = useQuery({
 const createMutation = useMutation({ mutationFn: createS3AccessPoint });
 const enableMutation = useMutation({ mutationFn: enableS3AccessPoint });
 const disableMutation = useMutation({ mutationFn: disableS3AccessPoint });
+const deleteMutation = useMutation({ mutationFn: deleteS3AccessPoint });
 const accessPoints = computed(() => accessPointsQuery.data.value?.data.items ?? []);
 const readySnapshots = computed(() => snapshotsQuery.data.value?.data.items ?? []);
 
@@ -186,7 +189,9 @@ async function submitCreate(): Promise<void> {
       : undefined;
     openCredentials(result.data.access_point, credential, !result.data.secret_access_key);
     await queryClient.invalidateQueries({ queryKey: ['s3-access-points', tenantId.value] });
-    ElMessage.success(result.data.replayed ? '已返回现有 Access Point' : 'S3 Access Point 已开启');
+    ElMessage.success(
+      result.data.request_replayed ? '已返回现有 Access Point' : 'S3 Access Point 已开启',
+    );
   } catch (error) {
     createError.value = error;
   } finally {
@@ -254,6 +259,33 @@ async function updateState(
   }
 }
 
+async function deleteAccessPoint(accessPoint: S3AccessPointView): Promise<void> {
+  if (!canManage.value || pendingAction.value) return;
+  try {
+    await ElMessageBox.confirm(
+      `删除 ${accessPoint.bucket_name} 后，所有 S3 凭证会立即失效，且不能重新启用。`,
+      '确认删除 Access Point',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
+    );
+  } catch {
+    return;
+  }
+  pendingAction.value = accessPoint.access_point_id;
+  try {
+    await deleteMutation.mutateAsync({
+      tenant_id: tenantId.value,
+      access_point_id: accessPoint.access_point_id,
+      request_id: `s3-access-point-delete-${globalThis.crypto.randomUUID()}`,
+    });
+    await queryClient.invalidateQueries({ queryKey: ['s3-access-points', tenantId.value] });
+    ElMessage.success('Access Point 已删除');
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '删除 Access Point 失败');
+  } finally {
+    pendingAction.value = undefined;
+  }
+}
+
 async function openBrowser(accessPoint: S3AccessPointView): Promise<void> {
   await router.push({
     name: 'object-storage-browser',
@@ -280,8 +312,16 @@ function previousPage(): void {
   cursor.value = cursorHistory.value.pop() || undefined;
 }
 
-function stateTagType(state: S3AccessPointView['state']): 'success' | 'warning' {
-  return state === 'active' ? 'success' : 'warning';
+function stateTagType(state: S3AccessPointView['state']): 'success' | 'warning' | 'danger' {
+  if (state === 'active') return 'success';
+  if (state === 'deleted') return 'danger';
+  return 'warning';
+}
+
+function stateLabel(state: S3AccessPointView['state']): string {
+  if (state === 'active') return '启用';
+  if (state === 'deleted') return '已删除';
+  return '已停用';
 }
 </script>
 
@@ -350,7 +390,7 @@ function stateTagType(state: S3AccessPointView['state']): 'success' | 'warning' 
           <el-table-column label="状态" width="100">
             <template #default="scope"
               ><el-tag :type="stateTagType(scope.row.state)" effect="plain">{{
-                scope.row.state === 'active' ? '启用' : '已停用'
+                stateLabel(scope.row.state)
               }}</el-tag></template
             >
           </el-table-column>
@@ -384,13 +424,22 @@ function stateTagType(state: S3AccessPointView['state']): 'success' | 'warning' 
                 @click="updateState(scope.row, 'disabled')"
               />
               <el-button
-                v-else-if="canManage"
+                v-else-if="canManage && scope.row.state === 'disabled'"
                 text
                 type="success"
                 :icon="Check"
                 title="启用 Access Point"
                 :loading="pendingAction === scope.row.access_point_id"
                 @click="updateState(scope.row, 'active')"
+              />
+              <el-button
+                v-if="canManage && scope.row.state !== 'deleted'"
+                text
+                type="danger"
+                :icon="Delete"
+                title="删除 Access Point"
+                :loading="pendingAction === scope.row.access_point_id"
+                @click="deleteAccessPoint(scope.row)"
               />
             </template>
           </el-table-column>
@@ -410,7 +459,7 @@ function stateTagType(state: S3AccessPointView['state']): 'success' | 'warning' 
             >
             <span
               ><el-tag :type="stateTagType(accessPoint.state)" size="small" effect="plain">{{
-                accessPoint.state === 'active' ? '启用' : '已停用'
+                stateLabel(accessPoint.state)
               }}</el-tag
               ><ArrowRight
             /></span>

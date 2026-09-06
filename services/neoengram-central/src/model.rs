@@ -6,10 +6,10 @@ use neoengram_domain::protocol::{
     AssignmentGeneration, AssignmentId, CommitDataLayout, EdgeClusterId, Extensions, JobAccepted,
     JobAssignment, JobDecision, JobFailed, JobFinalized, JobId, JobPrepared, JobProgress, JobState,
     LeaseGrant, MetadataBatchDescriptor, MetadataBatchId, MetadataBatchPage, MountGeneration,
-    ObjectReceiptRecord, OwnerGeneration, PlacementGeneration, PlaygroundId, PrincipalRef,
-    ProjectId, ResourceVersion, SnapshotDeliveryAction, SnapshotDeliveryAssignment,
-    SnapshotDeliveryMode, SnapshotDeliveryOperation, SnapshotId, StorageVolumeId, TenantId,
-    UnixMillis, WireIndexVersion, WorkspaceMaterializeAssignment, WorkspaceMaterializeOperation,
+    ObjectReceiptRecord, OwnerGeneration, PlacementGeneration, PrincipalRef, ProjectId,
+    ResourceVersion, SnapshotDeliveryAction, SnapshotDeliveryAssignment, SnapshotDeliveryMode,
+    SnapshotDeliveryOperation, SnapshotId, StorageVolumeId, TaskId, TenantId, UnixMillis,
+    WireIndexVersion, WorkspaceId, WorkspaceMaterializeAssignment, WorkspaceMaterializeOperation,
 };
 use serde::{Deserialize, Serialize};
 
@@ -21,13 +21,17 @@ pub struct AddJobSpec {
     pub tenant_id: TenantId,
     pub project_id: ProjectId,
     pub artifact_id: ArtifactId,
-    pub playground_id: PlaygroundId,
+    pub workspace_id: WorkspaceId,
     pub expected_index_version: WireIndexVersion,
     pub data_layout: CommitDataLayout,
     pub request_digest: ContentDigest,
     pub deadline_unix_ms: UnixMillis,
     pub paths: Vec<LogicalPath>,
     pub all: bool,
+    /// Root OperationTask fenced by assignments/reports for this domain detail Job.
+    /// This is an internal authority field and is intentionally absent from AddOperation.
+    #[serde(default)]
+    pub operation_task_id: Option<TaskId>,
     /// Unknown user-operation members retained verbatim and bound by `request_digest`.
     pub extensions: Extensions,
 }
@@ -41,7 +45,7 @@ impl AddJobSpec {
             tenant_id: self.tenant_id.clone(),
             project_id: self.project_id.clone(),
             artifact_id: self.artifact_id.clone(),
-            playground_id: self.playground_id.clone(),
+            workspace_id: self.workspace_id.clone(),
             expected_index_version: self.expected_index_version.clone(),
             data_layout: self.data_layout,
             deadline_unix_ms: self.deadline_unix_ms,
@@ -76,7 +80,7 @@ pub struct IndexKey {
     pub tenant_id: TenantId,
     pub project_id: ProjectId,
     pub artifact_id: ArtifactId,
-    pub playground_id: PlaygroundId,
+    pub workspace_id: WorkspaceId,
 }
 
 /// Server-selected execution placement and all generations required to fence stale agents.
@@ -106,7 +110,7 @@ pub struct WorkspaceMaterializeSpec {
     pub tenant_id: TenantId,
     pub project_id: ProjectId,
     pub artifact_id: ArtifactId,
-    pub playground_id: PlaygroundId,
+    pub workspace_id: WorkspaceId,
     pub storage_volume_id: StorageVolumeId,
     pub relative_root: LogicalPath,
     pub base_commit_id: Option<ContentDigest>,
@@ -114,6 +118,9 @@ pub struct WorkspaceMaterializeSpec {
     pub base_index_version: Option<WireIndexVersion>,
     pub request_digest: ContentDigest,
     pub deadline_unix_ms: UnixMillis,
+    /// Root `workspace.create` task whose materialize stage owns this detail Job.
+    #[serde(default)]
+    pub operation_task_id: Option<TaskId>,
 }
 
 impl WorkspaceMaterializeSpec {
@@ -125,7 +132,7 @@ impl WorkspaceMaterializeSpec {
             tenant_id: self.tenant_id.clone(),
             project_id: self.project_id.clone(),
             artifact_id: self.artifact_id.clone(),
-            playground_id: self.playground_id.clone(),
+            workspace_id: self.workspace_id.clone(),
             storage_volume_id: self.storage_volume_id.clone(),
             relative_root: self.relative_root.clone(),
             base_commit_id: self.base_commit_id,
@@ -164,6 +171,9 @@ pub struct SnapshotDeliverySpec {
     pub delivery_generation: neoengram_domain::protocol::DeliveryGeneration,
     pub request_digest: ContentDigest,
     pub deadline_unix_ms: UnixMillis,
+    /// Root `snapshot.create` task whose delivery_materialize stage owns this detail Job.
+    #[serde(default)]
+    pub operation_task_id: Option<TaskId>,
 }
 
 impl SnapshotDeliverySpec {
@@ -337,7 +347,7 @@ impl JobRecord {
             tenant_id: self.spec.tenant_id.clone(),
             project_id: self.spec.project_id.clone(),
             artifact_id: self.spec.artifact_id.clone(),
-            playground_id: self.spec.playground_id.clone(),
+            workspace_id: self.spec.workspace_id.clone(),
         }
     }
 
@@ -375,7 +385,7 @@ pub struct AuthorizationRequest {
     pub action: Action,
     pub tenant_id: TenantId,
     pub artifact_id: ArtifactId,
-    pub playground_id: PlaygroundId,
+    pub workspace_id: WorkspaceId,
     pub job_id: JobId,
 }
 
@@ -581,7 +591,7 @@ pub struct IndexPublishRequest {
     pub mutations: Vec<neoengram_domain::protocol::IndexDeltaRecord>,
 }
 
-/// One exact authoritative Index snapshot used to initialize a newly derived Playground.
+/// One exact authoritative Index snapshot used to initialize a newly derived Workspace.
 ///
 /// Initialization is create-only: an exact replay succeeds, while an already initialized key
 /// with any different version or records is a concurrent update.

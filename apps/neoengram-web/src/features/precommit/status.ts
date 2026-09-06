@@ -1,7 +1,7 @@
 import type {
-  PlaygroundState,
-  PlaygroundStorageAvailability,
-  PlaygroundView,
+  WorkspaceState,
+  WorkspaceStorageAvailability,
+  WorkspaceView,
   PreCommitPhase,
   PreCommitState,
   PreCommitView,
@@ -47,53 +47,51 @@ export function canCommitPreCommit(precommit?: PreCommitView): boolean {
   );
 }
 
-export function playgroundLifecycleLabel(state: PlaygroundState): string {
+export function workspaceLifecycleLabel(state: WorkspaceState): string {
   return { creating: '创建中', ready: '已物化', abnormal: '异常' }[state];
 }
 
-export function playgroundLifecycleTagType(
-  state: PlaygroundState,
-): 'warning' | 'success' | 'danger' {
+export function workspaceLifecycleTagType(state: WorkspaceState): 'warning' | 'success' | 'danger' {
   if (state === 'creating') return 'warning';
   if (state === 'abnormal') return 'danger';
   return 'success';
 }
 
-type PlaygroundRuntimeState = Pick<PlaygroundView, 'state'> &
-  Partial<Pick<PlaygroundView, 'active_precommit_id' | 'storage_availability'>>;
+type WorkspaceRuntimeState = Pick<WorkspaceView, 'state'> &
+  Partial<Pick<WorkspaceView, 'active_precommit_id' | 'storage_availability'>>;
 
-export const PLAYGROUND_ACTIVE_POLL_INTERVAL_MS = 1_000;
-export const PLAYGROUND_IDLE_POLL_INTERVAL_MS = 5_000;
+export const WORKSPACE_ACTIVE_POLL_INTERVAL_MS = 1_000;
+export const WORKSPACE_IDLE_POLL_INTERVAL_MS = 5_000;
 
-export function playgroundPollInterval(
-  playground: PlaygroundRuntimeState | undefined,
-): typeof PLAYGROUND_ACTIVE_POLL_INTERVAL_MS | typeof PLAYGROUND_IDLE_POLL_INTERVAL_MS {
-  return playground?.state === 'creating' || playground?.active_precommit_id
-    ? PLAYGROUND_ACTIVE_POLL_INTERVAL_MS
-    : PLAYGROUND_IDLE_POLL_INTERVAL_MS;
+export function workspacePollInterval(
+  workspace: WorkspaceRuntimeState | undefined,
+): typeof WORKSPACE_ACTIVE_POLL_INTERVAL_MS | typeof WORKSPACE_IDLE_POLL_INTERVAL_MS {
+  return workspace?.state === 'creating' || workspace?.active_precommit_id
+    ? WORKSPACE_ACTIVE_POLL_INTERVAL_MS
+    : WORKSPACE_IDLE_POLL_INTERVAL_MS;
 }
 
-export function playgroundListPollInterval(
-  playgrounds: readonly PlaygroundRuntimeState[],
-): typeof PLAYGROUND_ACTIVE_POLL_INTERVAL_MS | typeof PLAYGROUND_IDLE_POLL_INTERVAL_MS {
-  return playgrounds.some(
-    (playground) => playground.state === 'creating' || playground.active_precommit_id,
+export function workspaceListPollInterval(
+  workspaces: readonly WorkspaceRuntimeState[],
+): typeof WORKSPACE_ACTIVE_POLL_INTERVAL_MS | typeof WORKSPACE_IDLE_POLL_INTERVAL_MS {
+  return workspaces.some(
+    (workspace) => workspace.state === 'creating' || workspace.active_precommit_id,
   )
-    ? PLAYGROUND_ACTIVE_POLL_INTERVAL_MS
-    : PLAYGROUND_IDLE_POLL_INTERVAL_MS;
+    ? WORKSPACE_ACTIVE_POLL_INTERVAL_MS
+    : WORKSPACE_IDLE_POLL_INTERVAL_MS;
 }
 
-export function playgroundStorageAvailability(
-  playground: Partial<Pick<PlaygroundView, 'state' | 'storage_availability'>> | undefined,
-): PlaygroundStorageAvailability {
-  const availability = playground?.storage_availability;
+export function workspaceStorageAvailability(
+  workspace: Partial<Pick<WorkspaceView, 'state' | 'storage_availability'>> | undefined,
+): WorkspaceStorageAvailability {
+  const availability = workspace?.storage_availability;
   return availability === 'ready' || availability === 'degraded' || availability === 'unavailable'
     ? availability
     : 'unknown';
 }
 
-export function playgroundStorageAvailabilityLabel(
-  availability: PlaygroundStorageAvailability,
+export function workspaceStorageAvailabilityLabel(
+  availability: WorkspaceStorageAvailability,
 ): string {
   return {
     ready: '存储可达',
@@ -103,8 +101,8 @@ export function playgroundStorageAvailabilityLabel(
   }[availability];
 }
 
-export function playgroundStorageAvailabilityTagType(
-  availability: PlaygroundStorageAvailability,
+export function workspaceStorageAvailabilityTagType(
+  availability: WorkspaceStorageAvailability,
 ): 'warning' | 'success' | 'danger' | 'info' {
   if (availability === 'ready') return 'success';
   if (availability === 'degraded') return 'warning';
@@ -112,18 +110,18 @@ export function playgroundStorageAvailabilityTagType(
   return 'info';
 }
 
-export function isPlaygroundOperational(playground: PlaygroundRuntimeState | undefined): boolean {
-  return playground?.state === 'ready' && playgroundStorageAvailability(playground) === 'ready';
+export function isWorkspaceOperational(workspace: WorkspaceRuntimeState | undefined): boolean {
+  return workspace?.state === 'ready' && workspaceStorageAvailability(workspace) === 'ready';
 }
 
-export function playgroundOperationUnavailableReason(
-  playground: PlaygroundRuntimeState | undefined,
+export function workspaceOperationUnavailableReason(
+  workspace: WorkspaceRuntimeState | undefined,
 ): string | undefined {
-  if (!playground) return 'Playground 状态未知';
-  if (playground.state === 'creating') return 'Playground 正在创建';
-  if (playground.state === 'abnormal') return 'Playground 生命周期异常';
+  if (!workspace) return 'Workspace 状态未知';
+  if (workspace.state === 'creating') return 'Workspace 正在创建';
+  if (workspace.state === 'abnormal') return 'Workspace 生命周期异常';
 
-  const availability = playgroundStorageAvailability(playground);
+  const availability = workspaceStorageAvailability(workspace);
   if (availability === 'degraded') return 'StorageVolume 当前处于降级状态';
   if (availability === 'unavailable') return 'StorageVolume 当前不可达';
   if (availability === 'unknown') return 'StorageVolume 状态未知';

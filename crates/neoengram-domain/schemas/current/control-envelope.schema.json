@@ -23,8 +23,6 @@
         "agent.materialization.assignment",
         "agent.materialization.report",
         "agent.protocol.error",
-        "agent.replication.assignment",
-        "agent.replication.report",
         "agent.session.channel.open",
         "agent.session.close",
         "agent.session.heartbeat.report",
@@ -56,18 +54,6 @@
         "internal.s3.authorize",
         "internal.s3.read-channel",
         "internal.s3.read-peer",
-        "playground.change.list.query",
-        "playground.commit.create",
-        "playground.create",
-        "playground.dataset.profile.query",
-        "playground.file.list.query",
-        "playground.file.metadata.query",
-        "playground.list.query",
-        "playground.precommit.cancel",
-        "playground.precommit.query",
-        "playground.precommit.restart",
-        "playground.precommit.start",
-        "playground.query",
         "project.create",
         "project.list.query",
         "resource.deletion.create",
@@ -79,6 +65,7 @@
         "resource.retention-hold.create",
         "resource.retention-hold.release",
         "s3.access-point.create",
+        "s3.access-point.delete",
         "s3.access-point.disable",
         "s3.access-point.enable",
         "s3.access-point.list.query",
@@ -117,7 +104,18 @@
         "tenant.create",
         "tenant.list.query",
         "tenant.query",
-        "workspace.create"
+        "workspace.change.list.query",
+        "workspace.commit.create",
+        "workspace.create",
+        "workspace.dataset.profile.query",
+        "workspace.file.list.query",
+        "workspace.file.metadata.query",
+        "workspace.list.query",
+        "workspace.precommit.cancel",
+        "workspace.precommit.query",
+        "workspace.precommit.restart",
+        "workspace.precommit.start",
+        "workspace.query"
       ]
     },
     "actor": {
@@ -215,6 +213,9 @@
         "assignment_id": {
           "$ref": "#/$defs/AssignmentId"
         },
+        "attempt": {
+          "$ref": "#/$defs/Generation"
+        },
         "data_layout": {
           "$ref": "#/$defs/CommitDataLayout"
         },
@@ -261,8 +262,8 @@
         "placement_generation": {
           "$ref": "#/$defs/PlacementGeneration"
         },
-        "playground_id": {
-          "$ref": "#/$defs/PlaygroundId"
+        "plan_revision": {
+          "$ref": "#/$defs/Generation"
         },
         "principal": {
           "$ref": "#/$defs/PrincipalRef"
@@ -276,15 +277,32 @@
           "minLength": 64,
           "pattern": "^[0-9a-f]{64}$"
         },
+        "stage_attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "stage_key": {
+          "type": "string"
+        },
         "storage_volume_id": {
           "$ref": "#/$defs/StorageVolumeId"
         },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
+        },
         "tenant_id": {
           "$ref": "#/$defs/TenantId"
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/WorkspaceId"
         }
       },
       "required": [
         "job_id",
+        "task_id",
+        "attempt",
+        "stage_key",
+        "stage_attempt",
+        "plan_revision",
         "assignment_id",
         "assignment_generation",
         "agent_id",
@@ -292,7 +310,7 @@
         "tenant_id",
         "project_id",
         "artifact_id",
-        "playground_id",
+        "workspace_id",
         "edge_cluster_id",
         "storage_volume_id",
         "artifact_placement_id",
@@ -415,6 +433,9 @@
         "assignment": {
           "$ref": "#/$defs/ResourceLifecycleAssignment"
         },
+        "attempt": {
+          "$ref": "#/$defs/Generation"
+        },
         "edge_cluster_id": {
           "$ref": "#/$defs/EdgeClusterId"
         },
@@ -424,11 +445,23 @@
         "owner_generation": {
           "$ref": "#/$defs/OwnerGeneration"
         },
+        "plan_revision": {
+          "$ref": "#/$defs/Generation"
+        },
         "resource_scope": {
           "$ref": "#/$defs/AgentResourceLifecycleScope"
         },
         "session_generation": {
           "$ref": "#/$defs/SessionGeneration"
+        },
+        "stage_attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "stage_key": {
+          "type": "string"
+        },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
         },
         "volume_marker_id": {
           "$ref": "#/$defs/VolumeMarkerId"
@@ -436,6 +469,11 @@
       },
       "required": [
         "assignment",
+        "task_id",
+        "attempt",
+        "stage_key",
+        "stage_attempt",
+        "plan_revision",
         "resource_scope",
         "agent_id",
         "edge_cluster_id",
@@ -511,9 +549,6 @@
             "placement_generation": {
               "$ref": "#/$defs/PlacementGeneration"
             },
-            "playground_id": {
-              "$ref": "#/$defs/PlaygroundId"
-            },
             "project_id": {
               "$ref": "#/$defs/ProjectId"
             },
@@ -522,7 +557,10 @@
             },
             "type": {
               "type": "string",
-              "const": "playground"
+              "const": "workspace"
+            },
+            "workspace_id": {
+              "$ref": "#/$defs/WorkspaceId"
             }
           },
           "additionalProperties": false,
@@ -530,7 +568,7 @@
             "type",
             "project_id",
             "artifact_id",
-            "playground_id",
+            "workspace_id",
             "storage_volume_id",
             "artifact_placement_id",
             "placement_generation"
@@ -630,7 +668,7 @@
           ]
         },
         {
-          "description": "Creates the server-derived Playground directory below the approved Agent mount.\n\nThis operation deliberately reuses the normal job accepted/progress/failed reports. It\ndoes not enter the managed-Add publication state machine: successful materialization is\nterminal after the Agent reports `job.progress(state=succeeded)`.",
+          "description": "Creates the server-derived Workspace directory below the approved Agent mount.\n\nThis operation deliberately reuses the normal job accepted/progress/failed reports. It\ndoes not enter the managed-Add publication state machine: successful materialization is\nterminal after the Agent reports `job.progress(state=succeeded)`.",
           "type": "object",
           "properties": {
             "input": {
@@ -829,31 +867,6 @@
       "maxLength": 64,
       "minLength": 64,
       "pattern": "^[0-9a-f]{64}$"
-    },
-    "CommitObject": {
-      "description": "One immutable object required by a Commit.  The ordinal is part of the ObjectSet identity and\nmakes transfer planning deterministic.",
-      "type": "object",
-      "properties": {
-        "encoding": {
-          "$ref": "#/$defs/ObjectEncoding"
-        },
-        "object_id": {
-          "$ref": "#/$defs/ObjectId"
-        },
-        "ordinal": {
-          "$ref": "#/$defs/DecimalU64"
-        },
-        "size": {
-          "$ref": "#/$defs/DecimalU64"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "object_id",
-        "size",
-        "encoding",
-        "ordinal"
-      ]
     },
     "ComputeNodeId": {
       "description": "A validated compute node ID wire identifier.",
@@ -1084,38 +1097,6 @@
           "type": "object",
           "properties": {
             "payload": {
-              "$ref": "#/$defs/ReplicationAssignment"
-            },
-            "type": {
-              "type": "string",
-              "const": "replication.assignment"
-            }
-          },
-          "required": [
-            "type",
-            "payload"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "payload": {
-              "$ref": "#/$defs/ReplicationProgressReport"
-            },
-            "type": {
-              "type": "string",
-              "const": "replication.report"
-            }
-          },
-          "required": [
-            "type",
-            "payload"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "payload": {
               "$ref": "#/$defs/MaterializationAssignment"
             },
             "type": {
@@ -1254,7 +1235,7 @@
       "pattern": "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
     },
     "JobAccepted": {
-      "description": "No extension members are accepted by the current protocol.",
+      "description": "Exact execution identity copied into every Central-to-Agent assignment and Agent report.\n\nThe root task and its current stage are separate from domain detail identities (Job, Batch,\nDelivery, or Replication).  Keeping this fence as one flattened value object prevents one\nprotocol variant from accidentally omitting a generation while still leaving the wire fields\nat the top level for strict v2 payloads.",
       "type": "object",
       "properties": {
         "accepted_at_unix_ms": {
@@ -1266,18 +1247,38 @@
         "assignment_id": {
           "$ref": "#/$defs/AssignmentId"
         },
+        "attempt": {
+          "$ref": "#/$defs/Generation"
+        },
         "job_id": {
           "$ref": "#/$defs/JobId"
+        },
+        "plan_revision": {
+          "$ref": "#/$defs/Generation"
         },
         "request_digest": {
           "type": "string",
           "maxLength": 64,
           "minLength": 64,
           "pattern": "^[0-9a-f]{64}$"
+        },
+        "stage_attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "stage_key": {
+          "type": "string"
+        },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
         }
       },
       "required": [
         "job_id",
+        "task_id",
+        "attempt",
+        "stage_key",
+        "stage_attempt",
+        "plan_revision",
         "assignment_id",
         "assignment_generation",
         "accepted_at_unix_ms",
@@ -1297,7 +1298,7 @@
       ]
     },
     "JobDecision": {
-      "description": "No extension members are accepted by the current protocol.",
+      "description": "Exact execution identity copied into every Central-to-Agent assignment and Agent report.\n\nThe root task and its current stage are separate from domain detail identities (Job, Batch,\nDelivery, or Replication).  Keeping this fence as one flattened value object prevents one\nprotocol variant from accidentally omitting a generation while still leaving the wire fields\nat the top level for strict v2 payloads.",
       "type": "object",
       "properties": {
         "assignment_generation": {
@@ -1305,6 +1306,9 @@
         },
         "assignment_id": {
           "$ref": "#/$defs/AssignmentId"
+        },
+        "attempt": {
+          "$ref": "#/$defs/Generation"
         },
         "decision": {
           "$ref": "#/$defs/PublishDecision"
@@ -1317,10 +1321,27 @@
         },
         "job_id": {
           "$ref": "#/$defs/JobId"
+        },
+        "plan_revision": {
+          "$ref": "#/$defs/Generation"
+        },
+        "stage_attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "stage_key": {
+          "type": "string"
+        },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
         }
       },
       "required": [
         "job_id",
+        "task_id",
+        "attempt",
+        "stage_key",
+        "stage_attempt",
+        "plan_revision",
         "assignment_id",
         "assignment_generation",
         "decision_generation",
@@ -1338,6 +1359,9 @@
         "assignment_id": {
           "$ref": "#/$defs/AssignmentId"
         },
+        "attempt": {
+          "$ref": "#/$defs/Generation"
+        },
         "error": {
           "$ref": "#/$defs/ControlError"
         },
@@ -1350,8 +1374,20 @@
         "job_id": {
           "$ref": "#/$defs/JobId"
         },
+        "plan_revision": {
+          "$ref": "#/$defs/Generation"
+        },
         "stage": {
           "$ref": "#/$defs/JobFailureStage"
+        },
+        "stage_attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "stage_key": {
+          "type": "string"
+        },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
         },
         "tenant_id": {
           "$ref": "#/$defs/TenantId"
@@ -1360,6 +1396,11 @@
       "required": [
         "tenant_id",
         "job_id",
+        "task_id",
+        "attempt",
+        "stage_key",
+        "stage_attempt",
+        "plan_revision",
         "assignment_id",
         "assignment_generation",
         "final_state",
@@ -1378,7 +1419,7 @@
       ]
     },
     "JobFinalized": {
-      "description": "No extension members are accepted by the current protocol.",
+      "description": "Exact execution identity copied into every Central-to-Agent assignment and Agent report.\n\nThe root task and its current stage are separate from domain detail identities (Job, Batch,\nDelivery, or Replication).  Keeping this fence as one flattened value object prevents one\nprotocol variant from accidentally omitting a generation while still leaving the wire fields\nat the top level for strict v2 payloads.",
       "type": "object",
       "properties": {
         "assignment_generation": {
@@ -1386,6 +1427,9 @@
         },
         "assignment_id": {
           "$ref": "#/$defs/AssignmentId"
+        },
+        "attempt": {
+          "$ref": "#/$defs/Generation"
         },
         "decision_generation": {
           "$ref": "#/$defs/DecisionGeneration"
@@ -1398,10 +1442,27 @@
         },
         "job_id": {
           "$ref": "#/$defs/JobId"
+        },
+        "plan_revision": {
+          "$ref": "#/$defs/Generation"
+        },
+        "stage_attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "stage_key": {
+          "type": "string"
+        },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
         }
       },
       "required": [
         "job_id",
+        "task_id",
+        "attempt",
+        "stage_key",
+        "stage_attempt",
+        "plan_revision",
         "assignment_id",
         "assignment_generation",
         "decision_generation",
@@ -1417,7 +1478,7 @@
       "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
     },
     "JobPrepared": {
-      "description": "No extension members are accepted by the current protocol.",
+      "description": "Exact execution identity copied into every Central-to-Agent assignment and Agent report.\n\nThe root task and its current stage are separate from domain detail identities (Job, Batch,\nDelivery, or Replication).  Keeping this fence as one flattened value object prevents one\nprotocol variant from accidentally omitting a generation while still leaving the wire fields\nat the top level for strict v2 payloads.",
       "type": "object",
       "properties": {
         "assignment_generation": {
@@ -1425,6 +1486,9 @@
         },
         "assignment_id": {
           "$ref": "#/$defs/AssignmentId"
+        },
+        "attempt": {
+          "$ref": "#/$defs/Generation"
         },
         "base_index_version": {
           "$ref": "#/$defs/WireIndexVersion"
@@ -1447,6 +1511,9 @@
           },
           "maxItems": 4096
         },
+        "plan_revision": {
+          "$ref": "#/$defs/Generation"
+        },
         "publication_digest": {
           "description": "Backend-independent digest of scope, IndexDelta, Manifests, and ObjectSpecs.",
           "type": "string",
@@ -1460,10 +1527,24 @@
           "maxLength": 64,
           "minLength": 64,
           "pattern": "^[0-9a-f]{64}$"
+        },
+        "stage_attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "stage_key": {
+          "type": "string"
+        },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
         }
       },
       "required": [
         "job_id",
+        "task_id",
+        "attempt",
+        "stage_key",
+        "stage_attempt",
+        "plan_revision",
         "assignment_id",
         "assignment_generation",
         "base_index_version",
@@ -1473,7 +1554,7 @@
       ]
     },
     "JobProgress": {
-      "description": "No extension members are accepted by the current protocol.",
+      "description": "Exact execution identity copied into every Central-to-Agent assignment and Agent report.\n\nThe root task and its current stage are separate from domain detail identities (Job, Batch,\nDelivery, or Replication).  Keeping this fence as one flattened value object prevents one\nprotocol variant from accidentally omitting a generation while still leaving the wire fields\nat the top level for strict v2 payloads.",
       "type": "object",
       "properties": {
         "assignment_generation": {
@@ -1481,6 +1562,9 @@
         },
         "assignment_id": {
           "$ref": "#/$defs/AssignmentId"
+        },
+        "attempt": {
+          "$ref": "#/$defs/Generation"
         },
         "bytes_completed": {
           "$ref": "#/$defs/DecimalU64"
@@ -1496,6 +1580,9 @@
           "maxLength": 128,
           "minLength": 1
         },
+        "plan_revision": {
+          "$ref": "#/$defs/Generation"
+        },
         "retry_after_ms": {
           "anyOf": [
             {
@@ -1506,12 +1593,26 @@
             }
           ]
         },
+        "stage_attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "stage_key": {
+          "type": "string"
+        },
         "state": {
           "$ref": "#/$defs/JobState"
+        },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
         }
       },
       "required": [
         "job_id",
+        "task_id",
+        "attempt",
+        "stage_key",
+        "stage_attempt",
+        "plan_revision",
         "assignment_id",
         "assignment_generation",
         "state",
@@ -1622,6 +1723,16 @@
         "signed_ticket": {
           "$ref": "#/$defs/SignedMaterializationBatchTicket"
         },
+        "stage_attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "stage_key": {
+          "type": "string"
+        },
+        "task_attempt": {
+          "description": "Explicit root/stage fences are carried in addition to opaque attempt identities.",
+          "$ref": "#/$defs/Generation"
+        },
         "task_attempt_id": {
           "description": "Exact execution attempt authorized for this assignment.",
           "$ref": "#/$defs/TaskAttemptId"
@@ -1631,6 +1742,9 @@
       "required": [
         "operation_task_id",
         "task_attempt_id",
+        "task_attempt",
+        "stage_key",
+        "stage_attempt",
         "signed_ticket",
         "batch",
         "manifest",
@@ -1763,8 +1877,17 @@
         "source": {
           "$ref": "#/$defs/MaterializationSource"
         },
+        "stage_attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "stage_key": {
+          "type": "string"
+        },
         "target": {
           "$ref": "#/$defs/MaterializationTarget"
+        },
+        "task_attempt": {
+          "$ref": "#/$defs/Generation"
         },
         "task_attempt_id": {
           "$ref": "#/$defs/TaskAttemptId"
@@ -1781,6 +1904,9 @@
         "ticket_id",
         "operation_task_id",
         "task_attempt_id",
+        "task_attempt",
+        "stage_key",
+        "stage_attempt",
         "materialization_id",
         "batch_id",
         "plan_revision",
@@ -1862,11 +1988,20 @@
         "size": {
           "$ref": "#/$defs/DecimalU64"
         },
+        "stage_attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "stage_key": {
+          "type": "string"
+        },
         "target_placement_generation": {
           "$ref": "#/$defs/PlacementGeneration"
         },
         "target_storage_volume_id": {
           "$ref": "#/$defs/StorageVolumeId"
+        },
+        "task_attempt": {
+          "$ref": "#/$defs/Generation"
         },
         "task_attempt_id": {
           "$ref": "#/$defs/TaskAttemptId"
@@ -1886,6 +2021,9 @@
         "receipt_id",
         "operation_task_id",
         "task_attempt_id",
+        "task_attempt",
+        "stage_key",
+        "stage_attempt",
         "materialization_id",
         "batch_id",
         "plan_revision",
@@ -1982,9 +2120,18 @@
                 "plan_revision": {
                   "$ref": "#/$defs/Generation"
                 },
+                "stage_attempt": {
+                  "$ref": "#/$defs/Generation"
+                },
+                "stage_key": {
+                  "type": "string"
+                },
                 "target": {
                   "description": "The complete target fence from the signed assignment.  Failure reports must not rely\non whatever route happens to be current when Central receives them.",
                   "$ref": "#/$defs/MaterializationTarget"
+                },
+                "task_attempt": {
+                  "$ref": "#/$defs/Generation"
                 },
                 "task_attempt_id": {
                   "$ref": "#/$defs/TaskAttemptId"
@@ -1997,6 +2144,9 @@
               "required": [
                 "operation_task_id",
                 "task_attempt_id",
+                "task_attempt",
+                "stage_key",
+                "stage_attempt",
                 "materialization_id",
                 "batch_id",
                 "plan_revision",
@@ -2220,21 +2370,22 @@
         "job_id": {
           "$ref": "#/$defs/JobId"
         },
-        "playground_id": {
-          "$ref": "#/$defs/PlaygroundId"
-        },
         "project_id": {
           "$ref": "#/$defs/ProjectId"
         },
         "tenant_id": {
           "$ref": "#/$defs/TenantId"
+        },
+        "workspace_id": {
+          "description": "Workspace identity. The Rust field name remains an internal migration detail; the v2 wire\ncontract accepts only `workspace_id` and deliberately has no `workspace_id` alias.",
+          "$ref": "#/$defs/WorkspaceId"
         }
       },
       "required": [
         "tenant_id",
         "project_id",
         "artifact_id",
-        "playground_id",
+        "workspace_id",
         "job_id",
         "base_index_version"
       ]
@@ -2371,26 +2522,6 @@
         "ordinal"
       ]
     },
-    "ObjectSet": {
-      "description": "Canonical object set attached to an immutable Commit.",
-      "type": "object",
-      "properties": {
-        "object_set_digest": {
-          "$ref": "#/$defs/ContentDigest"
-        },
-        "objects": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/CommitObject"
-          }
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "object_set_digest",
-        "objects"
-      ]
-    },
     "ObjectTicketId": {
       "description": "A validated object ticket ID wire identifier.",
       "type": "string",
@@ -2414,13 +2545,6 @@
     },
     "PlacementId": {
       "description": "A validated object placement ID wire identifier.",
-      "type": "string",
-      "maxLength": 128,
-      "minLength": 1,
-      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
-    },
-    "PlaygroundId": {
-      "description": "A validated playground ID wire identifier.",
       "type": "string",
       "maxLength": 128,
       "minLength": 1,
@@ -2522,242 +2646,6 @@
             "error"
           ]
         }
-      ]
-    },
-    "ReplicationAssignment": {
-      "description": "Central's immutable command for one fenced Commit object replication attempt.\n\nThe signed ticket binds the physical source/target route and expiry. The ObjectSet is carried\nalongside it so an Agent can execute without consulting Central during a reconnect; validation\nrequires both representations to describe exactly the same object identities and digest.",
-      "type": "object",
-      "properties": {
-        "artifact_id": {
-          "description": "Artifact namespace bound by the Central-signed transfer ticket.",
-          "$ref": "#/$defs/ArtifactId"
-        },
-        "attempt": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "commit_id": {
-          "$ref": "#/$defs/CommitId"
-        },
-        "object_set": {
-          "$ref": "#/$defs/ObjectSet"
-        },
-        "replication_id": {
-          "$ref": "#/$defs/ReplicationId"
-        },
-        "signed_ticket": {
-          "$ref": "#/$defs/SignedTransferTicket"
-        },
-        "tenant_id": {
-          "$ref": "#/$defs/TenantId"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "replication_id",
-        "tenant_id",
-        "artifact_id",
-        "commit_id",
-        "attempt",
-        "signed_ticket",
-        "object_set"
-      ]
-    },
-    "ReplicationId": {
-      "description": "A validated replication ID wire identifier.",
-      "type": "string",
-      "maxLength": 128,
-      "minLength": 1,
-      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
-    },
-    "ReplicationObjectState": {
-      "description": "Durable progress state for one object inside a Replication.",
-      "type": "string",
-      "enum": [
-        "queued",
-        "transferring",
-        "verified",
-        "failed"
-      ]
-    },
-    "ReplicationProgressReport": {
-      "description": "Durable Agent-to-Central checkpoint emitted while executing a ReplicationAssignment.\n\nState events carry aggregate counters, object events carry the last fsync-confirmed byte\nboundary, and Published is the final publication fence. The attempt is repeated on every\nevent so Central can reject reports from a superseded retry without consulting Agent state.",
-      "oneOf": [
-        {
-          "type": "object",
-          "properties": {
-            "event": {
-              "type": "string",
-              "const": "state"
-            },
-            "payload": {
-              "description": "No extension members are accepted by the current protocol.",
-              "type": "object",
-              "properties": {
-                "attempt": {
-                  "type": "integer",
-                  "format": "uint64",
-                  "minimum": 0
-                },
-                "completed_bytes": {
-                  "type": "integer",
-                  "format": "uint64",
-                  "minimum": 0
-                },
-                "completed_objects": {
-                  "type": "integer",
-                  "format": "uint64",
-                  "minimum": 0
-                },
-                "issue_code": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "issue_message": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "replication_id": {
-                  "$ref": "#/$defs/ReplicationId"
-                },
-                "state": {
-                  "$ref": "#/$defs/ReplicationState"
-                },
-                "tenant_id": {
-                  "$ref": "#/$defs/TenantId"
-                }
-              },
-              "additionalProperties": false,
-              "required": [
-                "replication_id",
-                "tenant_id",
-                "attempt",
-                "state",
-                "completed_objects",
-                "completed_bytes"
-              ]
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "event",
-            "payload"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "event": {
-              "type": "string",
-              "const": "object"
-            },
-            "payload": {
-              "description": "No extension members are accepted by the current protocol.",
-              "type": "object",
-              "properties": {
-                "attempt": {
-                  "type": "integer",
-                  "format": "uint64",
-                  "minimum": 0
-                },
-                "object_id": {
-                  "$ref": "#/$defs/ObjectId"
-                },
-                "offset": {
-                  "type": "integer",
-                  "format": "uint64",
-                  "minimum": 0
-                },
-                "replication_id": {
-                  "$ref": "#/$defs/ReplicationId"
-                },
-                "state": {
-                  "$ref": "#/$defs/ReplicationObjectState"
-                },
-                "tenant_id": {
-                  "$ref": "#/$defs/TenantId"
-                }
-              },
-              "additionalProperties": false,
-              "required": [
-                "replication_id",
-                "tenant_id",
-                "attempt",
-                "object_id",
-                "offset",
-                "state"
-              ]
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "event",
-            "payload"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "event": {
-              "type": "string",
-              "const": "published"
-            },
-            "payload": {
-              "description": "No extension members are accepted by the current protocol.",
-              "type": "object",
-              "properties": {
-                "attempt": {
-                  "type": "integer",
-                  "format": "uint64",
-                  "minimum": 0
-                },
-                "commit_id": {
-                  "$ref": "#/$defs/CommitId"
-                },
-                "object_set_digest": {
-                  "$ref": "#/$defs/ContentDigest"
-                },
-                "replication_id": {
-                  "$ref": "#/$defs/ReplicationId"
-                },
-                "tenant_id": {
-                  "$ref": "#/$defs/TenantId"
-                }
-              },
-              "additionalProperties": false,
-              "required": [
-                "replication_id",
-                "tenant_id",
-                "attempt",
-                "commit_id",
-                "object_set_digest"
-              ]
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "event",
-            "payload"
-          ]
-        }
-      ]
-    },
-    "ReplicationState": {
-      "description": "Explicit object replication state.",
-      "type": "string",
-      "enum": [
-        "queued",
-        "planning",
-        "transferring",
-        "verifying",
-        "published",
-        "failed",
-        "cancelled"
       ]
     },
     "RequestId": {
@@ -2870,6 +2758,9 @@
         "assignment_id": {
           "$ref": "#/$defs/LifecycleAssignmentId"
         },
+        "attempt": {
+          "$ref": "#/$defs/Generation"
+        },
         "deletion_id": {
           "$ref": "#/$defs/DeletionId"
         },
@@ -2912,6 +2803,9 @@
             }
           ]
         },
+        "plan_revision": {
+          "$ref": "#/$defs/Generation"
+        },
         "reported_at_unix_ms": {
           "$ref": "#/$defs/UnixMillis"
         },
@@ -2927,11 +2821,20 @@
         "session_generation": {
           "$ref": "#/$defs/SessionGeneration"
         },
+        "stage_attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "stage_key": {
+          "type": "string"
+        },
         "state": {
           "$ref": "#/$defs/ResourceLifecycleReportState"
         },
         "storage_volume_id": {
           "$ref": "#/$defs/StorageVolumeId"
+        },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
         },
         "tenant_id": {
           "$ref": "#/$defs/TenantId"
@@ -2939,6 +2842,11 @@
       },
       "required": [
         "assignment_id",
+        "task_id",
+        "attempt",
+        "stage_key",
+        "stage_attempt",
+        "plan_revision",
         "deletion_id",
         "tenant_id",
         "resource",
@@ -2969,6 +2877,23 @@
     "ResourceRef": {
       "description": "Fully scoped resource identity. Tenant scope is carried by the containing request/record.",
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "project_id": {
+              "$ref": "#/$defs/ProjectId"
+            },
+            "type": {
+              "type": "string",
+              "const": "project"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "project_id"
+          ]
+        },
         {
           "type": "object",
           "properties": {
@@ -3013,15 +2938,15 @@
             "artifact_id": {
               "$ref": "#/$defs/ArtifactId"
             },
-            "playground_id": {
-              "$ref": "#/$defs/PlaygroundId"
-            },
             "project_id": {
               "$ref": "#/$defs/ProjectId"
             },
             "type": {
               "type": "string",
-              "const": "playground"
+              "const": "workspace"
+            },
+            "workspace_id": {
+              "$ref": "#/$defs/WorkspaceId"
             }
           },
           "additionalProperties": false,
@@ -3029,7 +2954,7 @@
             "type",
             "project_id",
             "artifact_id",
-            "playground_id"
+            "workspace_id"
           ]
         },
         {
@@ -3120,23 +3045,6 @@
         "central_signature"
       ]
     },
-    "SignedTransferTicket": {
-      "description": "A Central-authenticated transfer capability. The unsigned ticket remains a value object for\ndeterministic local workers; network-facing hops carry this envelope so the exact Tenant,\nObjectSet, endpoints, generations, byte limit, and expiry are signed together.",
-      "type": "object",
-      "properties": {
-        "central_signature": {
-          "$ref": "#/$defs/CentralSignedPayload"
-        },
-        "ticket": {
-          "$ref": "#/$defs/TransferTicket"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "ticket",
-        "central_signature"
-      ]
-    },
     "SnapshotDeliveryAction": {
       "type": "string",
       "enum": [
@@ -3165,6 +3073,9 @@
         },
         "assignment_id": {
           "$ref": "#/$defs/AssignmentId"
+        },
+        "attempt": {
+          "$ref": "#/$defs/Generation"
         },
         "commit_id": {
           "type": "string",
@@ -3202,6 +3113,9 @@
         "placement_generation": {
           "$ref": "#/$defs/PlacementGeneration"
         },
+        "plan_revision": {
+          "$ref": "#/$defs/Generation"
+        },
         "principal": {
           "$ref": "#/$defs/PrincipalRef"
         },
@@ -3226,11 +3140,20 @@
           "minLength": 64,
           "pattern": "^[0-9a-f]{64}$"
         },
+        "stage_attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "stage_key": {
+          "type": "string"
+        },
         "storage_volume_id": {
           "$ref": "#/$defs/StorageVolumeId"
         },
         "target_relative_root": {
           "type": "string"
+        },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
         },
         "tenant_id": {
           "$ref": "#/$defs/TenantId"
@@ -3238,6 +3161,11 @@
       },
       "required": [
         "job_id",
+        "task_id",
+        "attempt",
+        "stage_key",
+        "stage_attempt",
+        "plan_revision",
         "assignment_id",
         "assignment_generation",
         "agent_id",
@@ -3323,128 +3251,6 @@
       "minLength": 1,
       "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
     },
-    "TransferEndpoint": {
-      "description": "The physical endpoints bound into a short-lived TransferTicket.",
-      "type": "object",
-      "properties": {
-        "agent_id": {
-          "$ref": "#/$defs/AgentId"
-        },
-        "edge_cluster_id": {
-          "$ref": "#/$defs/EdgeClusterId"
-        },
-        "gateway_pool_id": {
-          "$ref": "#/$defs/GatewayPoolId"
-        },
-        "placement_id": {
-          "$ref": "#/$defs/PlacementId"
-        },
-        "storage_volume_id": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/StorageVolumeId"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "placement_id",
-        "agent_id",
-        "gateway_pool_id",
-        "edge_cluster_id"
-      ]
-    },
-    "TransferId": {
-      "description": "A validated transfer ID wire identifier.",
-      "type": "string",
-      "maxLength": 128,
-      "minLength": 1,
-      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
-    },
-    "TransferTicket": {
-      "description": "Central-issued, short-lived capability for exactly one object-set transfer.",
-      "type": "object",
-      "properties": {
-        "allowed_objects": {
-          "description": "The exact Object IDs permitted by this capability.  An empty list is valid for an empty\nCommit and is never interpreted as “all objects”.",
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ObjectId"
-          }
-        },
-        "artifact_id": {
-          "description": "Artifact namespace for the artifact-scoped Volume CAS. This is signed together with the\nrest of the transfer capability so an assignment cannot redirect bytes into another\nartifact's object namespace.",
-          "$ref": "#/$defs/ArtifactId"
-        },
-        "commit_id": {
-          "$ref": "#/$defs/CommitId"
-        },
-        "deadline_unix_ms": {
-          "$ref": "#/$defs/UnixMillis"
-        },
-        "max_bytes": {
-          "$ref": "#/$defs/DecimalU64"
-        },
-        "mount_generation": {
-          "$ref": "#/$defs/MountGeneration"
-        },
-        "object_set_digest": {
-          "$ref": "#/$defs/ContentDigest"
-        },
-        "route_generation": {
-          "$ref": "#/$defs/RouteGeneration"
-        },
-        "session_generation": {
-          "description": "Target route fences used by the receiving Agent/Gateway.",
-          "$ref": "#/$defs/SessionGeneration"
-        },
-        "source": {
-          "$ref": "#/$defs/TransferEndpoint"
-        },
-        "source_mount_generation": {
-          "$ref": "#/$defs/MountGeneration"
-        },
-        "source_route_generation": {
-          "$ref": "#/$defs/RouteGeneration"
-        },
-        "source_session_generation": {
-          "description": "Source route fences are kept separately from the target Agent fences. A relay must not\nreuse a target session or mount generation when it opens the source side of a transfer.",
-          "$ref": "#/$defs/SessionGeneration"
-        },
-        "target": {
-          "$ref": "#/$defs/TransferEndpoint"
-        },
-        "tenant_id": {
-          "$ref": "#/$defs/TenantId"
-        },
-        "transfer_id": {
-          "$ref": "#/$defs/TransferId"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "transfer_id",
-        "tenant_id",
-        "artifact_id",
-        "commit_id",
-        "object_set_digest",
-        "source",
-        "target",
-        "source_session_generation",
-        "source_mount_generation",
-        "source_route_generation",
-        "session_generation",
-        "mount_generation",
-        "route_generation",
-        "deadline_unix_ms",
-        "max_bytes",
-        "allowed_objects"
-      ]
-    },
     "UnixMillis": {
       "description": "A Unix millisecond timestamp encoded as a canonical decimal JSON string.",
       "type": "string",
@@ -3478,8 +3284,15 @@
         "digest"
       ]
     },
+    "WorkspaceId": {
+      "description": "A validated workspace ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
     "WorkspaceMaterializeAssignment": {
-      "description": "Complete immutable scope required to create one server-derived Playground directory.\n\n`relative_root` is carried for explicit protocol observability, but is not trusted by the\nAgent. Validation requires it to equal the canonical path derived from the typed resource\nidentifiers. `base_commit_id` and `base_index_version` are absent only for an empty baseline.",
+      "description": "Complete immutable scope required to create one server-derived Workspace directory.\n\n`relative_root` is carried for explicit protocol observability, but is not trusted by the\nAgent. Validation requires it to equal the canonical path derived from the typed resource\nidentifiers. `base_commit_id` and `base_index_version` are absent only for an empty baseline.",
       "type": "object",
       "properties": {
         "agent_id": {
@@ -3496,6 +3309,9 @@
         },
         "assignment_id": {
           "$ref": "#/$defs/AssignmentId"
+        },
+        "attempt": {
+          "$ref": "#/$defs/Generation"
         },
         "base_commit_id": {
           "type": [
@@ -3525,8 +3341,8 @@
         "owner_generation": {
           "$ref": "#/$defs/OwnerGeneration"
         },
-        "playground_id": {
-          "$ref": "#/$defs/PlaygroundId"
+        "plan_revision": {
+          "$ref": "#/$defs/Generation"
         },
         "principal": {
           "$ref": "#/$defs/PrincipalRef"
@@ -3544,15 +3360,32 @@
           "minLength": 64,
           "pattern": "^[0-9a-f]{64}$"
         },
+        "stage_attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "stage_key": {
+          "type": "string"
+        },
         "storage_volume_id": {
           "$ref": "#/$defs/StorageVolumeId"
         },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
+        },
         "tenant_id": {
           "$ref": "#/$defs/TenantId"
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/WorkspaceId"
         }
       },
       "required": [
         "job_id",
+        "task_id",
+        "attempt",
+        "stage_key",
+        "stage_attempt",
+        "plan_revision",
         "assignment_id",
         "assignment_generation",
         "agent_id",
@@ -3560,7 +3393,7 @@
         "tenant_id",
         "project_id",
         "artifact_id",
-        "playground_id",
+        "workspace_id",
         "storage_volume_id",
         "agent_mount_id",
         "mount_generation",

@@ -9,9 +9,9 @@ use neoengram_domain::core::{
 };
 use neoengram_domain::protocol::{
     ArtifactId, AssignmentGeneration, AssignmentId, CommitDataLayout, ControlError,
-    DecisionGeneration, ErrorCode, Extensions, IndexRevision, JobDecision, JobId, JobState,
-    PrincipalId, PrincipalKind, PrincipalRef, ProjectId, PublishDecision, RequestId,
-    ResourceVersion, TenantId, UnixMillis, WireIndexVersion,
+    DecisionGeneration, ErrorCode, Extensions, Generation, IndexRevision, JobDecision, JobId,
+    JobState, PrincipalId, PrincipalKind, PrincipalRef, ProjectId, PublishDecision, RequestId,
+    ResourceVersion, TaskExecutionFence, TaskId, TenantId, UnixMillis, WireIndexVersion,
 };
 
 #[cfg(feature = "authority-sqlite")]
@@ -76,7 +76,7 @@ async fn run_contract(store: AuthorityStore) -> ContractResult {
     let tenant_id = TenantId::new("tenant-a").unwrap();
     let project_id = ProjectId::new("project-a").unwrap();
     let artifact_id = ArtifactId::new("artifact-a").unwrap();
-    let playground_id = neoengram_domain::protocol::PlaygroundId::new("playground-a").unwrap();
+    let workspace_id = neoengram_domain::protocol::WorkspaceId::new("workspace-a").unwrap();
     let source = version(4, 4);
     let records = frozen_records();
     let candidate = WireIndexVersion::from(IndexVersion::from_snapshot(5, &records).unwrap());
@@ -85,7 +85,7 @@ async fn run_contract(store: AuthorityStore) -> ContractResult {
         tenant_id: tenant_id.clone(),
         project_id: project_id.clone(),
         artifact_id: artifact_id.clone(),
-        playground_id: playground_id.clone(),
+        workspace_id: workspace_id.clone(),
         precommit_id: key.precommit_id.clone(),
         precommit_request_id: RequestId::new("start-a").unwrap(),
         source_index_version: source.clone(),
@@ -100,7 +100,7 @@ async fn run_contract(store: AuthorityStore) -> ContractResult {
     assert_eq!(started.precommit.attempt, 1);
     assert_eq!(
         repository
-            .get_active(&tenant_id, &project_id, &artifact_id, &playground_id)
+            .get_active(&tenant_id, &project_id, &artifact_id, &workspace_id)
             .await
             .unwrap()
             .unwrap()
@@ -150,7 +150,7 @@ async fn run_contract(store: AuthorityStore) -> ContractResult {
         &tenant_id,
         &project_id,
         &artifact_id,
-        &playground_id,
+        &workspace_id,
         &key,
         JobId::new("job-a").unwrap(),
         source.clone(),
@@ -203,7 +203,7 @@ async fn run_contract(store: AuthorityStore) -> ContractResult {
         &tenant_id,
         &project_id,
         &artifact_id,
-        &playground_id,
+        &workspace_id,
         &key,
         JobId::new("job-a").unwrap(),
         source.clone(),
@@ -287,7 +287,7 @@ async fn run_contract(store: AuthorityStore) -> ContractResult {
             tenant_id: tenant_id.clone(),
             project_id: project_id.clone(),
             artifact_id: artifact_id.clone(),
-            source_playground_id: playground_id.clone(),
+            source_workspace_id: workspace_id.clone(),
             source_precommit_id: key.precommit_id.clone(),
             commit_request_id: RequestId::new("commit-a").unwrap(),
             commit_id,
@@ -354,7 +354,7 @@ async fn run_contract(store: AuthorityStore) -> ContractResult {
         .unwrap()
         .is_empty());
     assert!(repository
-        .get_active(&tenant_id, &project_id, &artifact_id, &playground_id)
+        .get_active(&tenant_id, &project_id, &artifact_id, &workspace_id)
         .await
         .unwrap()
         .is_none());
@@ -450,7 +450,7 @@ async fn run_contract(store: AuthorityStore) -> ContractResult {
         &tenant_id,
         &project_id,
         &artifact_id,
-        &playground_id,
+        &workspace_id,
     )
     .await;
     exercise_restart_and_cancel(
@@ -458,7 +458,7 @@ async fn run_contract(store: AuthorityStore) -> ContractResult {
         tenant_id,
         project_id,
         artifact_id,
-        playground_id,
+        workspace_id,
     )
     .await;
     ContractResult { key, commit_id }
@@ -469,7 +469,7 @@ async fn exercise_missing_frozen_head(
     tenant_id: &TenantId,
     project_id: &ProjectId,
     artifact_id: &ArtifactId,
-    playground_id: &neoengram_domain::protocol::PlaygroundId,
+    workspace_id: &neoengram_domain::protocol::WorkspaceId,
 ) {
     let source = version(8, 8);
     let records = frozen_records();
@@ -484,7 +484,7 @@ async fn exercise_missing_frozen_head(
             tenant_id: tenant_id.clone(),
             project_id: project_id.clone(),
             artifact_id: artifact_id.clone(),
-            playground_id: playground_id.clone(),
+            workspace_id: workspace_id.clone(),
             precommit_id: key.precommit_id.clone(),
             precommit_request_id: RequestId::new("start-missing-head").unwrap(),
             source_index_version: source.clone(),
@@ -499,7 +499,7 @@ async fn exercise_missing_frozen_head(
         tenant_id,
         project_id,
         artifact_id,
-        playground_id,
+        workspace_id,
         &key,
         job_id,
         source,
@@ -561,7 +561,7 @@ async fn exercise_restart_and_cancel(
     tenant_id: TenantId,
     project_id: ProjectId,
     artifact_id: ArtifactId,
-    playground_id: neoengram_domain::protocol::PlaygroundId,
+    workspace_id: neoengram_domain::protocol::WorkspaceId,
 ) {
     let source = version(10, 10);
     let key = PreCommitKey::new(
@@ -573,7 +573,7 @@ async fn exercise_restart_and_cancel(
             tenant_id: tenant_id.clone(),
             project_id: project_id.clone(),
             artifact_id: artifact_id.clone(),
-            playground_id: playground_id.clone(),
+            workspace_id: workspace_id.clone(),
             precommit_id: key.precommit_id.clone(),
             precommit_request_id: RequestId::new("start-retry").unwrap(),
             source_index_version: source.clone(),
@@ -588,7 +588,7 @@ async fn exercise_restart_and_cancel(
         &tenant_id,
         &project_id,
         &artifact_id,
-        &playground_id,
+        &workspace_id,
         &key,
         JobId::new("job-failed").unwrap(),
         source,
@@ -613,7 +613,7 @@ async fn exercise_restart_and_cancel(
     assert_eq!(abnormal.blockers[0].code, "SCAN_FAILED");
     assert_eq!(
         repository
-            .get_active(&tenant_id, &project_id, &artifact_id, &playground_id)
+            .get_active(&tenant_id, &project_id, &artifact_id, &workspace_id)
             .await
             .unwrap()
             .unwrap()
@@ -651,7 +651,7 @@ async fn exercise_restart_and_cancel(
     assert_eq!(cancelled.precommit.state, PreCommitState::Cancelled);
     assert!(repository.cancel(cancel).await.unwrap().replayed);
     assert!(repository
-        .get_active(&tenant_id, &project_id, &artifact_id, &playground_id)
+        .get_active(&tenant_id, &project_id, &artifact_id, &workspace_id)
         .await
         .unwrap()
         .is_none());
@@ -663,7 +663,7 @@ fn terminal_job(
     tenant_id: &TenantId,
     project_id: &ProjectId,
     artifact_id: &ArtifactId,
-    playground_id: &neoengram_domain::protocol::PlaygroundId,
+    workspace_id: &neoengram_domain::protocol::WorkspaceId,
     _key: &PreCommitKey,
     job_id: JobId,
     expected_index_version: WireIndexVersion,
@@ -681,12 +681,13 @@ fn terminal_job(
             tenant_id: tenant_id.clone(),
             project_id: project_id.clone(),
             artifact_id: artifact_id.clone(),
-            playground_id: playground_id.clone(),
+            workspace_id: workspace_id.clone(),
             expected_index_version,
             request_digest: ContentDigest::from_bytes([3; 32]),
             deadline_unix_ms: UnixMillis::new(10_000),
             paths: Vec::new(),
             all: true,
+            operation_task_id: None,
             data_layout: CommitDataLayout::FastCdc,
             extensions: Extensions::new(),
         },
@@ -703,7 +704,14 @@ fn terminal_job(
         prepared: None,
         publication_candidate: None,
         decision: Some(JobDecision {
-            job_id,
+            job_id: job_id.clone(),
+            task_fence: TaskExecutionFence::new(
+                TaskId::new(format!("task-{job_id}")).unwrap(),
+                Generation::new(1),
+                "scan_changes",
+                Generation::new(1),
+                Generation::new(1),
+            ),
             assignment_id: AssignmentId::new("assignment-a").unwrap(),
             assignment_generation: AssignmentGeneration::new(1),
             decision_generation: DecisionGeneration::new(1),

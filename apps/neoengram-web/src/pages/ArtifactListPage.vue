@@ -231,7 +231,7 @@ async function submitCreate(): Promise<void> {
     });
     createOpen.value = false;
     await queryClient.invalidateQueries({ queryKey: ['artifacts', tenantId.value] });
-    ElMessage.success(result.data.replayed ? '已返回现有 Artifact' : 'Artifact 已创建');
+    ElMessage.success(result.data.request_replayed ? '已返回现有 Artifact' : 'Artifact 已创建');
     await openArtifact(result.data.artifact.project_id, result.data.artifact.artifact_id);
   } catch (error) {
     createError.value = error instanceof Error ? error.message : '创建 Artifact 失败';

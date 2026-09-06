@@ -50,8 +50,8 @@ tags:
     description: 租户内 Project 创建与查询方法
   - name: Artifact
     description: 租户内 Artifact 创建、查询，以及 Commit 图和文件 Diff 查询方法
-  - name: Playground
-    description: 租户内 Playground 创建、查询和 Commit 方法
+  - name: Workspace
+    description: 租户内 Workspace 创建、查询和 Commit 方法
   - name: Snapshot
     description: 绑定 Artifact Commit 的只读 Snapshot 创建与查询方法
   - name: Placement
@@ -282,8 +282,9 @@ paths:
                       updated_at_unix_ms: "1785168000000"
                       permissions:
                         [tenant.admin, tenant.read, artifact.read, task.read]
-                    replayed: false
-                replayed:
+                    request_replayed: false
+                    execution_reused: false
+                request_replayed:
                   value:
                     tenant:
                       tenant_id: tenant-lab
@@ -294,7 +295,8 @@ paths:
                       updated_at_unix_ms: "1785168000000"
                       permissions:
                         [tenant.admin, tenant.read, artifact.read, task.read]
-                    replayed: true
+                    request_replayed: true
+                    execution_reused: false
         "401":
           $ref: "#/components/responses/AuthenticationProblem"
         "403":
@@ -476,7 +478,8 @@ paths:
         token 材料。
 
         `token_request_id` 是稳定 mutation identity；相同 ID 和完全相同 payload 重放原响应并将
-        `replayed` 设为 true，不同 payload 返回 409。原始 `bootstrap_token` 只允许出现在本方法的
+        `request_replayed` 设为 true；如果不同请求复用了相同语义执行，则仅将 `execution_reused`
+        设为 true。不同 payload 返回 409。原始 `bootstrap_token` 只允许出现在本方法的
         成功响应中，不能进入 enrollment 列表、查询、审批、审计或日志。
       security:
         - BearerAuth: []
@@ -518,14 +521,16 @@ paths:
                     bootstrap_token: ngenr_v1_hQ7Bv2jL0pK9Xz4cN6mR8sT1wY3aD5fG
                     volume_descriptor_digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
                     expires_at_unix_ms: "1785168900000"
-                    replayed: false
-                replayed:
+                    request_replayed: false
+                    execution_reused: false
+                request_replayed:
                   value:
                     token_id: storage-enrollment-token-01
                     bootstrap_token: ngenr_v1_hQ7Bv2jL0pK9Xz4cN6mR8sT1wY3aD5fG
                     volume_descriptor_digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
                     expires_at_unix_ms: "1785168900000"
-                    replayed: true
+                    request_replayed: true
+                    execution_reused: false
         "401":
           $ref: "#/components/responses/AuthenticationProblem"
         "403":
@@ -776,7 +781,8 @@ paths:
                     generation: "1"
                   created_at_unix_ms: "1785168120000"
                   updated_at_unix_ms: "1785168120000"
-                replayed: false
+                request_replayed: false
+                execution_reused: false
         "401":
           $ref: "#/components/responses/AuthenticationProblem"
         "403":
@@ -925,7 +931,8 @@ paths:
                   expires_at_unix_ms: "1785254460000"
                   reviewed_at_unix_ms: "1785168120000"
                   updated_at_unix_ms: "1785168120000"
-                replayed: false
+                request_replayed: false
+                execution_reused: false
         "401":
           $ref: "#/components/responses/AuthenticationProblem"
         "403":
@@ -955,7 +962,8 @@ paths:
       summary: 创建 Project
       description: |
         要求 Tenant 内的 `project.create` 权限。相同 Tenant、Project ID 和 canonical 创建内容返回
-        既有 Project 并标记 `replayed=true`；相同 Project ID 对应不同内容时返回冲突。
+        既有 Project 并按请求身份返回 `request_replayed=true`；不同请求但相同语义执行返回
+        `execution_reused=true`。相同 Project ID 对应不同内容时返回冲突。
       security:
         - BearerAuth: []
       parameters:
@@ -1038,6 +1046,9 @@ paths:
                     project_id: project-vision
                     display_name: 视觉数据
                     resource_version: "2"
+                    lifecycle:
+                      state: active
+                      generation: "1"
                     created_at_unix_ms: "1785167000000"
                     updated_at_unix_ms: "1785167600000"
         "401":
@@ -1344,42 +1355,6 @@ paths:
         "422": { $ref: "#/components/responses/ValidationProblem" }
         "500": { $ref: "#/components/responses/InternalProblem" }
 
-  /api/workspace/create:
-    post:
-      tags: [Placement]
-      operationId: createWorkspace
-      summary: 在目标 Volume 创建 Workspace
-      description: Workspace 是唯一可写数据面；Central 自动从已发布 Placement 选择可用源。
-      security:
-        - BearerAuth: []
-      parameters:
-        - $ref: "#/components/parameters/ApiVersion"
-        - $ref: "#/components/parameters/RequestId"
-        - $ref: "#/components/parameters/Traceparent"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/CreateWorkspaceRequest"
-      responses:
-        "200":
-          description: Workspace 已创建或幂等重放
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestId"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/CreateWorkspaceResponse"
-        "401": { $ref: "#/components/responses/AuthenticationProblem" }
-        "403": { $ref: "#/components/responses/AuthorizationProblem" }
-        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
-        "409": { $ref: "#/components/responses/MutationConflictProblem" }
-        "422": { $ref: "#/components/responses/ValidationProblem" }
-        "500": { $ref: "#/components/responses/InternalProblem" }
-        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
-
   /api/artifact/commit/graph/query:
     post:
       tags: [Artifact]
@@ -1537,13 +1512,13 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
 
-  /api/playground/list/query:
+  /api/workspace/list/query:
     post:
-      tags: [Playground]
-      operationId: queryPlaygroundList
-      summary: 查询租户内 Playground
+      tags: [Workspace]
+      operationId: queryWorkspaceList
+      summary: 查询租户内 Workspace
       description: |
-        按 Project、Artifact、Region、主状态或关键字分页查询 Playground。Artifact 筛选必须同时
+        按 Project、Artifact、Region、主状态或关键字分页查询 Workspace。Artifact 筛选必须同时
         提供 Project scope；opaque cursor 与完整筛选条件绑定。
       security:
         - BearerAuth: []
@@ -1556,7 +1531,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/QueryPlaygroundListRequest"
+              $ref: "#/components/schemas/QueryWorkspaceListRequest"
             example:
               tenant_id: tenant-a
               project_id: project-vision
@@ -1565,20 +1540,20 @@ paths:
               page_size: 50
       responses:
         "200":
-          description: Playground 页
+          description: Workspace 页
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestId"
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/QueryPlaygroundListResponse"
+                $ref: "#/components/schemas/QueryWorkspaceListResponse"
               example:
                 items:
                   - tenant_id: tenant-a
                     project_id: project-vision
                     artifact_id: road-scenes
-                    playground_id: labeling
+                    workspace_id: labeling
                     storage_volume_id: volume-shanghai-vision
                     region: cn-shanghai
                     display_name: 标注工作区
@@ -1612,12 +1587,12 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
 
-  /api/playground/query:
+  /api/workspace/query:
     post:
-      tags: [Playground]
-      operationId: queryPlayground
-      summary: 查询 Playground 详情
-      description: 按完整资源 scope 返回 Playground 的只读权威元数据。
+      tags: [Workspace]
+      operationId: queryWorkspace
+      summary: 查询 Workspace 详情
+      description: 按完整资源 scope 返回 Workspace 的只读权威元数据。
       security:
         - BearerAuth: []
       parameters:
@@ -1629,28 +1604,28 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/QueryPlaygroundRequest"
+              $ref: "#/components/schemas/QueryWorkspaceRequest"
             example:
               tenant_id: tenant-a
               project_id: project-vision
               artifact_id: road-scenes
-              playground_id: labeling
+              workspace_id: labeling
       responses:
         "200":
-          description: Playground 当前视图
+          description: Workspace 当前视图
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestId"
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/QueryPlaygroundResponse"
+                $ref: "#/components/schemas/QueryWorkspaceResponse"
               example:
-                playground:
+                workspace:
                   tenant_id: tenant-a
                   project_id: project-vision
                   artifact_id: road-scenes
-                  playground_id: labeling
+                  workspace_id: labeling
                   storage_volume_id: volume-shanghai-vision
                   region: cn-shanghai
                   display_name: 标注工作区
@@ -1682,16 +1657,16 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
 
-  /api/playground/create:
+  /api/workspace/create:
     post:
-      tags: [Playground]
-      operationId: createPlayground
-      summary: 创建 Playground
+      tags: [Workspace]
+      operationId: createWorkspace
+      summary: 创建 Workspace
       description: |
-        在已存在的权威 Artifact 下创建受管可写 Playground。显式 `base_commit_id` 可以选择当前
+        在已存在的权威 Artifact 下创建受管可写 Workspace。显式 `base_commit_id` 可以选择当前
         Head 或该 Artifact 已发布历史中的任一 Commit；未被任何 Head 可达、也未确认的 Commit 返回
         404，省略时服务端冻结创建瞬间的当前 Head。所选 Commit 的权威 Index 会先初始化为
-        Playground Index，再由目标 StorageVolume 的 Agent 异步物化；完成前 Playground 保持
+        Workspace Index，再由目标 StorageVolume 的 Agent 异步物化；完成前 Workspace 保持
         `state=creating`。所选 StorageVolume 必须属于同一 Tenant 且 `state=ready`；`degraded` 或
         `unavailable` 均拒绝新放置并返回 409。
       security:
@@ -1705,25 +1680,25 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/CreatePlaygroundRequest"
+              $ref: "#/components/schemas/CreateWorkspaceRequest"
             example:
               tenant_id: tenant-a
               project_id: project-vision
               artifact_id: road-scenes
-              playground_id: review-july
+              workspace_id: review-july
               storage_volume_id: volume-shanghai-vision
               display_name: 七月复核
               base_commit_id: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
       responses:
         "200":
-          description: 已创建或幂等返回的 Playground
+          description: 已创建或幂等返回的 Workspace
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestId"
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/CreatePlaygroundResponse"
+                $ref: "#/components/schemas/CreateWorkspaceResponse"
         "401":
           $ref: "#/components/responses/AuthenticationProblem"
         "403":
@@ -1741,13 +1716,13 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
 
-  /api/playground/precommit/start:
+  /api/workspace/precommit/start:
     post:
-      tags: [Playground]
-      operationId: startPlaygroundPreCommit
-      summary: 发起 Playground Pre-commit
+      tags: [Workspace]
+      operationId: startWorkspacePreCommit
+      summary: 发起 Workspace Pre-commit
       description: |
-        为 Ready Playground 的当前 IndexVersion 创建新的冻结候选会话。服务端生成新的
+        为 Ready Workspace 的当前 IndexVersion 创建新的冻结候选会话。服务端生成新的
         `precommit_id`，并在会话内部冻结当前 Head 供 Commit CAS 使用；Head 不作为公开请求或响应
         字段。已有 running/ready active Pre-commit 时必须先 cancel，不得用 start 覆盖。相同
         `precommit_request_id` 和 payload 返回原结果，不同 payload 返回 409。200 返回时 Pre-commit
@@ -1769,7 +1744,7 @@ paths:
               tenant_id: tenant-a
               project_id: project-vision
               artifact_id: road-scenes
-              playground_id: labeling
+              workspace_id: labeling
               precommit_request_id: precommit-request-july-labels
               expected_index_version:
                 revision: "31"
@@ -1790,7 +1765,7 @@ paths:
                   tenant_id: tenant-a
                   project_id: project-vision
                   artifact_id: road-scenes
-                  playground_id: labeling
+                  workspace_id: labeling
                   precommit_id: precommit-july-labels-01
                   precommit_request_id: precommit-request-july-labels
                   data_layout: fast_cdc
@@ -1809,11 +1784,11 @@ paths:
                     digest: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
                   created_at_unix_ms: "1785167600000"
                   updated_at_unix_ms: "1785167600000"
-                playground:
+                workspace:
                   tenant_id: tenant-a
                   project_id: project-vision
                   artifact_id: road-scenes
-                  playground_id: labeling
+                  workspace_id: labeling
                   storage_volume_id: volume-shanghai-vision
                   region: cn-shanghai
                   display_name: 标注工作区
@@ -1831,7 +1806,8 @@ paths:
                     generation: "1"
                   created_at_unix_ms: "1785167000000"
                   updated_at_unix_ms: "1785167600000"
-                replayed: false
+                request_replayed: false
+                execution_reused: false
         "401":
           $ref: "#/components/responses/AuthenticationProblem"
         "403":
@@ -1849,11 +1825,11 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
 
-  /api/playground/precommit/query:
+  /api/workspace/precommit/query:
     post:
-      tags: [Playground]
-      operationId: queryPlaygroundPreCommit
-      summary: 查询 Playground Pre-commit
+      tags: [Workspace]
+      operationId: queryWorkspacePreCommit
+      summary: 查询 Workspace Pre-commit
       description: |
         使用 Tenant 和服务端生成的 Pre-commit ID 查询冻结候选、检查和 Diff 摘要。完成且可提交的
         结果是 `state=ready, phase=idle`；有阻断项的结果是 `state=abnormal, phase=idle` 且
@@ -1888,7 +1864,7 @@ paths:
                   tenant_id: tenant-a
                   project_id: project-vision
                   artifact_id: road-scenes
-                  playground_id: labeling
+                  workspace_id: labeling
                   precommit_id: precommit-july-labels-01
                   precommit_request_id: precommit-request-july-labels
                   data_layout: fast_cdc
@@ -1937,11 +1913,11 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
 
-  /api/playground/precommit/restart:
+  /api/workspace/precommit/restart:
     post:
-      tags: [Playground]
-      operationId: restartPlaygroundPreCommit
-      summary: 重试失败或已取消的 Playground Pre-commit
+      tags: [Workspace]
+      operationId: restartWorkspacePreCommit
+      summary: 重试失败或已取消的 Workspace Pre-commit
       description: |
         仅允许对 `abnormal` 或 `cancelled` Pre-commit 在同一 ID 上创建新 attempt，使 `attempt + 1`，
         并冻结请求给定的当前 IndexVersion 与服务端当前 Head。Head 仍仅保存在内部。running/ready
@@ -1993,13 +1969,13 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
 
-  /api/playground/precommit/cancel:
+  /api/workspace/precommit/cancel:
     post:
-      tags: [Playground]
-      operationId: cancelPlaygroundPreCommit
-      summary: 取消 Playground Pre-commit
+      tags: [Workspace]
+      operationId: cancelWorkspacePreCommit
+      summary: 取消 Workspace Pre-commit
       description: |
-        取消尚未提交的 Pre-commit 并清除 Playground 的 active Pre-commit。相同
+        取消尚未提交的 Pre-commit 并清除 Workspace 的 active Pre-commit。相同
         `cancel_request_id` 和 payload 幂等返回；已提交或状态不允许取消时返回 409。取消后的会话
         为 `state=cancelled, phase=idle`，旧候选不能被 Commit 消费。
       security:
@@ -2045,11 +2021,11 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
 
-  /api/playground/file/list/query:
+  /api/workspace/file/list/query:
     post:
-      tags: [Playground]
-      operationId: queryPlaygroundFileList
-      summary: 查询 Playground 文件列表
+      tags: [Workspace]
+      operationId: queryWorkspaceFileList
+      summary: 查询 Workspace 文件列表
       description: |
         分页返回当前工作区 IndexVersion 的逻辑文件和目录。响应不包含 Manifest ID、内容摘要、
         对象位置、凭据或物理路径；opaque cursor 与资源 scope、IndexVersion 和筛选条件绑定。
@@ -2064,25 +2040,25 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/QueryPlaygroundFileListRequest"
+              $ref: "#/components/schemas/QueryWorkspaceFileListRequest"
             example:
               tenant_id: tenant-a
               project_id: project-vision
               artifact_id: road-scenes
-              playground_id: labeling
+              workspace_id: labeling
               path_prefix: dataset/night-rain
               format: parquet
               page_size: 50
       responses:
         "200":
-          description: Playground 逻辑文件页
+          description: Workspace 逻辑文件页
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestId"
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/QueryPlaygroundFileListResponse"
+                $ref: "#/components/schemas/QueryWorkspaceFileListResponse"
               example:
                 index_version:
                   revision: "31"
@@ -2111,11 +2087,11 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
 
-  /api/playground/change/list/query:
+  /api/workspace/change/list/query:
     post:
-      tags: [Playground]
-      operationId: queryPlaygroundChangeList
-      summary: 查询 Playground 文件变更
+      tags: [Workspace]
+      operationId: queryWorkspaceChangeList
+      summary: 查询 Workspace 文件变更
       description: |
         未提供 `precommit_id` 时分页查询当前工作区相对父 Commit 的变更；提供时查询该
         Pre-commit 的冻结候选。响应只包含逻辑路径、变更类型、格式和大小统计。
@@ -2130,12 +2106,12 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/QueryPlaygroundChangeListRequest"
+              $ref: "#/components/schemas/QueryWorkspaceChangeListRequest"
             example:
               tenant_id: tenant-a
               project_id: project-vision
               artifact_id: road-scenes
-              playground_id: labeling
+              workspace_id: labeling
               precommit_id: precommit-july-labels-01
               page_size: 50
       responses:
@@ -2147,7 +2123,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/QueryPlaygroundChangeListResponse"
+                $ref: "#/components/schemas/QueryWorkspaceChangeListResponse"
               example:
                 source: precommit
                 precommit_id: precommit-july-labels-01
@@ -2188,11 +2164,11 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
 
-  /api/playground/file/metadata/query:
+  /api/workspace/file/metadata/query:
     post:
-      tags: [Playground]
-      operationId: queryPlaygroundFileMetadata
-      summary: 查询 Playground 文件元数据
+      tags: [Workspace]
+      operationId: queryWorkspaceFileMetadata
+      summary: 查询 Workspace 文件元数据
       description: |
         返回当前工作区中一个逻辑文件的大小、格式、Schema、统计、质量和 freshness；不返回
         Manifest、Chunk、对象分布、凭据或底层文件系统路径。
@@ -2207,12 +2183,12 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/QueryPlaygroundFileMetadataRequest"
+              $ref: "#/components/schemas/QueryWorkspaceFileMetadataRequest"
             example:
               tenant_id: tenant-a
               project_id: project-vision
               artifact_id: road-scenes
-              playground_id: labeling
+              workspace_id: labeling
               path: dataset/night-rain/part-0042.parquet
       responses:
         "200":
@@ -2223,7 +2199,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/QueryPlaygroundFileMetadataResponse"
+                $ref: "#/components/schemas/QueryWorkspaceFileMetadataResponse"
               example:
                 index_version:
                   revision: "31"
@@ -2270,11 +2246,11 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
 
-  /api/playground/dataset/profile/query:
+  /api/workspace/dataset/profile/query:
     post:
-      tags: [Playground]
-      operationId: queryPlaygroundDatasetProfile
-      summary: 查询 Playground Dataset Profile
+      tags: [Workspace]
+      operationId: queryWorkspaceDatasetProfile
+      summary: 查询 Workspace Dataset Profile
       description: 返回当前工作区 IndexVersion 的公开数据集画像、Schema、质量和 freshness 摘要。
       security:
         - BearerAuth: []
@@ -2287,22 +2263,22 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/QueryPlaygroundDatasetProfileRequest"
+              $ref: "#/components/schemas/QueryWorkspaceDatasetProfileRequest"
             example:
               tenant_id: tenant-a
               project_id: project-vision
               artifact_id: road-scenes
-              playground_id: labeling
+              workspace_id: labeling
       responses:
         "200":
-          description: Playground Dataset Profile
+          description: Workspace Dataset Profile
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestId"
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/QueryPlaygroundDatasetProfileResponse"
+                $ref: "#/components/schemas/QueryWorkspaceDatasetProfileResponse"
               example:
                 index_version:
                   revision: "31"
@@ -2338,17 +2314,17 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailableProblem"
 
-  /api/playground/commit/create:
+  /api/workspace/commit/create:
     post:
-      tags: [Playground]
-      operationId: commitPlayground
-      summary: 提交 Playground
+      tags: [Workspace]
+      operationId: commitWorkspace
+      summary: 提交 Workspace
       description: |
-        消费属于该 Playground、`state=ready, phase=idle`、无 blockers 且候选 IndexVersion 匹配的
+        消费属于该 Workspace、`state=ready, phase=idle`、无 blockers 且候选 IndexVersion 匹配的
         Pre-commit，创建不可变 Commit，并把 Pre-commit 标记为 Committed。服务端必须同时校验
-        Playground 当前 Head 与该 Pre-commit attempt 内部冻结的 Head，并对内部版本指针执行 CAS；
+        Workspace 当前 Head 与该 Pre-commit attempt 内部冻结的 Head，并对内部版本指针执行 CAS；
         Head 变化返回 409，公开请求不增加 `source_head_commit_id`。`commit_request_id` 是稳定
-        mutation identity；200 返回时 Commit、Playground 和已消费 Pre-commit 均已持久化且可查询。
+        mutation identity；200 返回时 Commit、Workspace 和已消费 Pre-commit 均已持久化且可查询。
       security:
         - BearerAuth: []
       parameters:
@@ -2360,12 +2336,12 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/CommitPlaygroundRequest"
+              $ref: "#/components/schemas/CommitWorkspaceRequest"
             example:
               tenant_id: tenant-a
               project_id: project-vision
               artifact_id: road-scenes
-              playground_id: labeling
+              workspace_id: labeling
               commit_request_id: commit-request-july-labels
               precommit_id: precommit-july-labels-01
               expected_candidate_index_version:
@@ -2384,7 +2360,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/CommitPlaygroundResponse"
+                $ref: "#/components/schemas/CommitWorkspaceResponse"
         "401":
           $ref: "#/components/responses/AuthenticationProblem"
         "403":
@@ -2570,7 +2546,7 @@ paths:
         为指定 Artifact 的固定 Commit 创建 Snapshot，并在同一原子请求中绑定一个目标 EdgeCluster、
         StorageVolume 和只读交付模式。Snapshot 与其唯一 SnapshotDelivery 初始分别为 `creating` 和
         `requested`；只有交付完成后 Snapshot 才会变为 `ready`。相同 `request_id` 和 payload 返回
-        `replayed: true`。
+        `request_replayed: true`；不同请求但相同语义的执行会返回 `execution_reused: true`。
       security:
         - BearerAuth: []
       parameters:
@@ -2630,7 +2606,8 @@ paths:
                   logical_size_bytes: "12884901888"
                   created_at_unix_ms: "1785167600000"
                   updated_at_unix_ms: "1785167600000"
-                replayed: false
+                request_replayed: false
+                execution_reused: false
         "401":
           $ref: "#/components/responses/AuthenticationProblem"
         "403":
@@ -2702,7 +2679,8 @@ paths:
                   resource_version: "2"
                   created_at_unix_ms: "1785067400000"
                   updated_at_unix_ms: "1785167800000"
-                replayed: false
+                request_replayed: false
+                execution_reused: false
         "401":
           $ref: "#/components/responses/AuthenticationProblem"
         "403":
@@ -3176,6 +3154,44 @@ paths:
       responses:
         "200":
           description: 已停用 Access Point
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpdateS3AccessPointResponse"
+        "401": { $ref: "#/components/responses/AuthenticationProblem" }
+        "403": { $ref: "#/components/responses/AuthorizationProblem" }
+        "404": { $ref: "#/components/responses/ResourceNotFoundProblem" }
+        "409": { $ref: "#/components/responses/MutationConflictProblem" }
+        "422": { $ref: "#/components/responses/ValidationProblem" }
+        "500": { $ref: "#/components/responses/InternalProblem" }
+        "503": { $ref: "#/components/responses/ServiceUnavailableProblem" }
+
+  /api/s3/access-point/delete:
+    post:
+      tags: [S3]
+      operationId: deleteS3AccessPoint
+      summary: 删除 S3 Access Point
+      description: |
+        要求 `s3.access.manage` 权限。删除会立即撤销所有凭证并保留 Access Point 的审计墓碑；
+        已删除 Access Point 不再提供对象访问，也不能重新启用。
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ApiVersion"
+        - $ref: "#/components/parameters/RequestId"
+        - $ref: "#/components/parameters/Traceparent"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateS3AccessPointRequest"
+      responses:
+        "200":
+          description: 已删除 Access Point
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestId"
@@ -4067,7 +4083,7 @@ paths:
       tags: [Task]
       operationId: queryTask
       summary: 查询操作任务详情
-      description: 返回任务当前状态、Attempt、子任务和追加式审计事件。
+      description: 返回任务当前状态、阶段、Attempt 和追加式审计事件。
       security: [{ BearerAuth: [] }]
       parameters:
         - $ref: "#/components/parameters/ApiVersion"
@@ -4425,7 +4441,7 @@ components:
                 title: Resource mutation conflict
                 status: 409
                 detail: The resource identity or expected version conflicts with current state
-                instance: /api/playground/commit/create
+                instance: /api/workspace/commit/create
                 code: RESOURCE_CONFLICT
                 request_id: req-20260727-001
                 retryable: false
@@ -4621,8 +4637,8 @@ components:
                 request_id: req-20260727-001
                 retryable: false
                 violations:
-                  - field: task_kind
-                    reason: contains an unsupported task kind
+                  - field: intent_kind
+                    reason: contains an unsupported task intent
     OverloadedProblem:
       description: 服务端并发请求配额已耗尽
       headers:
@@ -4816,11 +4832,13 @@ components:
     GatewayPoolResponse:
       type: object
       additionalProperties: false
-      required: [gateway_pool, replayed]
+      required: [gateway_pool, request_replayed, execution_reused]
       properties:
         gateway_pool:
           $ref: "#/components/schemas/GatewayPoolView"
-        replayed:
+        request_replayed:
+          type: boolean
+        execution_reused:
           type: boolean
         task:
           $ref: "#/components/schemas/TaskView"
@@ -4965,7 +4983,7 @@ components:
     CreateGatewayReplicaResponse:
       type: object
       additionalProperties: false
-      required: [gateway_replica, replayed]
+      required: [gateway_replica, request_replayed, execution_reused]
       properties:
         gateway_replica:
           $ref: "#/components/schemas/GatewayReplicaView"
@@ -4975,7 +4993,9 @@ components:
           minLength: 51
           maxLength: 51
           pattern: "^nggw_v1_[A-Za-z0-9_-]{43}$"
-        replayed:
+        request_replayed:
+          type: boolean
+        execution_reused:
           type: boolean
         task:
           $ref: "#/components/schemas/TaskView"
@@ -4983,11 +5003,13 @@ components:
     GatewayReplicaResponse:
       type: object
       additionalProperties: false
-      required: [gateway_replica, replayed]
+      required: [gateway_replica, request_replayed, execution_reused]
       properties:
         gateway_replica:
           $ref: "#/components/schemas/GatewayReplicaView"
-        replayed:
+        request_replayed:
+          type: boolean
+        execution_reused:
           type: boolean
         task:
           $ref: "#/components/schemas/TaskView"
@@ -5157,11 +5179,13 @@ components:
     CreateTenantResponse:
       type: object
       additionalProperties: false
-      required: [tenant, replayed]
+      required: [tenant, request_replayed, execution_reused]
       properties:
         tenant:
           $ref: "#/components/schemas/TenantView"
-        replayed:
+        request_replayed:
+          type: boolean
+        execution_reused:
           type: boolean
         task:
           $ref: "#/components/schemas/TaskView"
@@ -5309,11 +5333,13 @@ components:
     CreateStorageVolumeResponse:
       type: object
       additionalProperties: false
-      required: [storage_volume, replayed]
+      required: [storage_volume, request_replayed, execution_reused]
       properties:
         storage_volume:
           $ref: "#/components/schemas/StorageVolumeView"
-        replayed:
+        request_replayed:
+          type: boolean
+        execution_reused:
           type: boolean
         task:
           $ref: "#/components/schemas/TaskView"
@@ -5323,7 +5349,7 @@ components:
       description: |
         租户登记的稳定逻辑存储身份。PVC namespace/claim 可以公开用于运维识别；NFS
         server、export path、凭据、中心挂载路径和 Agent ownership 不属于公开视图。只有 `state=ready`
-        可用于创建新的 Playground 或 Snapshot；`degraded` 与 `unavailable` 仍可查询，但禁止新放置。
+        可用于创建新的 Workspace 或 Snapshot；`degraded` 与 `unavailable` 仍可查询，但禁止新放置。
       additionalProperties: false
       required:
         - tenant_id
@@ -5418,7 +5444,8 @@ components:
       description: |
         原始 bootstrap token 只在本响应中返回。相同 token_request_id 和完全相同 payload 重放时返回
         同一 token_id、bootstrap_token、volume_descriptor_digest 和 expires_at_unix_ms，并将
-        replayed 设为 true。Agent 配置必须使用该服务端冻结的 descriptor digest。
+        request_replayed 设为 true；不同请求但相同语义执行则将 execution_reused 设为 true。
+        Agent 配置必须使用该服务端冻结的 descriptor digest。
       additionalProperties: false
       required:
         [
@@ -5426,7 +5453,8 @@ components:
           bootstrap_token,
           volume_descriptor_digest,
           expires_at_unix_ms,
-          replayed,
+          request_replayed,
+          execution_reused,
         ]
       properties:
         token_id:
@@ -5437,7 +5465,9 @@ components:
           $ref: "#/components/schemas/ContentDigest"
         expires_at_unix_ms:
           $ref: "#/components/schemas/UnixMillis"
-        replayed:
+        request_replayed:
+          type: boolean
+        execution_reused:
           type: boolean
         task:
           $ref: "#/components/schemas/TaskView"
@@ -5523,13 +5553,15 @@ components:
         approved，StorageVolume 固定为 unavailable；后续认证 Agent session 和健康 probe 才能分别
         推进到 enrolled 与 ready。
       additionalProperties: false
-      required: [enrollment, storage_volume, replayed]
+      required: [enrollment, storage_volume, request_replayed, execution_reused]
       properties:
         enrollment:
           $ref: "#/components/schemas/StorageEnrollmentView"
         storage_volume:
           $ref: "#/components/schemas/StorageVolumeView"
-        replayed:
+        request_replayed:
+          type: boolean
+        execution_reused:
           type: boolean
         task:
           $ref: "#/components/schemas/TaskView"
@@ -5596,11 +5628,13 @@ components:
     RejectStorageEnrollmentResponse:
       type: object
       additionalProperties: false
-      required: [enrollment, replayed]
+      required: [enrollment, request_replayed, execution_reused]
       properties:
         enrollment:
           $ref: "#/components/schemas/StorageEnrollmentView"
-        replayed:
+        request_replayed:
+          type: boolean
+        execution_reused:
           type: boolean
         task:
           $ref: "#/components/schemas/TaskView"
@@ -5789,11 +5823,13 @@ components:
     CreateProjectResponse:
       type: object
       additionalProperties: false
-      required: [project, replayed]
+      required: [project, request_replayed, execution_reused]
       properties:
         project:
           $ref: "#/components/schemas/ProjectView"
-        replayed:
+        request_replayed:
+          type: boolean
+        execution_reused:
           type: boolean
         task:
           $ref: "#/components/schemas/TaskView"
@@ -5806,6 +5842,7 @@ components:
         - project_id
         - display_name
         - resource_version
+        - lifecycle
         - created_at_unix_ms
         - updated_at_unix_ms
       properties:
@@ -5819,6 +5856,8 @@ components:
           $ref: "#/components/schemas/Description"
         resource_version:
           $ref: "#/components/schemas/CanonicalU64"
+        lifecycle:
+          $ref: "#/components/schemas/ResourceLifecycleView"
         created_at_unix_ms:
           $ref: "#/components/schemas/UnixMillis"
         updated_at_unix_ms:
@@ -5932,11 +5971,13 @@ components:
     CreateArtifactResponse:
       type: object
       additionalProperties: false
-      required: [artifact, replayed]
+      required: [artifact, request_replayed, execution_reused]
       properties:
         artifact:
           $ref: "#/components/schemas/ArtifactView"
-        replayed:
+        request_replayed:
+          type: boolean
+        execution_reused:
           type: boolean
         task:
           $ref: "#/components/schemas/TaskView"
@@ -6142,7 +6183,7 @@ components:
         new_size_bytes:
           $ref: "#/components/schemas/CanonicalU64"
 
-    QueryPlaygroundListRequest:
+    QueryWorkspaceListRequest:
       type: object
       additionalProperties: false
       dependentRequired:
@@ -6158,7 +6199,7 @@ components:
         region:
           $ref: "#/components/schemas/RegionName"
         state:
-          $ref: "#/components/schemas/PlaygroundState"
+          $ref: "#/components/schemas/WorkspaceState"
         cursor:
           $ref: "#/components/schemas/PageCursor"
         page_size:
@@ -6166,7 +6207,7 @@ components:
         query:
           $ref: "#/components/schemas/SearchQuery"
 
-    QueryPlaygroundListResponse:
+    QueryWorkspaceListResponse:
       type: object
       additionalProperties: false
       required: [items]
@@ -6175,14 +6216,14 @@ components:
           type: array
           maxItems: 100
           items:
-            $ref: "#/components/schemas/PlaygroundView"
+            $ref: "#/components/schemas/WorkspaceView"
         next_cursor:
           $ref: "#/components/schemas/PageCursor"
 
-    QueryPlaygroundRequest:
+    QueryWorkspaceRequest:
       type: object
       additionalProperties: false
-      required: [tenant_id, project_id, artifact_id, playground_id]
+      required: [tenant_id, project_id, artifact_id, workspace_id]
       properties:
         tenant_id:
           $ref: "#/components/schemas/TenantId"
@@ -6190,29 +6231,29 @@ components:
           $ref: "#/components/schemas/ProjectId"
         artifact_id:
           $ref: "#/components/schemas/ArtifactId"
-        playground_id:
-          $ref: "#/components/schemas/PlaygroundId"
+        workspace_id:
+          $ref: "#/components/schemas/WorkspaceId"
 
-    QueryPlaygroundResponse:
+    QueryWorkspaceResponse:
       type: object
       additionalProperties: false
-      required: [playground]
+      required: [workspace]
       properties:
-        playground:
-          $ref: "#/components/schemas/PlaygroundView"
+        workspace:
+          $ref: "#/components/schemas/WorkspaceView"
 
-    CreatePlaygroundRequest:
+    CreateWorkspaceRequest:
       type: object
       description: |
         创建请求必须引用同 Tenant/Project 下已存在的 Artifact，并明确选择同 Tenant、`state=ready`
-        的 StorageVolume。Playground 是该 Artifact 某个固定 Commit 的可写派生视图，不能创建或
+        的 StorageVolume。Workspace 是该 Artifact 某个固定 Commit 的可写派生视图，不能创建或
         重定义 Artifact；Region 由 Volume 派生，不能由调用方另行指定。
       additionalProperties: false
       required:
         - tenant_id
         - project_id
         - artifact_id
-        - playground_id
+        - workspace_id
         - storage_volume_id
         - display_name
       properties:
@@ -6222,8 +6263,8 @@ components:
           $ref: "#/components/schemas/ProjectId"
         artifact_id:
           $ref: "#/components/schemas/ArtifactId"
-        playground_id:
-          $ref: "#/components/schemas/PlaygroundId"
+        workspace_id:
+          $ref: "#/components/schemas/WorkspaceId"
         storage_volume_id:
           $ref: "#/components/schemas/StorageVolumeId"
         display_name:
@@ -6235,32 +6276,36 @@ components:
             当前 Head 或历史 Commit；省略时服务端冻结创建瞬间的当前 Head。空 Artifact 必须省略，
             且服务端不会为其伪造 base Commit。
 
-    CreatePlaygroundResponse:
+    CreateWorkspaceResponse:
       type: object
       additionalProperties: false
-      required: [playground, replayed]
+      required: [workspace, request_replayed, execution_reused]
       properties:
-        playground:
-          $ref: "#/components/schemas/PlaygroundView"
-        replayed:
+        workspace:
+          $ref: "#/components/schemas/WorkspaceView"
+        request_replayed:
           type: boolean
+        execution_reused:
+          type: boolean
+        task:
+          $ref: "#/components/schemas/TaskView"
 
-    PlaygroundState:
+    WorkspaceState:
       type: string
       enum: [creating, ready, abnormal]
 
-    PlaygroundStorageAvailability:
+    WorkspaceStorageAvailability:
       type: string
       description: |
-        Playground 所在 StorageVolume 的实时可达性。`unknown` 表示服务端当前无法确认存储状态；
+        Workspace 所在 StorageVolume 的实时可达性。`unknown` 表示服务端当前无法确认存储状态；
         只有 `ready` 可以执行扫描、Pre-commit 检测等依赖 Agent 的实时操作。中心已持久化的
         Index、文件清单、变化和 Profile 不受该字段限制。
       enum: [ready, degraded, unavailable, unknown]
 
-    PlaygroundView:
+    WorkspaceView:
       type: object
       description: |
-        Playground 的 `tenant_id + project_id + artifact_id` 是不可变来源 scope，Region 始终由所选
+        Workspace 的 `tenant_id + project_id + artifact_id` 是不可变来源 scope，Region 始终由所选
         StorageVolume 派生。`state` 只表达持久生命周期，`storage_availability` 表达所在存储的
         实时可达性；scanning、hashing、uploading 和 validating 仅属于独立 Pre-commit 流程。
       additionalProperties: false
@@ -6268,7 +6313,7 @@ components:
         - tenant_id
         - project_id
         - artifact_id
-        - playground_id
+        - workspace_id
         - storage_volume_id
         - region
         - display_name
@@ -6286,8 +6331,8 @@ components:
           $ref: "#/components/schemas/ProjectId"
         artifact_id:
           $ref: "#/components/schemas/ArtifactId"
-        playground_id:
-          $ref: "#/components/schemas/PlaygroundId"
+        workspace_id:
+          $ref: "#/components/schemas/WorkspaceId"
         storage_volume_id:
           $ref: "#/components/schemas/StorageVolumeId"
         region:
@@ -6301,9 +6346,9 @@ components:
         index_version:
           $ref: "#/components/schemas/IndexVersion"
         state:
-          $ref: "#/components/schemas/PlaygroundState"
+          $ref: "#/components/schemas/WorkspaceState"
         storage_availability:
-          $ref: "#/components/schemas/PlaygroundStorageAvailability"
+          $ref: "#/components/schemas/WorkspaceStorageAvailability"
         active_precommit_id:
           $ref: "#/components/schemas/PreCommitId"
         issue:
@@ -6327,7 +6372,7 @@ components:
         - tenant_id
         - project_id
         - artifact_id
-        - playground_id
+        - workspace_id
         - precommit_request_id
         - expected_index_version
         - data_layout
@@ -6338,8 +6383,8 @@ components:
           $ref: "#/components/schemas/ProjectId"
         artifact_id:
           $ref: "#/components/schemas/ArtifactId"
-        playground_id:
-          $ref: "#/components/schemas/PlaygroundId"
+        workspace_id:
+          $ref: "#/components/schemas/WorkspaceId"
         precommit_request_id:
           $ref: "#/components/schemas/ResourceId"
         expected_index_version:
@@ -6350,14 +6395,18 @@ components:
     StartPreCommitResponse:
       type: object
       additionalProperties: false
-      required: [precommit, playground, replayed]
+      required: [precommit, workspace, request_replayed, execution_reused]
       properties:
         precommit:
           $ref: "#/components/schemas/PreCommitView"
-        playground:
-          $ref: "#/components/schemas/PlaygroundView"
-        replayed:
+        workspace:
+          $ref: "#/components/schemas/WorkspaceView"
+        request_replayed:
           type: boolean
+        execution_reused:
+          type: boolean
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     QueryPreCommitRequest:
       type: object
@@ -6398,13 +6447,15 @@ components:
     RestartPreCommitResponse:
       type: object
       additionalProperties: false
-      required: [precommit, playground, replayed]
+      required: [precommit, workspace, request_replayed, execution_reused]
       properties:
         precommit:
           $ref: "#/components/schemas/PreCommitView"
-        playground:
-          $ref: "#/components/schemas/PlaygroundView"
-        replayed:
+        workspace:
+          $ref: "#/components/schemas/WorkspaceView"
+        request_replayed:
+          type: boolean
+        execution_reused:
           type: boolean
         task:
           $ref: "#/components/schemas/TaskView"
@@ -6424,13 +6475,15 @@ components:
     CancelPreCommitResponse:
       type: object
       additionalProperties: false
-      required: [precommit, playground, replayed]
+      required: [precommit, workspace, request_replayed, execution_reused]
       properties:
         precommit:
           $ref: "#/components/schemas/PreCommitView"
-        playground:
-          $ref: "#/components/schemas/PlaygroundView"
-        replayed:
+        workspace:
+          $ref: "#/components/schemas/WorkspaceView"
+        request_replayed:
+          type: boolean
+        execution_reused:
           type: boolean
         task:
           $ref: "#/components/schemas/TaskView"
@@ -6452,14 +6505,14 @@ components:
     PreCommitView:
       type: object
       description: |
-        Playground 某一 IndexVersion 的冻结候选及其脱敏检查结果。`ready/idle` 必须有候选且 blockers
+        Workspace 某一 IndexVersion 的冻结候选及其脱敏检查结果。`ready/idle` 必须有候选且 blockers
         为空；`abnormal/idle` 且 blockers 非空在产品中显示为 Blocked。服务端冻结的 Head 不公开。
       additionalProperties: false
       required:
         - tenant_id
         - project_id
         - artifact_id
-        - playground_id
+        - workspace_id
         - precommit_id
         - precommit_request_id
         - attempt
@@ -6480,8 +6533,8 @@ components:
           $ref: "#/components/schemas/ProjectId"
         artifact_id:
           $ref: "#/components/schemas/ArtifactId"
-        playground_id:
-          $ref: "#/components/schemas/PlaygroundId"
+        workspace_id:
+          $ref: "#/components/schemas/WorkspaceId"
         precommit_id:
           $ref: "#/components/schemas/PreCommitId"
         precommit_request_id:
@@ -6575,7 +6628,7 @@ components:
         path:
           $ref: "#/components/schemas/LogicalPath"
 
-    CommitPlaygroundRequest:
+    CommitWorkspaceRequest:
       type: object
       description: |
         消费 ready/idle Pre-commit 候选。服务端用该 attempt 内部冻结的 Head 执行 CAS；客户端只提交
@@ -6585,7 +6638,7 @@ components:
         - tenant_id
         - project_id
         - artifact_id
-        - playground_id
+        - workspace_id
         - commit_request_id
         - precommit_id
         - expected_candidate_index_version
@@ -6598,8 +6651,8 @@ components:
           $ref: "#/components/schemas/ProjectId"
         artifact_id:
           $ref: "#/components/schemas/ArtifactId"
-        playground_id:
-          $ref: "#/components/schemas/PlaygroundId"
+        workspace_id:
+          $ref: "#/components/schemas/WorkspaceId"
         commit_request_id:
           $ref: "#/components/schemas/ResourceId"
         precommit_id:
@@ -6621,24 +6674,28 @@ components:
           items:
             $ref: "#/components/schemas/TagName"
 
-    CommitPlaygroundResponse:
+    CommitWorkspaceResponse:
       type: object
       additionalProperties: false
-      required: [commit, playground, consumed_precommit, replayed]
+      required: [commit, workspace, consumed_precommit, request_replayed, execution_reused]
       properties:
         commit:
           $ref: "#/components/schemas/CommitNode"
-        playground:
-          $ref: "#/components/schemas/PlaygroundView"
+        workspace:
+          $ref: "#/components/schemas/WorkspaceView"
         consumed_precommit:
           $ref: "#/components/schemas/PreCommitView"
-        replayed:
+        request_replayed:
           type: boolean
+        execution_reused:
+          type: boolean
+        task:
+          $ref: "#/components/schemas/TaskView"
 
-    QueryPlaygroundFileListRequest:
+    QueryWorkspaceFileListRequest:
       type: object
       additionalProperties: false
-      required: [tenant_id, project_id, artifact_id, playground_id]
+      required: [tenant_id, project_id, artifact_id, workspace_id]
       properties:
         tenant_id:
           $ref: "#/components/schemas/TenantId"
@@ -6646,8 +6703,8 @@ components:
           $ref: "#/components/schemas/ProjectId"
         artifact_id:
           $ref: "#/components/schemas/ArtifactId"
-        playground_id:
-          $ref: "#/components/schemas/PlaygroundId"
+        workspace_id:
+          $ref: "#/components/schemas/WorkspaceId"
         path_prefix:
           $ref: "#/components/schemas/LogicalPath"
         format:
@@ -6657,7 +6714,7 @@ components:
         page_size:
           $ref: "#/components/schemas/PageSize"
 
-    QueryPlaygroundFileListResponse:
+    QueryWorkspaceFileListResponse:
       type: object
       additionalProperties: false
       required: [index_version, items]
@@ -6672,10 +6729,10 @@ components:
         next_cursor:
           $ref: "#/components/schemas/PageCursor"
 
-    QueryPlaygroundChangeListRequest:
+    QueryWorkspaceChangeListRequest:
       type: object
       additionalProperties: false
-      required: [tenant_id, project_id, artifact_id, playground_id]
+      required: [tenant_id, project_id, artifact_id, workspace_id]
       properties:
         tenant_id:
           $ref: "#/components/schemas/TenantId"
@@ -6683,8 +6740,8 @@ components:
           $ref: "#/components/schemas/ProjectId"
         artifact_id:
           $ref: "#/components/schemas/ArtifactId"
-        playground_id:
-          $ref: "#/components/schemas/PlaygroundId"
+        workspace_id:
+          $ref: "#/components/schemas/WorkspaceId"
         precommit_id:
           $ref: "#/components/schemas/PreCommitId"
         change_type:
@@ -6696,7 +6753,7 @@ components:
         page_size:
           $ref: "#/components/schemas/PageSize"
 
-    QueryPlaygroundChangeListResponse:
+    QueryWorkspaceChangeListResponse:
       type: object
       additionalProperties: false
       required: [source, index_version, summary, items]
@@ -6714,11 +6771,11 @@ components:
           type: array
           maxItems: 100
           items:
-            $ref: "#/components/schemas/PlaygroundChangeEntry"
+            $ref: "#/components/schemas/WorkspaceChangeEntry"
         next_cursor:
           $ref: "#/components/schemas/PageCursor"
 
-    PlaygroundChangeEntry:
+    WorkspaceChangeEntry:
       type: object
       additionalProperties: false
       required: [change_type, path]
@@ -6736,10 +6793,10 @@ components:
         format:
           $ref: "#/components/schemas/FileFormat"
 
-    QueryPlaygroundFileMetadataRequest:
+    QueryWorkspaceFileMetadataRequest:
       type: object
       additionalProperties: false
-      required: [tenant_id, project_id, artifact_id, playground_id, path]
+      required: [tenant_id, project_id, artifact_id, workspace_id, path]
       properties:
         tenant_id:
           $ref: "#/components/schemas/TenantId"
@@ -6747,12 +6804,12 @@ components:
           $ref: "#/components/schemas/ProjectId"
         artifact_id:
           $ref: "#/components/schemas/ArtifactId"
-        playground_id:
-          $ref: "#/components/schemas/PlaygroundId"
+        workspace_id:
+          $ref: "#/components/schemas/WorkspaceId"
         path:
           $ref: "#/components/schemas/LogicalPath"
 
-    QueryPlaygroundFileMetadataResponse:
+    QueryWorkspaceFileMetadataResponse:
       type: object
       additionalProperties: false
       required: [index_version, metadata]
@@ -6762,10 +6819,10 @@ components:
         metadata:
           $ref: "#/components/schemas/FileMetadataView"
 
-    QueryPlaygroundDatasetProfileRequest:
+    QueryWorkspaceDatasetProfileRequest:
       type: object
       additionalProperties: false
-      required: [tenant_id, project_id, artifact_id, playground_id]
+      required: [tenant_id, project_id, artifact_id, workspace_id]
       properties:
         tenant_id:
           $ref: "#/components/schemas/TenantId"
@@ -6773,10 +6830,10 @@ components:
           $ref: "#/components/schemas/ProjectId"
         artifact_id:
           $ref: "#/components/schemas/ArtifactId"
-        playground_id:
-          $ref: "#/components/schemas/PlaygroundId"
+        workspace_id:
+          $ref: "#/components/schemas/WorkspaceId"
 
-    QueryPlaygroundDatasetProfileResponse:
+    QueryWorkspaceDatasetProfileResponse:
       type: object
       additionalProperties: false
       required: [index_version, profile]
@@ -6838,7 +6895,7 @@ components:
 
     DatasetProfileView:
       type: object
-      description: Playground 或 Snapshot 派生的只读逻辑画像，不是 Snapshot 创建输入。
+      description: Workspace 或 Snapshot 派生的只读逻辑画像，不是 Snapshot 创建输入。
       additionalProperties: false
       required: [state]
       properties:
@@ -7059,7 +7116,7 @@ components:
     CreateCommitMaterializationRequest:
       type: object
       additionalProperties: false
-      required: [tenant_id, project_id, artifact_id, object_namespace_id, commit_id, target_storage_volume_id, request_id]
+      required: [tenant_id, project_id, artifact_id, object_namespace_id, commit_id, target_storage_volume_id, purpose, request_id]
       properties:
         tenant_id:
           $ref: "#/components/schemas/TenantId"
@@ -7073,6 +7130,12 @@ components:
           $ref: "#/components/schemas/CommitId"
         target_storage_volume_id:
           $ref: "#/components/schemas/StorageVolumeId"
+        purpose:
+          $ref: "#/components/schemas/TaskPurpose"
+        repair_observation_digest:
+          $ref: "#/components/schemas/ContentDigest"
+        target_placement_generation:
+          $ref: "#/components/schemas/CanonicalU64"
         coverage_goal:
           $ref: "#/components/schemas/MaterializationCoverageGoal"
         request_id:
@@ -7114,28 +7177,10 @@ components:
         page_size:
           $ref: "#/components/schemas/PageSize"
 
-    CreateWorkspaceRequest:
-      type: object
-      additionalProperties: false
-      required: [tenant_id, project_id, artifact_id, target_storage_volume_id, request_id]
-      properties:
-        tenant_id:
-          $ref: "#/components/schemas/TenantId"
-        project_id:
-          $ref: "#/components/schemas/ProjectId"
-        artifact_id:
-          $ref: "#/components/schemas/ArtifactId"
-        base_commit_id:
-          $ref: "#/components/schemas/CommitId"
-        target_storage_volume_id:
-          $ref: "#/components/schemas/StorageVolumeId"
-        request_id:
-          $ref: "#/components/schemas/RequestId"
-
     MaterializationView:
       type: object
       additionalProperties: false
-      required: [materialization_id, tenant_id, object_namespace_id, commit_id, target_storage_volume_id, plan_revision, coverage_goal, state, object_set_digest, verified_objects, total_objects, verified_bytes, total_bytes, missing_objects, missing_bytes, source_count]
+      required: [materialization_id, tenant_id, object_namespace_id, commit_id, target_storage_volume_id, purpose, plan_revision, coverage_goal, state, object_set_digest, verified_objects, total_objects, verified_bytes, total_bytes, missing_objects, missing_bytes, source_count]
       properties:
         materialization_id:
           $ref: "#/components/schemas/ResourceId"
@@ -7149,6 +7194,8 @@ components:
           $ref: "#/components/schemas/CommitId"
         target_storage_volume_id:
           $ref: "#/components/schemas/StorageVolumeId"
+        purpose:
+          $ref: "#/components/schemas/TaskPurpose"
         plan_revision:
           $ref: "#/components/schemas/CanonicalU64"
         coverage_goal:
@@ -7178,11 +7225,13 @@ components:
     CreateCommitMaterializationResponse:
       type: object
       additionalProperties: false
-      required: [materialization, replayed]
+      required: [materialization, request_replayed, execution_reused]
       properties:
         materialization:
           $ref: "#/components/schemas/MaterializationView"
-        replayed:
+        request_replayed:
+          type: boolean
+        execution_reused:
           type: boolean
         task:
           $ref: "#/components/schemas/TaskView"
@@ -7291,37 +7340,6 @@ components:
         availability:
           $ref: "#/components/schemas/CommitAvailabilityView"
 
-    WorkspaceView:
-      type: object
-      additionalProperties: false
-      required: [workspace_id, tenant_id, project_id, artifact_id, target_storage_volume_id, lifecycle]
-      properties:
-        workspace_id:
-          $ref: "#/components/schemas/ResourceId"
-        tenant_id:
-          $ref: "#/components/schemas/TenantId"
-        project_id:
-          $ref: "#/components/schemas/ProjectId"
-        artifact_id:
-          $ref: "#/components/schemas/ArtifactId"
-        base_commit_id:
-          $ref: "#/components/schemas/CommitId"
-        target_storage_volume_id:
-          $ref: "#/components/schemas/StorageVolumeId"
-        lifecycle:
-          type: string
-          enum: [provisioning, active, unavailable, deleting, deleted]
-
-    CreateWorkspaceResponse:
-      type: object
-      additionalProperties: false
-      required: [workspace, replayed]
-      properties:
-        workspace:
-          $ref: "#/components/schemas/WorkspaceView"
-        replayed:
-          type: boolean
-
     CreateSnapshotRequest:
       type: object
       description: |
@@ -7360,12 +7378,16 @@ components:
     CreateSnapshotResponse:
       type: object
       additionalProperties: false
-      required: [snapshot, replayed]
+      required: [snapshot, request_replayed, execution_reused]
       properties:
         snapshot:
           $ref: "#/components/schemas/SnapshotView"
-        replayed:
+        request_replayed:
           type: boolean
+        execution_reused:
+          type: boolean
+        task:
+          $ref: "#/components/schemas/TaskView"
 
     SnapshotDeliveryMode:
       type: string
@@ -7494,11 +7516,13 @@ components:
     RetrySnapshotDeliveryResponse:
       type: object
       additionalProperties: false
-      required: [delivery, replayed]
+      required: [delivery, request_replayed, execution_reused]
       properties:
         delivery:
           $ref: "#/components/schemas/SnapshotDeliveryView"
-        replayed:
+        request_replayed:
+          type: boolean
+        execution_reused:
           type: boolean
         task:
           $ref: "#/components/schemas/TaskView"
@@ -7518,11 +7542,13 @@ components:
     DeleteSnapshotDeliveryResponse:
       type: object
       additionalProperties: false
-      required: [delivery, replayed]
+      required: [delivery, request_replayed, execution_reused]
       properties:
         delivery:
           $ref: "#/components/schemas/SnapshotDeliveryView"
-        replayed:
+        request_replayed:
+          type: boolean
+        execution_reused:
           type: boolean
         task:
           $ref: "#/components/schemas/TaskView"
@@ -7757,17 +7783,30 @@ components:
     ResourceRef:
       description: Tenant scope 由包含该引用的请求携带，不允许从资源 ID 推断或覆盖。
       oneOf:
+        - $ref: "#/components/schemas/ProjectResourceRef"
         - $ref: "#/components/schemas/StorageVolumeResourceRef"
         - $ref: "#/components/schemas/ArtifactResourceRef"
-        - $ref: "#/components/schemas/PlaygroundResourceRef"
+        - $ref: "#/components/schemas/WorkspaceResourceRef"
         - $ref: "#/components/schemas/SnapshotResourceRef"
       discriminator:
         propertyName: type
         mapping:
+          project: "#/components/schemas/ProjectResourceRef"
           storage_volume: "#/components/schemas/StorageVolumeResourceRef"
           artifact: "#/components/schemas/ArtifactResourceRef"
-          playground: "#/components/schemas/PlaygroundResourceRef"
+          workspace: "#/components/schemas/WorkspaceResourceRef"
           snapshot: "#/components/schemas/SnapshotResourceRef"
+
+    ProjectResourceRef:
+      type: object
+      additionalProperties: false
+      required: [type, project_id]
+      properties:
+        type:
+          type: string
+          const: project
+        project_id:
+          $ref: "#/components/schemas/ProjectId"
 
     StorageVolumeResourceRef:
       type: object
@@ -7793,20 +7832,20 @@ components:
         artifact_id:
           $ref: "#/components/schemas/ArtifactId"
 
-    PlaygroundResourceRef:
+    WorkspaceResourceRef:
       type: object
       additionalProperties: false
-      required: [type, project_id, artifact_id, playground_id]
+      required: [type, project_id, artifact_id, workspace_id]
       properties:
         type:
           type: string
-          const: playground
+          const: workspace
         project_id:
           $ref: "#/components/schemas/ProjectId"
         artifact_id:
           $ref: "#/components/schemas/ArtifactId"
-        playground_id:
-          $ref: "#/components/schemas/PlaygroundId"
+        workspace_id:
+          $ref: "#/components/schemas/WorkspaceId"
 
     SnapshotResourceRef:
       type: object
@@ -8195,11 +8234,13 @@ components:
     DeletionMutationResponse:
       type: object
       additionalProperties: false
-      required: [deletion, replayed]
+      required: [deletion, request_replayed, execution_reused]
       properties:
         deletion:
           $ref: "#/components/schemas/DeletionOperationView"
-        replayed:
+        request_replayed:
+          type: boolean
+        execution_reused:
           type: boolean
         task:
           $ref: "#/components/schemas/TaskView"
@@ -8207,13 +8248,15 @@ components:
     CreateRetentionHoldResponse:
       type: object
       additionalProperties: false
-      required: [deletion, retention_hold, replayed]
+      required: [deletion, retention_hold, request_replayed, execution_reused]
       properties:
         deletion:
           $ref: "#/components/schemas/DeletionOperationView"
         retention_hold:
           $ref: "#/components/schemas/RetentionHoldView"
-        replayed:
+        request_replayed:
+          type: boolean
+        execution_reused:
           type: boolean
         task:
           $ref: "#/components/schemas/TaskView"
@@ -8221,13 +8264,15 @@ components:
     ReleaseRetentionHoldResponse:
       type: object
       additionalProperties: false
-      required: [deletion, retention_hold, replayed]
+      required: [deletion, retention_hold, request_replayed, execution_reused]
       properties:
         deletion:
           $ref: "#/components/schemas/DeletionOperationView"
         retention_hold:
           $ref: "#/components/schemas/RetentionHoldView"
-        replayed:
+        request_replayed:
+          type: boolean
+        execution_reused:
           type: boolean
         task:
           $ref: "#/components/schemas/TaskView"
@@ -8307,11 +8352,13 @@ components:
     UpdateS3AccessPointResponse:
       type: object
       additionalProperties: false
-      required: [access_point, replayed]
+      required: [access_point, request_replayed, execution_reused]
       properties:
         access_point:
           $ref: "#/components/schemas/S3AccessPointView"
-        replayed:
+        request_replayed:
+          type: boolean
+        execution_reused:
           type: boolean
         task:
           $ref: "#/components/schemas/TaskView"
@@ -8323,7 +8370,8 @@ components:
         - access_point
         - access_key_id
         - credential_expires_at_unix_ms
-        - replayed
+        - request_replayed
+        - execution_reused
       properties:
         access_point:
           $ref: "#/components/schemas/S3AccessPointView"
@@ -8337,7 +8385,9 @@ components:
           maxLength: 2048
         credential_expires_at_unix_ms:
           $ref: "#/components/schemas/UnixMillis"
-        replayed:
+        request_replayed:
+          type: boolean
+        execution_reused:
           type: boolean
         task:
           $ref: "#/components/schemas/TaskView"
@@ -8359,7 +8409,7 @@ components:
     CreateS3CredentialResponse:
       type: object
       additionalProperties: false
-      required: [credential, replayed]
+      required: [credential, request_replayed, execution_reused]
       properties:
         credential:
           $ref: "#/components/schemas/S3CredentialView"
@@ -8367,7 +8417,9 @@ components:
           type: string
           writeOnly: true
           maxLength: 2048
-        replayed:
+        request_replayed:
+          type: boolean
+        execution_reused:
           type: boolean
         task:
           $ref: "#/components/schemas/TaskView"
@@ -8587,18 +8639,18 @@ components:
         artifact_id: { $ref: "#/components/schemas/ArtifactId" }
         object_namespace_id: { $ref: "#/components/schemas/ObjectNamespaceId" }
         commit_id: { $ref: "#/components/schemas/CommitId" }
-        playground_id: { $ref: "#/components/schemas/PlaygroundId" }
+        workspace_id: { $ref: "#/components/schemas/WorkspaceId" }
         snapshot_id: { $ref: "#/components/schemas/SnapshotId" }
         storage_volume_id: { $ref: "#/components/schemas/StorageVolumeId" }
-        task_kind:
+        intent_kind:
           type: array
           uniqueItems: true
-          items: { $ref: "#/components/schemas/TaskKind" }
+          items: { $ref: "#/components/schemas/TaskIntent" }
+        purpose: { $ref: "#/components/schemas/TaskPurpose" }
         state:
           type: array
           uniqueItems: true
           items: { $ref: "#/components/schemas/TaskState" }
-        parent_task_id: { $ref: "#/components/schemas/TaskId" }
         created_after_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
         created_before_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
         updated_after_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
@@ -8634,13 +8686,14 @@ components:
         artifact_id: { $ref: "#/components/schemas/ArtifactId" }
         object_namespace_id: { $ref: "#/components/schemas/ObjectNamespaceId" }
         commit_id: { $ref: "#/components/schemas/CommitId" }
-        playground_id: { $ref: "#/components/schemas/PlaygroundId" }
+        workspace_id: { $ref: "#/components/schemas/WorkspaceId" }
         snapshot_id: { $ref: "#/components/schemas/SnapshotId" }
         storage_volume_id: { $ref: "#/components/schemas/StorageVolumeId" }
-        task_kind:
+        intent_kind:
           type: array
           uniqueItems: true
-          items: { $ref: "#/components/schemas/TaskKind" }
+          items: { $ref: "#/components/schemas/TaskIntent" }
+        purpose: { $ref: "#/components/schemas/TaskPurpose" }
         state:
           type: array
           uniqueItems: true
@@ -8664,27 +8717,55 @@ components:
         task_id: { $ref: "#/components/schemas/TaskId" }
         expected_resource_version: { $ref: "#/components/schemas/CanonicalU64" }
 
-    TaskKind:
+    TaskIntent:
       type: string
       enum:
+        - project.create
+        - project.delete
+        - project.restore
+        - artifact.create
+        - artifact.delete
+        - artifact.restore
         - workspace.create
-        - workspace.materialize
-        - precommit.check
-        - add.scan
-        - commit.create
+        - workspace.delete
+        - workspace.restore
         - snapshot.create
-        - snapshot.delivery.materialize
+        - snapshot.delete
+        - snapshot.restore
+        - storage_volume.create
+        - storage_volume.delete
+        - storage_volume.restore
+        - s3_access_point.create
+        - s3_access_point.delete
+        - s3_access_point.enable
+        - s3_access_point.disable
+        - commit.validate
+        - commit.create
         - commit.materialize
-        - integrity.scan
-        - resource.repair
-        - catalog.lifecycle
-        - storage.lifecycle
-        - gateway.lifecycle
-        - s3.lifecycle
+        - agent_enrollment.create
+        - agent_enrollment.approve
+        - agent_enrollment.reject
+        - agent_enrollment.recover
+        - agent_enrollment.delete
+        - gateway_pool.create
+        - gateway_pool.update
+        - gateway_pool.drain
+        - gateway_pool.delete
+        - gateway_replica.create
+        - gateway_replica.activate
+        - gateway_replica.drain
+        - gateway_replica.revoke
+        - gateway_replica.delete
+        - s3_credential.create
+        - s3_credential.revoke
+
+    TaskPurpose:
+      type: string
+      enum: [copy, repair]
 
     TaskState:
       type: string
-      enum: [queued, running, waiting, verifying, succeeded, stalled, failed, cancelled]
+      enum: [queued, running, waiting, verifying, succeeded, stalled, failed, cancelling, cancelled]
 
     TaskProgressView:
       type: object
@@ -8706,31 +8787,76 @@ components:
         retryable: { type: boolean }
         detail: { type: string, minLength: 1, maxLength: 4096 }
 
+    TaskResourceRefView:
+      type: object
+      additionalProperties: false
+      required: [resource_kind, resource_id]
+      properties:
+        resource_kind: { type: string, minLength: 1, maxLength: 128 }
+        resource_id: { type: string, minLength: 1, maxLength: 256 }
+
+    TaskResourceLinkView:
+      type: object
+      additionalProperties: false
+      required: [resource_kind, resource_id, role]
+      properties:
+        resource_kind: { type: string, minLength: 1, maxLength: 128 }
+        resource_id: { type: string, minLength: 1, maxLength: 256 }
+        role: { type: string, enum: [primary, source, target, related] }
+
+    TaskStageView:
+      type: object
+      additionalProperties: false
+      required: [stage_key, stage_kind, ordinal, dependencies, state, stage_attempt, progress, created_at_unix_ms, updated_at_unix_ms, resource_version]
+      properties:
+        stage_key: { type: string, minLength: 1, maxLength: 256 }
+        stage_kind: { type: string, minLength: 1, maxLength: 256 }
+        ordinal: { $ref: "#/components/schemas/CanonicalU64" }
+        dependencies: { type: array, items: { type: string, minLength: 1, maxLength: 256 }, uniqueItems: true }
+        state: { type: string, enum: [pending, ready, running, waiting, verifying, succeeded, skipped, no_op, stalled, failed, cancelling, cancelled] }
+        stage_attempt: { $ref: "#/components/schemas/CanonicalU64" }
+        outcome: { type: string, enum: [succeeded, skipped, no_op, reused, failed, cancelled] }
+        progress: { $ref: "#/components/schemas/TaskProgressView" }
+        detail_kind: { type: string, minLength: 1, maxLength: 256 }
+        detail_id: { type: string, minLength: 1, maxLength: 256 }
+        issue: { $ref: "#/components/schemas/TaskIssueView" }
+        created_at_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
+        updated_at_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
+        started_at_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
+        finished_at_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
+        resource_version: { $ref: "#/components/schemas/CanonicalU64" }
+
+    TaskCompletionView:
+      type: object
+      additionalProperties: false
+      required: [outcome]
+      properties:
+        outcome: { type: string, enum: [succeeded, cancelled, failed] }
+        finished_at_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
+
     TaskView:
       type: object
       additionalProperties: false
-      required: [task_id, task_kind, state, phase, tenant_id, request_id, request_digest, actor, attempt, progress, deadline_unix_ms, created_at_unix_ms, updated_at_unix_ms, resource_version, origin, executable]
+      required: [task_id, intent_kind, state, tenant_id, primary_resource, resource_links, execution_id, execution_key_digest, execution_reused, current_stage, stages, request_id, request_digest, actor, attempt, progress, deadline_unix_ms, created_at_unix_ms, updated_at_unix_ms, resource_version, origin, executable]
       properties:
         task_id: { $ref: "#/components/schemas/TaskId" }
-        task_kind: { $ref: "#/components/schemas/TaskKind" }
+        intent_kind: { $ref: "#/components/schemas/TaskIntent" }
+        purpose: { $ref: "#/components/schemas/TaskPurpose" }
         state: { $ref: "#/components/schemas/TaskState" }
-        phase: { type: string, minLength: 1, maxLength: 512 }
         tenant_id: { $ref: "#/components/schemas/TenantId" }
-        project_id: { $ref: "#/components/schemas/ProjectId" }
-        artifact_id: { $ref: "#/components/schemas/ArtifactId" }
-        object_namespace_id: { $ref: "#/components/schemas/ObjectNamespaceId" }
-        commit_id: { $ref: "#/components/schemas/CommitId" }
-        playground_id: { $ref: "#/components/schemas/PlaygroundId" }
-        snapshot_id: { $ref: "#/components/schemas/SnapshotId" }
-        storage_volume_id: { $ref: "#/components/schemas/StorageVolumeId" }
-        parent_task_id: { $ref: "#/components/schemas/TaskId" }
+        primary_resource: { $ref: "#/components/schemas/TaskResourceRefView" }
+        resource_links: { type: array, items: { $ref: "#/components/schemas/TaskResourceLinkView" } }
+        execution_id: { type: string, minLength: 1, maxLength: 256 }
+        execution_key_digest: { $ref: "#/components/schemas/ContentDigest" }
+        execution_reused: { type: boolean }
+        current_stage: { $ref: "#/components/schemas/TaskStageView" }
+        stages: { type: array, items: { $ref: "#/components/schemas/TaskStageView" } }
+        completion: { $ref: "#/components/schemas/TaskCompletionView" }
         request_id: { $ref: "#/components/schemas/RequestId" }
         request_digest: { $ref: "#/components/schemas/ContentDigest" }
         actor: { type: string, minLength: 1, maxLength: 256 }
         attempt: { $ref: "#/components/schemas/CanonicalU64" }
         progress: { $ref: "#/components/schemas/TaskProgressView" }
-        detail_kind: { type: string, minLength: 1, maxLength: 256 }
-        detail_id: { type: string, minLength: 1, maxLength: 256 }
         deadline_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
         issue: { $ref: "#/components/schemas/TaskIssueView" }
         created_at_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
@@ -8738,19 +8864,19 @@ components:
         started_at_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
         finished_at_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
         resource_version: { $ref: "#/components/schemas/CanonicalU64" }
-        origin: { type: string, enum: [user, system, legacy] }
+        origin: { type: string, enum: [user, system] }
         executable: { type: boolean }
 
     TaskAttemptView:
       type: object
       additionalProperties: false
-      required: [attempt_id, task_id, attempt, state, phase, created_at_unix_ms, updated_at_unix_ms, resource_version]
+      required: [attempt_id, task_id, attempt, state, current_stage_key, created_at_unix_ms, updated_at_unix_ms, resource_version]
       properties:
         attempt_id: { $ref: "#/components/schemas/TaskAttemptId" }
         task_id: { $ref: "#/components/schemas/TaskId" }
         attempt: { $ref: "#/components/schemas/CanonicalU64" }
         state: { $ref: "#/components/schemas/TaskState" }
-        phase: { type: string, minLength: 1, maxLength: 512 }
+        current_stage_key: { type: string, minLength: 1, maxLength: 256 }
         created_at_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
         updated_at_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
         started_at_unix_ms: { $ref: "#/components/schemas/UnixMillis" }
@@ -8789,12 +8915,11 @@ components:
     QueryTaskResponse:
       type: object
       additionalProperties: false
-      required: [task, attempts, events, children]
+      required: [task, attempts, events]
       properties:
         task: { $ref: "#/components/schemas/TaskView" }
         attempts: { type: array, items: { $ref: "#/components/schemas/TaskAttemptView" } }
         events: { type: array, items: { $ref: "#/components/schemas/TaskEventView" } }
-        children: { type: array, items: { $ref: "#/components/schemas/TaskView" } }
 
     QueryTaskEventListResponse:
       type: object
@@ -8807,7 +8932,7 @@ components:
     TaskSummaryView:
       type: object
       additionalProperties: false
-      required: [total, queued, running, waiting, verifying, succeeded, stalled, failed, cancelled]
+      required: [total, queued, running, waiting, verifying, succeeded, stalled, failed, cancelling, cancelled]
       properties:
         total: { $ref: "#/components/schemas/CanonicalU64" }
         queued: { $ref: "#/components/schemas/CanonicalU64" }
@@ -8817,6 +8942,7 @@ components:
         succeeded: { $ref: "#/components/schemas/CanonicalU64" }
         stalled: { $ref: "#/components/schemas/CanonicalU64" }
         failed: { $ref: "#/components/schemas/CanonicalU64" }
+        cancelling: { $ref: "#/components/schemas/CanonicalU64" }
         cancelled: { $ref: "#/components/schemas/CanonicalU64" }
 
     QueryTaskSummaryResponse:
@@ -8829,10 +8955,11 @@ components:
     TaskMutationResponse:
       type: object
       additionalProperties: false
-      required: [task, replayed]
+      required: [task, request_replayed, execution_reused]
       properties:
         task: { $ref: "#/components/schemas/TaskView" }
-        replayed: { type: boolean }
+        request_replayed: { type: boolean }
+        execution_reused: { type: boolean }
 
     ProblemDetails:
       type: object
@@ -8922,7 +9049,7 @@ components:
       $ref: "#/components/schemas/ResourceId"
     ArtifactId:
       $ref: "#/components/schemas/ResourceId"
-    PlaygroundId:
+    WorkspaceId:
       $ref: "#/components/schemas/ResourceId"
     CommitId:
       $ref: "#/components/schemas/ContentDigest"
@@ -9012,7 +9139,7 @@ components:
 
     S3AccessPointState:
       type: string
-      enum: [active, disabled]
+      enum: [active, disabled, deleted]
 
     S3CredentialState:
       type: string
@@ -9057,8 +9184,8 @@ components:
         - artifact.commit.replicate
         - project.read
         - project.create
-        - playground.read
-        - playground.create
+        - workspace.read
+        - workspace.create
         - snapshot.read
         - snapshot.create
         - s3.access.read

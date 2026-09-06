@@ -11,7 +11,7 @@ use clap::Args;
 use neoengram_domain::protocol::{
     decode_bounded_unique_json, AgentBootstrapProof, ContentDigest, Ed25519PublicKeySpki,
     Ed25519Signature, GatewayBootstrapCertificateDelivery, GatewayBootstrapChallenge,
-    GatewayBootstrapChallengeRequest, GatewayBootstrapProofResponse, UnixMillis,
+    GatewayBootstrapChallengeRequest, GatewayBootstrapProofResponse, RequestId, UnixMillis,
     CURRENT_WIRE_VERSION, MAX_AGENT_ENROLLMENT_MESSAGE_BYTES,
 };
 use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -31,6 +31,7 @@ use crate::tunnel::GatewayIdentity;
 const MAX_BOOTSTRAP_PRIVATE_KEY_BYTES: u64 = 64 * 1024;
 const MAX_BOOTSTRAP_TOKEN_BYTES: u64 = 1024;
 const MAX_BOOTSTRAP_CERTIFICATE_BYTES: u64 = 1024 * 1024;
+const MAX_BOOTSTRAP_METADATA_BYTES: u64 = 16 * 1024;
 const ACTIVATION_TOKEN_PREFIX: &str = "nggw_v1_";
 
 #[derive(Debug, Clone, Default, Args)]
@@ -108,6 +109,12 @@ impl GatewayBootstrapConfig {
                 "workload trust domain is required while Gateway bootstrap is enabled".into(),
             )
         })?;
+        if active_certificate_file.is_some_and(|active| active == certificate_path.as_path()) {
+            return Err(BootstrapError::Configuration(
+                "bootstrap certificate destination must differ from the active listener certificate path"
+                    .into(),
+            ));
+        }
         require_restricted_file(private_key_path, "bootstrap private key")?;
         require_restricted_file(token_path, "bootstrap activation token")?;
         let private_key_pem = read_bounded(
@@ -146,8 +153,16 @@ impl GatewayBootstrapConfig {
             "spiffe://{trust_domain}/workloads/edge-clusters/{}/gateway-pools/{}/gateway-replicas/{}",
             identity.edge_cluster_id, identity.gateway_pool_id, identity.gateway_replica_id
         );
-        let certificate_installed = certificate_path.exists()
-            && active_certificate_file != Some(certificate_path.as_path());
+        let certificate_installed = certificate_path.exists();
+        let restart_required =
+            certificate_installed && active_certificate_file != Some(certificate_path.as_path());
+        let installed_metadata = if certificate_installed {
+            read_installed_certificate_metadata(&installed_certificate_metadata_path(
+                &certificate_path,
+            )?)
+        } else {
+            None
+        };
         let certificate_verifier = client_ca_file.map(load_certificate_verifier).transpose()?;
         Ok(Some(Arc::new(GatewayBootstrap {
             identity,
@@ -160,8 +175,12 @@ impl GatewayBootstrapConfig {
             state: Mutex::new(BootstrapState {
                 pending: None,
                 certificate_installed,
-                installed_request_id: None,
-                installed_certificate_digest: None,
+                restart_required,
+                installed_request_id: installed_metadata
+                    .as_ref()
+                    .map(|metadata| metadata.request_id.clone()),
+                installed_certificate_digest: installed_metadata
+                    .map(|metadata| metadata.leaf_certificate_digest),
             }),
         })))
     }
@@ -181,13 +200,21 @@ pub(crate) struct GatewayBootstrap {
 struct BootstrapState {
     pending: Option<GatewayBootstrapChallenge>,
     certificate_installed: bool,
-    installed_request_id: Option<neoengram_domain::protocol::RequestId>,
+    restart_required: bool,
+    installed_request_id: Option<RequestId>,
     installed_certificate_digest: Option<ContentDigest>,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct InstalledCertificateMetadata {
+    request_id: RequestId,
+    leaf_certificate_digest: ContentDigest,
 }
 
 impl GatewayBootstrap {
     pub(crate) async fn restart_required(&self) -> bool {
-        self.state.lock().await.certificate_installed
+        self.state.lock().await.restart_required
     }
 
     pub(crate) async fn prove(
@@ -253,13 +280,20 @@ impl GatewayBootstrap {
         let mut state = self.state.lock().await;
         let certificate_digest = ContentDigest::hash(delivery.leaf_certificate_der.as_bytes());
         if state.certificate_installed || self.certificate_path.exists() {
+            state.certificate_installed = true;
+            // Once this process has accepted a delivery, retain the request identity and leaf
+            // digest as an idempotency fence. A replay from a different activation request must
+            // not be acknowledged merely because it carries the same certificate bytes. The
+            // metadata is durable so a process restart cannot reset this fence.
+            if state.installed_request_id.as_ref() != Some(&delivery.request_id)
+                || state.installed_certificate_digest != Some(certificate_digest)
+            {
+                return Err(BootstrapError::AlreadyActivated);
+            }
             self.validate_leaf_certificate(&delivery)?;
             let expected = certificate_bundle_pem(&delivery);
             let installed = read_installed_certificate(&self.certificate_path)?;
-            state.certificate_installed = true;
             if installed == expected {
-                state.installed_request_id = Some(delivery.request_id);
-                state.installed_certificate_digest = Some(certificate_digest);
                 return Ok(());
             }
             return Err(BootstrapError::AlreadyActivated);
@@ -276,11 +310,22 @@ impl GatewayBootstrap {
         self.validate_leaf_certificate(&delivery)?;
         let pem = certificate_bundle_pem(&delivery);
         let certificate_path = self.certificate_path.clone();
-        tokio::task::spawn_blocking(move || atomic_write_restricted(&certificate_path, &pem))
-            .await
-            .map_err(|error| BootstrapError::Persistence(error.to_string()))??;
+        let metadata_path = installed_certificate_metadata_path(&certificate_path)?;
+        let metadata = InstalledCertificateMetadata {
+            request_id: delivery.request_id.clone(),
+            leaf_certificate_digest: certificate_digest,
+        };
+        let metadata_json = serde_json::to_vec(&metadata)
+            .map_err(|error| BootstrapError::Persistence(error.to_string()))?;
+        tokio::task::spawn_blocking(move || {
+            atomic_write_restricted(&certificate_path, &pem)?;
+            atomic_write_restricted(&metadata_path, &metadata_json)
+        })
+        .await
+        .map_err(|error| BootstrapError::Persistence(error.to_string()))??;
         state.pending = None;
         state.certificate_installed = true;
+        state.restart_required = true;
         state.installed_request_id = Some(delivery.request_id);
         state.installed_certificate_digest = Some(certificate_digest);
         Ok(())
@@ -531,6 +576,41 @@ fn read_installed_certificate(path: &Path) -> Result<Vec<u8>, BootstrapError> {
         ));
     }
     fs::read(path).map_err(|error| BootstrapError::Persistence(error.to_string()))
+}
+
+fn installed_certificate_metadata_path(path: &Path) -> Result<PathBuf, BootstrapError> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            BootstrapError::Configuration(
+                "certificate path has no valid file name for bootstrap metadata".into(),
+            )
+        })?;
+    Ok(path.with_file_name(format!("{file_name}.bootstrap-state.json")))
+}
+
+/// Read the local activation fence without ever treating an invalid record as authorization.
+/// Missing, malformed, or insufficiently restricted metadata deliberately maps to `None`; an
+/// installed certificate with no matching metadata can therefore only be rejected, never replayed.
+fn read_installed_certificate_metadata(path: &Path) -> Option<InstalledCertificateMetadata> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_BOOTSTRAP_METADATA_BYTES
+    {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            return None;
+        }
+    }
+    let bytes = fs::read(path).ok()?;
+    decode_bounded_unique_json(&bytes, MAX_BOOTSTRAP_METADATA_BYTES as usize).ok()
 }
 
 fn require_restricted_file(path: &Path, kind: &str) -> Result<(), BootstrapError> {
@@ -845,6 +925,9 @@ MC4CAQAwBQYDK2VwBCIEINQawrTMCmjrnfruh9FAsmFhzfyw4nNF+73pdTtdaJ46
             .unwrap();
         let persisted = fs::read_to_string(&certificate_path).unwrap();
         assert_eq!(persisted.matches("BEGIN CERTIFICATE").count(), 2);
+        let metadata_path = installed_certificate_metadata_path(&certificate_path).unwrap();
+        let metadata = fs::read_to_string(&metadata_path).unwrap();
+        assert!(metadata.contains("request-a"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -856,7 +939,20 @@ MC4CAQAwBQYDK2VwBCIEINQawrTMCmjrnfruh9FAsmFhzfyw4nNF+73pdTtdaJ46
                     & 0o777,
                 0o600
             );
+            assert_eq!(
+                fs::metadata(&metadata_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
+        let mut replayed_request = delivery.clone();
+        replayed_request.request_id =
+            neoengram_domain::protocol::RequestId::new("request-replayed").unwrap();
+        assert!(matches!(
+            bootstrap
+                .install_certificate(&serde_json::to_vec(&replayed_request).unwrap())
+                .await,
+            Err(BootstrapError::AlreadyActivated)
+        ));
         bootstrap
             .install_certificate(&delivery_bytes)
             .await
@@ -867,19 +963,20 @@ MC4CAQAwBQYDK2VwBCIEINQawrTMCmjrnfruh9FAsmFhzfyw4nNF+73pdTtdaJ46
             activation_token_file: Some(directory.path().join("activation-token")),
             certificate_chain_file: Some(certificate_path.clone()),
         }
-        .load(
-            identity(),
-            Some("mesh.example.test"),
-            Some(&certificate_path),
-            None,
-        )
+        .load(identity(), Some("mesh.example.test"), None, None)
         .unwrap()
         .unwrap();
-        assert!(!restarted.restart_required().await);
+        assert!(restarted.restart_required().await);
         restarted
             .install_certificate(&delivery_bytes)
             .await
             .unwrap();
+        assert!(matches!(
+            restarted
+                .install_certificate(&serde_json::to_vec(&replayed_request).unwrap())
+                .await,
+            Err(BootstrapError::AlreadyActivated)
+        ));
         let mut different_chain = delivery;
         different_chain.issuer_chain_der = vec![
             GatewayOpaqueBytes::new(matching_leaf_certificate()).unwrap(),
@@ -897,6 +994,126 @@ MC4CAQAwBQYDK2VwBCIEINQawrTMCmjrnfruh9FAsmFhzfyw4nNF+73pdTtdaJ46
                 .await,
             Err(BootstrapError::AlreadyActivated)
         ));
+
+        let active_certificate_path = directory.path().join("active-workload-chain.pem");
+        let error = GatewayBootstrapConfig {
+            private_key_file: Some(directory.path().join("activation-key.pem")),
+            activation_token_file: Some(directory.path().join("activation-token")),
+            certificate_chain_file: Some(certificate_path.clone()),
+        }
+        .load(
+            identity(),
+            Some("mesh.example.test"),
+            Some(&certificate_path),
+            None,
+        )
+        .err()
+        .expect("bootstrap and active certificate paths must not alias");
+        assert!(matches!(error, BootstrapError::Configuration(_)));
+
+        // A distinct active listener path is the supported post-install arrangement.
+        fs::copy(&certificate_path, &active_certificate_path).unwrap();
+        let restarted_with_active = GatewayBootstrapConfig {
+            private_key_file: Some(directory.path().join("activation-key.pem")),
+            activation_token_file: Some(directory.path().join("activation-token")),
+            certificate_chain_file: Some(certificate_path),
+        }
+        .load(
+            identity(),
+            Some("mesh.example.test"),
+            Some(&active_certificate_path),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(restarted_with_active.restart_required().await);
+    }
+
+    #[tokio::test]
+    async fn installed_certificate_without_metadata_fails_closed_after_restart() {
+        let (directory, bootstrap, certificate_path) = fixture();
+        let original_challenge = challenge();
+        bootstrap
+            .prove(
+                &serde_json::to_vec(&GatewayBootstrapChallengeRequest {
+                    wire_version: CURRENT_WIRE_VERSION,
+                    challenge: original_challenge.clone(),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let delivery = GatewayBootstrapCertificateDelivery {
+            wire_version: CURRENT_WIRE_VERSION,
+            request_id: original_challenge.request_id,
+            certificate_generation: CertificateGeneration::new(1),
+            leaf_certificate_der: GatewayOpaqueBytes::new(matching_leaf_certificate()).unwrap(),
+            issuer_chain_der: vec![GatewayOpaqueBytes::new(matching_leaf_certificate()).unwrap()],
+        };
+        bootstrap
+            .install_certificate(&serde_json::to_vec(&delivery).unwrap())
+            .await
+            .unwrap();
+        let metadata_path = installed_certificate_metadata_path(&certificate_path).unwrap();
+        fs::remove_file(metadata_path).unwrap();
+
+        let restarted = GatewayBootstrapConfig {
+            private_key_file: Some(directory.path().join("activation-key.pem")),
+            activation_token_file: Some(directory.path().join("activation-token")),
+            certificate_chain_file: Some(certificate_path),
+        }
+        .load(identity(), Some("mesh.example.test"), None, None)
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            restarted
+                .install_certificate(&serde_json::to_vec(&delivery).unwrap())
+                .await,
+            Err(BootstrapError::AlreadyActivated)
+        ));
+        assert!(matches!(
+            restarted
+                .prove(
+                    &serde_json::to_vec(&GatewayBootstrapChallengeRequest {
+                        wire_version: CURRENT_WIRE_VERSION,
+                        challenge: challenge(),
+                    })
+                    .unwrap(),
+                )
+                .await,
+            Err(BootstrapError::AlreadyActivated)
+        ));
+    }
+
+    #[test]
+    fn installed_certificate_metadata_rejects_duplicate_members() {
+        let directory = tempfile::tempdir().unwrap();
+        let metadata_path = directory
+            .path()
+            .join("certificate-chain.pem.bootstrap-state.json");
+        write_secret(
+            &metadata_path,
+            br#"{"request_id":"request-a","request_id":"request-b","leaf_certificate_digest":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
+        );
+        assert!(read_installed_certificate_metadata(&metadata_path).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_certificate_metadata_requires_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let metadata_path = directory
+            .path()
+            .join("certificate-chain.pem.bootstrap-state.json");
+        let metadata = InstalledCertificateMetadata {
+            request_id: RequestId::new("request-a").unwrap(),
+            leaf_certificate_digest: ContentDigest::from_bytes([0; 32]),
+        };
+        write_secret(&metadata_path, &serde_json::to_vec(&metadata).unwrap());
+        fs::set_permissions(&metadata_path, PermissionsExt::from_mode(0o640)).unwrap();
+        assert!(read_installed_certificate_metadata(&metadata_path).is_none());
     }
 
     #[tokio::test]

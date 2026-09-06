@@ -4,16 +4,15 @@ use fusen_rs::{interface, Call, Error, Response};
 
 use crate::{
     dto::{
-        CancelPreCommitRequest, CancelPreCommitResponse, CommitPlaygroundRequest,
-        CommitPlaygroundResponse, CreateArtifactRequest, CreateArtifactResponse,
+        CancelPreCommitRequest, CancelPreCommitResponse, CommitWorkspaceRequest,
+        CommitWorkspaceResponse, CreateArtifactRequest, CreateArtifactResponse,
         CreateCommitMaterializationRequest, CreateCommitMaterializationResponse,
-        CreateDeletionRequest, CreatePlaygroundRequest, CreatePlaygroundResponse,
-        CreateProjectRequest, CreateProjectResponse, CreateRetentionHoldRequest,
-        CreateRetentionHoldResponse, CreateS3AccessPointRequest, CreateS3AccessPointResponse,
-        CreateS3CredentialRequest, CreateS3CredentialResponse, CreateS3DownloadUrlRequest,
-        CreateS3DownloadUrlResponse, CreateSnapshotRequest, CreateSnapshotResponse,
-        CreateStorageVolumeRequest, CreateStorageVolumeResponse, CreateTenantRequest,
-        CreateTenantResponse, CreateWorkspaceRequest, CreateWorkspaceResponse,
+        CreateDeletionRequest, CreateProjectRequest, CreateProjectResponse,
+        CreateRetentionHoldRequest, CreateRetentionHoldResponse, CreateS3AccessPointRequest,
+        CreateS3AccessPointResponse, CreateS3CredentialRequest, CreateS3CredentialResponse,
+        CreateS3DownloadUrlRequest, CreateS3DownloadUrlResponse, CreateSnapshotRequest,
+        CreateSnapshotResponse, CreateStorageVolumeRequest, CreateStorageVolumeResponse,
+        CreateTenantRequest, CreateTenantResponse, CreateWorkspaceRequest, CreateWorkspaceResponse,
         DeleteSnapshotDeliveryRequest, DeleteSnapshotDeliveryResponse, DeletionMutationResponse,
         InternalS3AuthorizeRequest, InternalS3AuthorizeResponse, QueryArtifactCommitDiffRequest,
         QueryArtifactCommitDiffResponse, QueryArtifactCommitGraphRequest,
@@ -22,25 +21,25 @@ use crate::{
         QueryCommitAvailabilityV2Response, QueryCommitCoverageRequest, QueryCommitCoverageResponse,
         QueryDeletionImpactRequest, QueryDeletionImpactResponse, QueryDeletionListRequest,
         QueryDeletionListResponse, QueryDeletionRequest, QueryDeletionResponse,
-        QueryPlaygroundChangeListRequest, QueryPlaygroundChangeListResponse,
-        QueryPlaygroundDatasetProfileRequest, QueryPlaygroundDatasetProfileResponse,
-        QueryPlaygroundFileListRequest, QueryPlaygroundFileListResponse,
-        QueryPlaygroundFileMetadataRequest, QueryPlaygroundFileMetadataResponse,
-        QueryPlaygroundListRequest, QueryPlaygroundListResponse, QueryPlaygroundRequest,
-        QueryPlaygroundResponse, QueryPreCommitRequest, QueryPreCommitResponse,
-        QueryProjectListRequest, QueryProjectListResponse, QueryS3AccessPointListRequest,
-        QueryS3AccessPointListResponse, QueryS3AccessPointRequest, QueryS3AccessPointResponse,
-        QueryS3CredentialListRequest, QueryS3CredentialListResponse, QueryS3ObjectListRequest,
-        QueryS3ObjectListResponse, QuerySnapshotDeliveryListRequest,
-        QuerySnapshotDeliveryListResponse, QuerySnapshotDeliveryRequest,
-        QuerySnapshotDeliveryResponse, QuerySnapshotListRequest, QuerySnapshotListResponse,
-        QuerySnapshotRequest, QuerySnapshotResponse, QueryStorageVolumeListRequest,
-        QueryStorageVolumeListResponse, QueryStorageVolumeRequest, QueryStorageVolumeResponse,
-        QueryTenantListRequest, QueryTenantListResponse, QueryTenantRequest, QueryTenantResponse,
-        ReleaseRetentionHoldRequest, ReleaseRetentionHoldResponse, RestartPreCommitRequest,
-        RestartPreCommitResponse, RetrySnapshotDeliveryRequest, RetrySnapshotDeliveryResponse,
-        RevokeS3CredentialRequest, StartPreCommitRequest, StartPreCommitResponse,
-        UpdateDeletionRequest, UpdateS3AccessPointRequest, UpdateS3AccessPointResponse,
+        QueryPreCommitRequest, QueryPreCommitResponse, QueryProjectListRequest,
+        QueryProjectListResponse, QueryS3AccessPointListRequest, QueryS3AccessPointListResponse,
+        QueryS3AccessPointRequest, QueryS3AccessPointResponse, QueryS3CredentialListRequest,
+        QueryS3CredentialListResponse, QueryS3ObjectListRequest, QueryS3ObjectListResponse,
+        QuerySnapshotDeliveryListRequest, QuerySnapshotDeliveryListResponse,
+        QuerySnapshotDeliveryRequest, QuerySnapshotDeliveryResponse, QuerySnapshotListRequest,
+        QuerySnapshotListResponse, QuerySnapshotRequest, QuerySnapshotResponse,
+        QueryStorageVolumeListRequest, QueryStorageVolumeListResponse, QueryStorageVolumeRequest,
+        QueryStorageVolumeResponse, QueryTenantListRequest, QueryTenantListResponse,
+        QueryTenantRequest, QueryTenantResponse, QueryWorkspaceChangeListRequest,
+        QueryWorkspaceChangeListResponse, QueryWorkspaceDatasetProfileRequest,
+        QueryWorkspaceDatasetProfileResponse, QueryWorkspaceFileListRequest,
+        QueryWorkspaceFileListResponse, QueryWorkspaceFileMetadataRequest,
+        QueryWorkspaceFileMetadataResponse, QueryWorkspaceListRequest, QueryWorkspaceListResponse,
+        QueryWorkspaceRequest, QueryWorkspaceResponse, ReleaseRetentionHoldRequest,
+        ReleaseRetentionHoldResponse, RestartPreCommitRequest, RestartPreCommitResponse,
+        RetrySnapshotDeliveryRequest, RetrySnapshotDeliveryResponse, RevokeS3CredentialRequest,
+        StartPreCommitRequest, StartPreCommitResponse, UpdateDeletionRequest,
+        UpdateS3AccessPointRequest, UpdateS3AccessPointResponse,
     },
     service::CatalogService,
 };
@@ -69,13 +68,6 @@ pub trait PlacementApi {
         #[param(context)] call: Call,
         #[param(body)] request: QueryCommitAvailabilityV2Request,
     ) -> Result<Response<QueryCommitAvailabilityV2Response>, Error>;
-
-    #[fusen_rs::method(method = "POST", path = "/api/workspace/create")]
-    async fn create_workspace(
-        &self,
-        #[param(context)] call: Call,
-        #[param(body)] request: CreateWorkspaceRequest,
-    ) -> Result<Response<CreateWorkspaceResponse>, Error>;
 }
 
 pub struct PlacementController {
@@ -119,17 +111,6 @@ impl PlacementApi for PlacementController {
     ) -> Result<Response<QueryCommitAvailabilityV2Response>, Error> {
         self.service
             .query_commit_availability_v2(&authenticated_identity(&call)?, request)
-            .await
-            .map(Response::new)
-    }
-
-    async fn create_workspace(
-        &self,
-        call: Call,
-        request: CreateWorkspaceRequest,
-    ) -> Result<Response<CreateWorkspaceResponse>, Error> {
-        self.service
-            .create_workspace(&authenticated_identity(&call)?, request)
             .await
             .map(Response::new)
     }
@@ -238,91 +219,91 @@ pub trait ArtifactApi {
     ) -> Result<Response<CreateArtifactResponse>, Error>;
 }
 
-#[interface(name = "neoengram.playground")]
-pub trait PlaygroundApi {
-    #[fusen_rs::method(method = "POST", path = "/api/playground/list/query")]
-    async fn query_playground_list(
+#[interface(name = "neoengram.workspace")]
+pub trait WorkspaceApi {
+    #[fusen_rs::method(method = "POST", path = "/api/workspace/list/query")]
+    async fn query_workspace_list(
         &self,
         #[param(context)] call: Call,
-        #[param(body)] request: QueryPlaygroundListRequest,
-    ) -> Result<Response<QueryPlaygroundListResponse>, Error>;
+        #[param(body)] request: QueryWorkspaceListRequest,
+    ) -> Result<Response<QueryWorkspaceListResponse>, Error>;
 
-    #[fusen_rs::method(method = "POST", path = "/api/playground/query")]
-    async fn query_playground(
+    #[fusen_rs::method(method = "POST", path = "/api/workspace/query")]
+    async fn query_workspace(
         &self,
         #[param(context)] call: Call,
-        #[param(body)] request: QueryPlaygroundRequest,
-    ) -> Result<Response<QueryPlaygroundResponse>, Error>;
+        #[param(body)] request: QueryWorkspaceRequest,
+    ) -> Result<Response<QueryWorkspaceResponse>, Error>;
 
-    #[fusen_rs::method(method = "POST", path = "/api/playground/create")]
-    async fn create_playground(
+    #[fusen_rs::method(method = "POST", path = "/api/workspace/create")]
+    async fn create_workspace(
         &self,
         #[param(context)] call: Call,
-        #[param(body)] request: CreatePlaygroundRequest,
-    ) -> Result<Response<CreatePlaygroundResponse>, Error>;
+        #[param(body)] request: CreateWorkspaceRequest,
+    ) -> Result<Response<CreateWorkspaceResponse>, Error>;
 
-    #[fusen_rs::method(method = "POST", path = "/api/playground/precommit/start")]
-    async fn start_playground_precommit(
+    #[fusen_rs::method(method = "POST", path = "/api/workspace/precommit/start")]
+    async fn start_workspace_precommit(
         &self,
         #[param(context)] call: Call,
         #[param(body)] request: StartPreCommitRequest,
     ) -> Result<Response<StartPreCommitResponse>, Error>;
 
-    #[fusen_rs::method(method = "POST", path = "/api/playground/precommit/query")]
-    async fn query_playground_precommit(
+    #[fusen_rs::method(method = "POST", path = "/api/workspace/precommit/query")]
+    async fn query_workspace_precommit(
         &self,
         #[param(context)] call: Call,
         #[param(body)] request: QueryPreCommitRequest,
     ) -> Result<Response<QueryPreCommitResponse>, Error>;
 
-    #[fusen_rs::method(method = "POST", path = "/api/playground/precommit/restart")]
-    async fn restart_playground_precommit(
+    #[fusen_rs::method(method = "POST", path = "/api/workspace/precommit/restart")]
+    async fn restart_workspace_precommit(
         &self,
         #[param(context)] call: Call,
         #[param(body)] request: RestartPreCommitRequest,
     ) -> Result<Response<RestartPreCommitResponse>, Error>;
 
-    #[fusen_rs::method(method = "POST", path = "/api/playground/precommit/cancel")]
-    async fn cancel_playground_precommit(
+    #[fusen_rs::method(method = "POST", path = "/api/workspace/precommit/cancel")]
+    async fn cancel_workspace_precommit(
         &self,
         #[param(context)] call: Call,
         #[param(body)] request: CancelPreCommitRequest,
     ) -> Result<Response<CancelPreCommitResponse>, Error>;
 
-    #[fusen_rs::method(method = "POST", path = "/api/playground/file/list/query")]
-    async fn query_playground_file_list(
+    #[fusen_rs::method(method = "POST", path = "/api/workspace/file/list/query")]
+    async fn query_workspace_file_list(
         &self,
         #[param(context)] call: Call,
-        #[param(body)] request: QueryPlaygroundFileListRequest,
-    ) -> Result<Response<QueryPlaygroundFileListResponse>, Error>;
+        #[param(body)] request: QueryWorkspaceFileListRequest,
+    ) -> Result<Response<QueryWorkspaceFileListResponse>, Error>;
 
-    #[fusen_rs::method(method = "POST", path = "/api/playground/change/list/query")]
-    async fn query_playground_change_list(
+    #[fusen_rs::method(method = "POST", path = "/api/workspace/change/list/query")]
+    async fn query_workspace_change_list(
         &self,
         #[param(context)] call: Call,
-        #[param(body)] request: QueryPlaygroundChangeListRequest,
-    ) -> Result<Response<QueryPlaygroundChangeListResponse>, Error>;
+        #[param(body)] request: QueryWorkspaceChangeListRequest,
+    ) -> Result<Response<QueryWorkspaceChangeListResponse>, Error>;
 
-    #[fusen_rs::method(method = "POST", path = "/api/playground/file/metadata/query")]
-    async fn query_playground_file_metadata(
+    #[fusen_rs::method(method = "POST", path = "/api/workspace/file/metadata/query")]
+    async fn query_workspace_file_metadata(
         &self,
         #[param(context)] call: Call,
-        #[param(body)] request: QueryPlaygroundFileMetadataRequest,
-    ) -> Result<Response<QueryPlaygroundFileMetadataResponse>, Error>;
+        #[param(body)] request: QueryWorkspaceFileMetadataRequest,
+    ) -> Result<Response<QueryWorkspaceFileMetadataResponse>, Error>;
 
-    #[fusen_rs::method(method = "POST", path = "/api/playground/dataset/profile/query")]
-    async fn query_playground_dataset_profile(
+    #[fusen_rs::method(method = "POST", path = "/api/workspace/dataset/profile/query")]
+    async fn query_workspace_dataset_profile(
         &self,
         #[param(context)] call: Call,
-        #[param(body)] request: QueryPlaygroundDatasetProfileRequest,
-    ) -> Result<Response<QueryPlaygroundDatasetProfileResponse>, Error>;
+        #[param(body)] request: QueryWorkspaceDatasetProfileRequest,
+    ) -> Result<Response<QueryWorkspaceDatasetProfileResponse>, Error>;
 
-    #[fusen_rs::method(method = "POST", path = "/api/playground/commit/create")]
-    async fn commit_playground(
+    #[fusen_rs::method(method = "POST", path = "/api/workspace/commit/create")]
+    async fn commit_workspace(
         &self,
         #[param(context)] call: Call,
-        #[param(body)] request: CommitPlaygroundRequest,
-    ) -> Result<Response<CommitPlaygroundResponse>, Error>;
+        #[param(body)] request: CommitWorkspaceRequest,
+    ) -> Result<Response<CommitWorkspaceResponse>, Error>;
 }
 
 #[interface(name = "neoengram.snapshot")]
@@ -409,6 +390,13 @@ pub trait S3Api {
 
     #[fusen_rs::method(method = "POST", path = "/api/s3/access-point/disable")]
     async fn disable_access_point(
+        &self,
+        #[param(context)] call: Call,
+        #[param(body)] request: UpdateS3AccessPointRequest,
+    ) -> Result<Response<UpdateS3AccessPointResponse>, Error>;
+
+    #[fusen_rs::method(method = "POST", path = "/api/s3/access-point/delete")]
+    async fn delete_access_point(
         &self,
         #[param(context)] call: Call,
         #[param(body)] request: UpdateS3AccessPointRequest,
@@ -715,146 +703,146 @@ impl ArtifactApi for ArtifactController {
     }
 }
 
-pub struct PlaygroundController {
+pub struct WorkspaceController {
     service: Arc<CatalogService>,
 }
 
-impl PlaygroundController {
+impl WorkspaceController {
     #[must_use]
     pub fn new(service: Arc<CatalogService>) -> Self {
         Self { service }
     }
 }
 
-impl PlaygroundApi for PlaygroundController {
-    async fn query_playground_list(
+impl WorkspaceApi for WorkspaceController {
+    async fn query_workspace_list(
         &self,
         call: Call,
-        request: QueryPlaygroundListRequest,
-    ) -> Result<Response<QueryPlaygroundListResponse>, Error> {
+        request: QueryWorkspaceListRequest,
+    ) -> Result<Response<QueryWorkspaceListResponse>, Error> {
         self.service
-            .list_playgrounds(&authenticated_identity(&call)?, request)
+            .list_workspaces(&authenticated_identity(&call)?, request)
             .await
             .map(Response::new)
     }
 
-    async fn query_playground(
+    async fn query_workspace(
         &self,
         call: Call,
-        request: QueryPlaygroundRequest,
-    ) -> Result<Response<QueryPlaygroundResponse>, Error> {
+        request: QueryWorkspaceRequest,
+    ) -> Result<Response<QueryWorkspaceResponse>, Error> {
         self.service
-            .query_playground(&authenticated_identity(&call)?, request)
+            .query_workspace(&authenticated_identity(&call)?, request)
             .await
             .map(Response::new)
     }
 
-    async fn create_playground(
+    async fn create_workspace(
         &self,
         call: Call,
-        request: CreatePlaygroundRequest,
-    ) -> Result<Response<CreatePlaygroundResponse>, Error> {
+        request: CreateWorkspaceRequest,
+    ) -> Result<Response<CreateWorkspaceResponse>, Error> {
         self.service
-            .create_playground(&authenticated_identity(&call)?, request)
+            .create_workspace(&authenticated_identity(&call)?, request)
             .await
             .map(Response::new)
     }
 
-    async fn start_playground_precommit(
+    async fn start_workspace_precommit(
         &self,
         call: Call,
         request: StartPreCommitRequest,
     ) -> Result<Response<StartPreCommitResponse>, Error> {
         self.service
-            .start_playground_precommit(&authenticated_identity(&call)?, request)
+            .start_workspace_precommit(&authenticated_identity(&call)?, request)
             .await
             .map(Response::new)
     }
 
-    async fn query_playground_precommit(
+    async fn query_workspace_precommit(
         &self,
         call: Call,
         request: QueryPreCommitRequest,
     ) -> Result<Response<QueryPreCommitResponse>, Error> {
         self.service
-            .query_playground_precommit(&authenticated_identity(&call)?, request)
+            .query_workspace_precommit(&authenticated_identity(&call)?, request)
             .await
             .map(Response::new)
     }
 
-    async fn restart_playground_precommit(
+    async fn restart_workspace_precommit(
         &self,
         call: Call,
         request: RestartPreCommitRequest,
     ) -> Result<Response<RestartPreCommitResponse>, Error> {
         self.service
-            .restart_playground_precommit(&authenticated_identity(&call)?, request)
+            .restart_workspace_precommit(&authenticated_identity(&call)?, request)
             .await
             .map(Response::new)
     }
 
-    async fn cancel_playground_precommit(
+    async fn cancel_workspace_precommit(
         &self,
         call: Call,
         request: CancelPreCommitRequest,
     ) -> Result<Response<CancelPreCommitResponse>, Error> {
         self.service
-            .cancel_playground_precommit(&authenticated_identity(&call)?, request)
+            .cancel_workspace_precommit(&authenticated_identity(&call)?, request)
             .await
             .map(Response::new)
     }
 
-    async fn query_playground_file_list(
+    async fn query_workspace_file_list(
         &self,
         call: Call,
-        request: QueryPlaygroundFileListRequest,
-    ) -> Result<Response<QueryPlaygroundFileListResponse>, Error> {
+        request: QueryWorkspaceFileListRequest,
+    ) -> Result<Response<QueryWorkspaceFileListResponse>, Error> {
         self.service
-            .query_playground_file_list(&authenticated_identity(&call)?, request)
+            .query_workspace_file_list(&authenticated_identity(&call)?, request)
             .await
             .map(Response::new)
     }
 
-    async fn query_playground_change_list(
+    async fn query_workspace_change_list(
         &self,
         call: Call,
-        request: QueryPlaygroundChangeListRequest,
-    ) -> Result<Response<QueryPlaygroundChangeListResponse>, Error> {
+        request: QueryWorkspaceChangeListRequest,
+    ) -> Result<Response<QueryWorkspaceChangeListResponse>, Error> {
         self.service
-            .query_playground_change_list(&authenticated_identity(&call)?, request)
+            .query_workspace_change_list(&authenticated_identity(&call)?, request)
             .await
             .map(Response::new)
     }
 
-    async fn query_playground_file_metadata(
+    async fn query_workspace_file_metadata(
         &self,
         call: Call,
-        request: QueryPlaygroundFileMetadataRequest,
-    ) -> Result<Response<QueryPlaygroundFileMetadataResponse>, Error> {
+        request: QueryWorkspaceFileMetadataRequest,
+    ) -> Result<Response<QueryWorkspaceFileMetadataResponse>, Error> {
         self.service
-            .query_playground_file_metadata(&authenticated_identity(&call)?, request)
+            .query_workspace_file_metadata(&authenticated_identity(&call)?, request)
             .await
             .map(Response::new)
     }
 
-    async fn query_playground_dataset_profile(
+    async fn query_workspace_dataset_profile(
         &self,
         call: Call,
-        request: QueryPlaygroundDatasetProfileRequest,
-    ) -> Result<Response<QueryPlaygroundDatasetProfileResponse>, Error> {
+        request: QueryWorkspaceDatasetProfileRequest,
+    ) -> Result<Response<QueryWorkspaceDatasetProfileResponse>, Error> {
         self.service
-            .query_playground_dataset_profile(&authenticated_identity(&call)?, request)
+            .query_workspace_dataset_profile(&authenticated_identity(&call)?, request)
             .await
             .map(Response::new)
     }
 
-    async fn commit_playground(
+    async fn commit_workspace(
         &self,
         call: Call,
-        request: CommitPlaygroundRequest,
-    ) -> Result<Response<CommitPlaygroundResponse>, Error> {
+        request: CommitWorkspaceRequest,
+    ) -> Result<Response<CommitWorkspaceResponse>, Error> {
         self.service
-            .commit_playground(&authenticated_identity(&call)?, request)
+            .commit_workspace(&authenticated_identity(&call)?, request)
             .await
             .map(Response::new)
     }
@@ -1138,6 +1126,17 @@ impl S3Api for S3Controller {
     ) -> Result<Response<UpdateS3AccessPointResponse>, Error> {
         self.service
             .disable_s3_access_point(&authenticated_identity(&call)?, request)
+            .await
+            .map(Response::new)
+    }
+
+    async fn delete_access_point(
+        &self,
+        call: Call,
+        request: UpdateS3AccessPointRequest,
+    ) -> Result<Response<UpdateS3AccessPointResponse>, Error> {
+        self.service
+            .delete_s3_access_point(&authenticated_identity(&call)?, request)
             .await
             .map(Response::new)
     }

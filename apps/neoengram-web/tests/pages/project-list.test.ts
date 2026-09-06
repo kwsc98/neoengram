@@ -31,7 +31,7 @@ async function mountPage() {
     requestId: 'request-projects',
   });
   api.createProject.mockResolvedValue({
-    data: { project: { ...project, project_id: 'project-lab' }, replayed: false },
+    data: { project: { ...project, project_id: 'project-lab' }, request_replayed: false },
     requestId: 'request-create',
   });
   const pinia = createPinia();

@@ -5,18 +5,18 @@ use crate::{
     AssignWorkspaceMaterializationRequest, AssignmentTarget, CentralError, CentralErrorCode,
     CentralResult, Clock, ControlCatalogRepository, ControlPlane,
     CreateWorkspaceMaterializationRequest, ExpireAddJobRequest, IndexKey, IndexPublisher,
-    InitializeIndexSnapshotRequest, JobKey, JobOperation, JobRecord, JobRepository,
-    PlaygroundListRequest, PlaygroundRecord, PlaygroundState, PreCommitKey, PreCommitRecord,
-    PreCommitRepository, PreCommitState, ResumePublicationRequest, SnapshotDeliveryRecord,
-    SnapshotDeliverySpec, SnapshotDeliveryTarget, SnapshotState, TenantListRequest,
-    WorkspaceMaterializeSpec, WorkspaceMaterializeTarget,
+    InitializeIndexSnapshotRequest, JobKey, JobOperation, JobRecord, JobRepository, PreCommitKey,
+    PreCommitRecord, PreCommitRepository, PreCommitState, ResumePublicationRequest,
+    SnapshotDeliveryRecord, SnapshotDeliverySpec, SnapshotDeliveryTarget, SnapshotState,
+    TenantListRequest, WorkspaceListRequest, WorkspaceMaterializeSpec, WorkspaceMaterializeTarget,
+    WorkspaceRecord, WorkspaceState,
 };
 use neoengram_domain::core::{CommitId, IndexVersion};
 use neoengram_domain::protocol::{
     AddOperation, AgentId, AgentMountId, ArtifactPlacementId, AssignmentGeneration, AssignmentId,
     Extensions, JobId, JobState, MountGeneration, OwnerGeneration, PlacementGeneration,
     PrincipalId, PrincipalKind, PrincipalRef, SnapshotDeliveryAction, SnapshotDeliveryMode,
-    SnapshotDeliveryOperation, UnixMillis, WorkspaceMaterializeAssignment,
+    SnapshotDeliveryOperation, TaskId, UnixMillis, WorkspaceMaterializeAssignment,
     WorkspaceMaterializeOperation,
 };
 
@@ -82,7 +82,7 @@ impl JobCoordinator {
         })
     }
 
-    /// Rejects fabricated Playground scope and stale client Index defaults before Job creation.
+    /// Rejects fabricated Workspace scope and stale client Index defaults before Job creation.
     pub async fn validate_spec(&self, spec: &crate::AddJobSpec) -> CentralResult<()> {
         if self
             .jobs
@@ -106,28 +106,28 @@ impl JobCoordinator {
 
     /// Rejects a new Agent-backed operation before it creates a durable queued Job.
     pub async fn validate_live_storage(&self, spec: &crate::AddJobSpec) -> CentralResult<()> {
-        let playground = self
+        let workspace = self
             .catalog
-            .get_playground(
+            .get_workspace(
                 &spec.tenant_id,
                 &spec.project_id,
                 &spec.artifact_id,
-                &spec.playground_id,
+                &spec.workspace_id,
             )
             .await?
             .ok_or_else(|| {
                 CentralError::new(
                     CentralErrorCode::JobNotFound,
-                    "the requested Playground is not visible or does not exist",
+                    "the requested Workspace is not visible or does not exist",
                 )
                 .with_retryable(false)
             })?;
-        if !playground.lifecycle.is_active() {
+        if !workspace.lifecycle.is_active() {
             return Err(resource_lifecycle_fenced());
         }
         let Some(owner) = self
             .registry
-            .get_current_by_volume(&spec.tenant_id, &playground.storage_volume_id)
+            .get_current_by_volume(&spec.tenant_id, &workspace.storage_volume_id)
             .await?
         else {
             return Err(storage_volume_unavailable());
@@ -151,27 +151,27 @@ impl JobCoordinator {
         if job.operation == JobOperation::WorkspaceMaterialize {
             return self.schedule_workspace_materialization(job).await;
         }
-        let playground = self
+        let workspace = self
             .catalog
-            .get_playground(
+            .get_workspace(
                 &job.spec.tenant_id,
                 &job.spec.project_id,
                 &job.spec.artifact_id,
-                &job.spec.playground_id,
+                &job.spec.workspace_id,
             )
             .await?
             .ok_or_else(|| {
                 CentralError::new(
                     CentralErrorCode::JobNotFound,
-                    "the Job's Playground no longer exists",
+                    "the Job's Workspace no longer exists",
                 )
             })?;
-        if !playground.lifecycle.is_active() {
+        if !workspace.lifecycle.is_active() {
             return Ok(None);
         }
         let volume = self
             .catalog
-            .get_storage_volume(&job.spec.tenant_id, &playground.storage_volume_id)
+            .get_storage_volume(&job.spec.tenant_id, &workspace.storage_volume_id)
             .await?
             .ok_or_else(|| {
                 CentralError::new(
@@ -186,12 +186,12 @@ impl JobCoordinator {
         if !same_index_version(&current, &job.spec.expected_index_version) {
             return Err(CentralError::new(
                 CentralErrorCode::MetadataInvalid,
-                "the Job's expected IndexVersion no longer matches its Playground",
+                "the Job's expected IndexVersion no longer matches its Workspace",
             ));
         }
         let Some(owner) = self
             .registry
-            .get_current_by_volume(&job.spec.tenant_id, &playground.storage_volume_id)
+            .get_current_by_volume(&job.spec.tenant_id, &workspace.storage_volume_id)
             .await?
         else {
             return Ok(None);
@@ -214,7 +214,7 @@ impl JobCoordinator {
             assignment_generation: AssignmentGeneration::new(1),
             agent_id: instance.agent_id.clone(),
             edge_cluster_id: owner.enrollment.edge_cluster_id.clone(),
-            storage_volume_id: playground.storage_volume_id,
+            storage_volume_id: workspace.storage_volume_id,
             artifact_placement_id: deterministic_placement_id(job, &owner.mount.storage_volume_id)?,
             placement_generation: PlacementGeneration::new(1),
             agent_mount_id: owner.mount.agent_mount_id.clone(),
@@ -223,52 +223,50 @@ impl JobCoordinator {
             max_whole_file_bytes: volume.max_whole_file_bytes,
             lease: None,
         };
-        let result = self
-            .control
-            .assign_job(AssignJobRequest {
-                actor: job.spec.principal.clone(),
-                tenant_id: job.spec.tenant_id.clone(),
-                job_id: job.spec.job_id.clone(),
-                target,
-            })
-            .await?;
+        let result = Box::pin(self.control.assign_job(AssignJobRequest {
+            actor: job.spec.principal.clone(),
+            tenant_id: job.spec.tenant_id.clone(),
+            job_id: job.spec.job_id.clone(),
+            target,
+        }))
+        .await?;
         Ok(Some(result.job))
     }
 
-    /// Idempotently creates the durable materialization Job for one Creating Playground and
+    /// Idempotently creates the durable materialization Job for one Creating Workspace and
     /// performs its first owner-selection attempt.
     pub async fn ensure_workspace_materialization(
         &self,
-        playground: &PlaygroundRecord,
+        workspace: &WorkspaceRecord,
     ) -> CentralResult<JobRecord> {
-        if !playground.lifecycle.is_active() {
+        if !workspace.lifecycle.is_active() {
             return Err(resource_lifecycle_fenced());
         }
-        if playground.state != PlaygroundState::Creating {
+        if workspace.state != WorkspaceState::Creating {
             return Err(CentralError::new(
                 CentralErrorCode::InvalidState,
-                "only a Creating Playground can be materialized",
+                "only a Creating Workspace can be materialized",
             ));
         }
-        let job_id = deterministic_materialization_job_id(playground)?;
+        let job_id = deterministic_materialization_job_id(workspace)?;
         let relative_root = WorkspaceMaterializeAssignment::canonical_relative_root(
-            &playground.project_id,
-            &playground.artifact_id,
-            &playground.playground_id,
+            &workspace.project_id,
+            &workspace.artifact_id,
+            &workspace.workspace_id,
         )?;
-        if relative_root.as_str() != playground.relative_root {
+        if relative_root.as_str() != workspace.relative_root {
             return Err(CentralError::new(
                 CentralErrorCode::ProtocolInvalid,
-                "Playground relative_root differs from the canonical materialization path",
+                "Workspace relative_root differs from the canonical materialization path",
             ));
         }
         let index_key = IndexKey {
-            tenant_id: playground.tenant_id.clone(),
-            project_id: playground.project_id.clone(),
-            artifact_id: playground.artifact_id.clone(),
-            playground_id: playground.playground_id.clone(),
+            tenant_id: workspace.tenant_id.clone(),
+            project_id: workspace.project_id.clone(),
+            artifact_id: workspace.artifact_id.clone(),
+            workspace_id: workspace.workspace_id.clone(),
         };
-        let base_index_version = if let Some(base_commit_id) = playground.base_commit_id {
+        let base_index_version = if let Some(base_commit_id) = workspace.base_commit_id {
             let precommits = self.precommits.as_ref().ok_or_else(|| {
                 CentralError::new(
                     CentralErrorCode::InvalidState,
@@ -277,16 +275,16 @@ impl JobCoordinator {
             })?;
             let commit = precommits
                 .get_commit(
-                    &playground.tenant_id,
-                    &playground.project_id,
-                    &playground.artifact_id,
+                    &workspace.tenant_id,
+                    &workspace.project_id,
+                    &workspace.artifact_id,
                     CommitId::from_digest(base_commit_id),
                 )
                 .await?
                 .ok_or_else(|| {
                     CentralError::new(
                         CentralErrorCode::MetadataInvalid,
-                        "the Playground base Commit is missing from authority",
+                        "the Workspace base Commit is missing from authority",
                     )
                 })?;
             let initialized = self
@@ -302,7 +300,7 @@ impl JobCoordinator {
             let empty = IndexVersion::from_snapshot(0, &[]).map_err(|error| {
                 CentralError::new(
                     CentralErrorCode::Internal,
-                    format!("cannot construct the empty Playground Index: {error}"),
+                    format!("cannot construct the empty Workspace Index: {error}"),
                 )
             })?;
             self.indexes
@@ -315,11 +313,16 @@ impl JobCoordinator {
             None
         };
         let deadline_unix_ms = UnixMillis::new(
-            playground
+            workspace
                 .created_at_unix_ms
                 .get()
                 .saturating_add(WORKSPACE_MATERIALIZE_DEADLINE_MS),
         );
+        let operation_request_id = neoengram_domain::protocol::RequestId::new(format!(
+            "workspace-create-{}",
+            workspace.workspace_id
+        ))?;
+        let operation_task_id = task_id_for_request(&workspace.tenant_id, &operation_request_id)?;
         let principal = PrincipalRef {
             kind: PrincipalKind::System,
             id: PrincipalId::new("workspace-materializer")?,
@@ -328,13 +331,13 @@ impl JobCoordinator {
         let operation = WorkspaceMaterializeOperation {
             job_id: job_id.clone(),
             principal: principal.clone(),
-            tenant_id: playground.tenant_id.clone(),
-            project_id: playground.project_id.clone(),
-            artifact_id: playground.artifact_id.clone(),
-            playground_id: playground.playground_id.clone(),
-            storage_volume_id: playground.storage_volume_id.clone(),
+            tenant_id: workspace.tenant_id.clone(),
+            project_id: workspace.project_id.clone(),
+            artifact_id: workspace.artifact_id.clone(),
+            workspace_id: workspace.workspace_id.clone(),
+            storage_volume_id: workspace.storage_volume_id.clone(),
             relative_root: relative_root.clone(),
-            base_commit_id: playground.base_commit_id,
+            base_commit_id: workspace.base_commit_id,
             base_index_version: base_index_version.clone(),
             deadline_unix_ms,
             extensions: Extensions::new(),
@@ -346,16 +349,17 @@ impl JobCoordinator {
                 spec: WorkspaceMaterializeSpec {
                     job_id,
                     principal,
-                    tenant_id: playground.tenant_id.clone(),
-                    project_id: playground.project_id.clone(),
-                    artifact_id: playground.artifact_id.clone(),
-                    playground_id: playground.playground_id.clone(),
-                    storage_volume_id: playground.storage_volume_id.clone(),
+                    tenant_id: workspace.tenant_id.clone(),
+                    project_id: workspace.project_id.clone(),
+                    artifact_id: workspace.artifact_id.clone(),
+                    workspace_id: workspace.workspace_id.clone(),
+                    storage_volume_id: workspace.storage_volume_id.clone(),
                     relative_root,
-                    base_commit_id: playground.base_commit_id,
+                    base_commit_id: workspace.base_commit_id,
                     base_index_version,
                     request_digest,
                     deadline_unix_ms,
+                    operation_task_id: Some(operation_task_id),
                 },
             })
             .await?;
@@ -483,6 +487,8 @@ impl JobCoordinator {
             extensions: Extensions::new(),
         };
         let request_digest = operation.request_digest()?;
+        let operation_task_id =
+            task_id_for_request(&delivery.tenant_id, &delivery.create_request_id)?;
         let created = self
             .control
             .create_snapshot_delivery(crate::CreateSnapshotDeliveryRequest {
@@ -508,6 +514,7 @@ impl JobCoordinator {
                     delivery_generation: delivery.delivery_generation,
                     request_digest,
                     deadline_unix_ms,
+                    operation_task_id: Some(operation_task_id),
                 },
             })
             .await?;
@@ -604,7 +611,7 @@ impl JobCoordinator {
             .await?;
         }
         let created = self.control.create_precommit_add_job(spec).await?;
-        let job = match self.schedule(&created.job).await? {
+        let job = match Box::pin(self.schedule(&created.job)).await? {
             Some(assigned) => assigned,
             None => created.job,
         };
@@ -646,25 +653,25 @@ impl JobCoordinator {
                 "WorkspaceMaterialize Job lost its immutable spec",
             )
         })?;
-        let playground = self
+        let workspace = self
             .catalog
-            .get_playground(
+            .get_workspace(
                 &spec.tenant_id,
                 &spec.project_id,
                 &spec.artifact_id,
-                &spec.playground_id,
+                &spec.workspace_id,
             )
             .await?
             .ok_or_else(|| {
                 CentralError::new(
                     CentralErrorCode::JobNotFound,
-                    "materialization Playground no longer exists",
+                    "materialization Workspace no longer exists",
                 )
             })?;
-        if !playground.lifecycle.is_active() {
+        if !workspace.lifecycle.is_active() {
             return Ok(None);
         }
-        if playground.state != PlaygroundState::Creating {
+        if workspace.state != WorkspaceState::Creating {
             return Ok(None);
         }
         let Some(owner) = self
@@ -849,10 +856,10 @@ impl JobCoordinator {
         if limit == 0 {
             return Ok(CoordinatorRun::default());
         }
-        // A crash can occur after the catalog commits a Creating Playground but before its
+        // A crash can occur after the catalog commits a Creating Workspace but before its
         // deterministic materialization Job is inserted. Re-deriving the Job from catalog
         // identity closes that cross-SQLite window.
-        self.recover_creating_playgrounds(limit).await?;
+        self.recover_creating_workspaces(limit).await?;
         // The Pre-commit aggregate and its Add Job share authority storage but use separate ports.
         // Re-derive a missing deterministic Job after either write-side response is lost.
         self.recover_running_precommits(limit).await?;
@@ -1005,7 +1012,7 @@ impl JobCoordinator {
                     "committed Pre-commit lost its immutable Commit row",
                 )
             })?;
-        super::workspace_commit::publish_committed_playground_head(
+        super::workspace_commit::publish_committed_workspace_head(
             self.catalog.as_ref(),
             precommits,
             &commit,
@@ -1017,7 +1024,7 @@ impl JobCoordinator {
         Ok(())
     }
 
-    async fn recover_creating_playgrounds(&self, limit: usize) -> CentralResult<()> {
+    async fn recover_creating_workspaces(&self, limit: usize) -> CentralResult<()> {
         let mut remaining = limit;
         let mut tenant_cursor = None;
         while remaining != 0 {
@@ -1034,23 +1041,23 @@ impl JobCoordinator {
                 break;
             }
             for tenant in page.records {
-                let mut playground_cursor = None;
+                let mut workspace_cursor = None;
                 loop {
-                    let playgrounds = self
+                    let workspaces = self
                         .catalog
-                        .list_playgrounds(&PlaygroundListRequest {
+                        .list_workspaces(&WorkspaceListRequest {
                             tenant_id: tenant.tenant_id.clone(),
                             project_id: None,
                             artifact_id: None,
                             region: None,
-                            state: Some(PlaygroundState::Creating),
+                            state: Some(WorkspaceState::Creating),
                             query: None,
-                            after: playground_cursor.clone(),
+                            after: workspace_cursor.clone(),
                             limit: u16::try_from(remaining.min(100)).unwrap_or(100),
                         })
                         .await?;
-                    for playground in &playgrounds.records {
-                        if playground
+                    for workspace in &workspaces.records {
+                        if workspace
                             .created_at_unix_ms
                             .get()
                             .saturating_add(WORKSPACE_MATERIALIZE_DEADLINE_MS)
@@ -1058,13 +1065,13 @@ impl JobCoordinator {
                         {
                             let _ = self
                                 .catalog
-                                .transition_playground_state(
-                                    &playground.tenant_id,
-                                    &playground.project_id,
-                                    &playground.artifact_id,
-                                    &playground.playground_id,
-                                    PlaygroundState::Creating,
-                                    PlaygroundState::Abnormal,
+                                .transition_workspace_state(
+                                    &workspace.tenant_id,
+                                    &workspace.project_id,
+                                    &workspace.artifact_id,
+                                    &workspace.workspace_id,
+                                    WorkspaceState::Creating,
+                                    WorkspaceState::Abnormal,
                                     self.clock.now(),
                                 )
                                 .await?;
@@ -1074,14 +1081,14 @@ impl JobCoordinator {
                             }
                             continue;
                         }
-                        let _ = self.ensure_workspace_materialization(playground).await?;
+                        let _ = self.ensure_workspace_materialization(workspace).await?;
                         remaining = remaining.saturating_sub(1);
                         if remaining == 0 {
                             return Ok(());
                         }
                     }
-                    playground_cursor = playgrounds.next;
-                    if playground_cursor.is_none() {
+                    workspace_cursor = workspaces.next;
+                    if workspace_cursor.is_none() {
                         break;
                     }
                 }
@@ -1138,7 +1145,7 @@ impl JobCoordinator {
         }
         // SnapshotDelivery uses its own immutable Delivery spec and Agent report state. It is
         // intentionally excluded from the generic Add/PreCommit recovery path, which expects a
-        // Playground-backed Index and would otherwise recurse through the wrong synchronizer.
+        // Workspace-backed Index and would otherwise recurse through the wrong synchronizer.
         if job.operation == JobOperation::SnapshotDelivery {
             if job.state.is_terminal() {
                 return Ok(());
@@ -1267,7 +1274,7 @@ fn precommit_add_job_spec(precommit: &PreCommitRecord) -> CentralResult<AddJobSp
         tenant_id: precommit.tenant_id.clone(),
         project_id: precommit.project_id.clone(),
         artifact_id: precommit.artifact_id.clone(),
-        playground_id: precommit.playground_id.clone(),
+        workspace_id: precommit.workspace_id.clone(),
         expected_index_version: precommit.source_index_version.clone(),
         data_layout: precommit.data_layout,
         deadline_unix_ms,
@@ -1281,15 +1288,27 @@ fn precommit_add_job_spec(precommit: &PreCommitRecord) -> CentralResult<AddJobSp
         tenant_id: precommit.tenant_id.clone(),
         project_id: precommit.project_id.clone(),
         artifact_id: precommit.artifact_id.clone(),
-        playground_id: precommit.playground_id.clone(),
+        workspace_id: precommit.workspace_id.clone(),
         expected_index_version: precommit.source_index_version.clone(),
         data_layout: precommit.data_layout,
         request_digest: operation.request_digest()?,
         deadline_unix_ms,
         paths: Vec::new(),
         all: true,
+        operation_task_id: Some(task_id_for_request(
+            &precommit.tenant_id,
+            &precommit.precommit_request_id,
+        )?),
         extensions: Extensions::new(),
     })
+}
+
+fn task_id_for_request(
+    tenant_id: &neoengram_domain::protocol::TenantId,
+    request_id: &neoengram_domain::protocol::RequestId,
+) -> CentralResult<TaskId> {
+    let digest = blake3::hash(format!("operation-task\0{tenant_id}\0{request_id}").as_bytes());
+    TaskId::new(format!("task-{digest}")).map_err(Into::into)
 }
 
 pub(crate) async fn validate_job_spec(
@@ -1309,22 +1328,22 @@ pub(crate) async fn validate_job_spec(
         // Exact replay and JobId reuse are decided against the immutable persisted spec.
         return Ok(());
     }
-    let playground = catalog
-        .get_playground(
+    let workspace = catalog
+        .get_workspace(
             &spec.tenant_id,
             &spec.project_id,
             &spec.artifact_id,
-            &spec.playground_id,
+            &spec.workspace_id,
         )
         .await?
         .ok_or_else(|| {
             CentralError::new(
                 CentralErrorCode::JobNotFound,
-                "the requested Playground is not visible or does not exist",
+                "the requested Workspace is not visible or does not exist",
             )
             .with_retryable(false)
         })?;
-    if !playground.lifecycle.is_active() {
+    if !workspace.lifecycle.is_active() {
         return Err(resource_lifecycle_fenced());
     }
     let current = indexes
@@ -1332,13 +1351,13 @@ pub(crate) async fn validate_job_spec(
             tenant_id: spec.tenant_id.clone(),
             project_id: spec.project_id.clone(),
             artifact_id: spec.artifact_id.clone(),
-            playground_id: spec.playground_id.clone(),
+            workspace_id: spec.workspace_id.clone(),
         })
         .await?;
     if !same_index_version(&current, &spec.expected_index_version) {
         return Err(CentralError::new(
             CentralErrorCode::MetadataInvalid,
-            "expected_index_version differs from the authoritative Playground IndexVersion",
+            "expected_index_version differs from the authoritative Workspace IndexVersion",
         )
         .with_retryable(false));
     }
@@ -1355,7 +1374,7 @@ fn same_index_version(
 fn storage_volume_unavailable() -> CentralError {
     CentralError::new(
         CentralErrorCode::StorageVolumeNotReady,
-        "the Playground StorageVolume has no reachable Ready Agent owner",
+        "the Workspace StorageVolume has no reachable Ready Agent owner",
     )
     .with_retryable(true)
 }
@@ -1377,13 +1396,10 @@ fn deterministic_assignment_id(job: &JobRecord) -> CentralResult<AssignmentId> {
     .map_err(CentralError::from)
 }
 
-fn deterministic_materialization_job_id(playground: &PlaygroundRecord) -> CentralResult<JobId> {
+fn deterministic_materialization_job_id(workspace: &WorkspaceRecord) -> CentralResult<JobId> {
     let input = format!(
         "{}\0{}\0{}\0{}",
-        playground.tenant_id,
-        playground.project_id,
-        playground.artifact_id,
-        playground.playground_id
+        workspace.tenant_id, workspace.project_id, workspace.artifact_id, workspace.workspace_id
     );
     JobId::new(format!(
         "materialize-{}",
@@ -1473,17 +1489,27 @@ mod tests {
         AgentBootId, AgentEnrollmentId, AgentEnrollmentState, AgentEnrollmentTokenId, AgentId,
         AgentInstallationId, AgentMountId, AgentMountIdentityDigest, ArtifactId,
         AssignmentGeneration, AssignmentId, DecimalU64, DeliveryGeneration, EdgeClusterId,
-        Extensions, IndexDeltaRecord, JobAccepted, JobId, JobPrepared, JobProgress, ManifestRecord,
-        MetadataBatchDescriptor, MetadataBatchId, MetadataBatchPage, MetadataBatchRecords,
-        MetadataBatchScope, MetadataPublication, MountAccessMode, MountGeneration, OwnerGeneration,
-        PlacementGeneration, PlaygroundId, PrincipalId, PrincipalKind, PrincipalRef, ProjectId,
-        PvcIdentityDigest, RequestId, ResourceHealth, ResourceLifecycle, ResourceVersion,
-        SequenceNumber, SessionGeneration, SessionId, SnapshotDeliveryId, SnapshotDeliveryState,
-        SnapshotId, StorageVolumeId, TenantId, UnixMillis, VolumeMarkerId, WireChunkingStrategy,
-        CURRENT_WIRE_VERSION,
+        Extensions, Generation, IndexDeltaRecord, JobAccepted, JobId, JobPrepared, JobProgress,
+        ManifestRecord, MetadataBatchDescriptor, MetadataBatchId, MetadataBatchPage,
+        MetadataBatchRecords, MetadataBatchScope, MetadataPublication, MountAccessMode,
+        MountGeneration, OwnerGeneration, PlacementGeneration, PrincipalId, PrincipalKind,
+        PrincipalRef, ProjectId, PvcIdentityDigest, RequestId, ResourceHealth, ResourceLifecycle,
+        ResourceVersion, SequenceNumber, SessionGeneration, SessionId, SnapshotDeliveryId,
+        SnapshotDeliveryState, SnapshotId, StorageVolumeId, TaskExecutionFence, TaskId, TenantId,
+        UnixMillis, VolumeMarkerId, WireChunkingStrategy, WorkspaceId, CURRENT_WIRE_VERSION,
     };
 
     use super::*;
+
+    fn test_task_fence(job_id: &JobId, stage_key: &str) -> TaskExecutionFence {
+        TaskExecutionFence::new(
+            TaskId::new(format!("task-{job_id}")).unwrap(),
+            Generation::new(1),
+            stage_key,
+            Generation::new(1),
+            Generation::new(1),
+        )
+    }
 
     #[tokio::test]
     async fn empty_workspace_materialization_creates_a_real_empty_index_marker() {
@@ -1491,7 +1517,7 @@ mod tests {
         let tenant_id = TenantId::new("tenant-empty-materialize").unwrap();
         let project_id = ProjectId::new("project-empty-materialize").unwrap();
         let artifact_id = ArtifactId::new("artifact-empty-materialize").unwrap();
-        let playground_id = PlaygroundId::new("playground-empty-materialize").unwrap();
+        let workspace_id = WorkspaceId::new("workspace-empty-materialize").unwrap();
         let storage_volume_id = StorageVolumeId::new("volume-empty-materialize").unwrap();
         components
             .control_catalog
@@ -1552,26 +1578,26 @@ mod tests {
             })
             .await
             .unwrap();
-        let playground = PlaygroundRecord {
+        let workspace = WorkspaceRecord {
             tenant_id: tenant_id.clone(),
             project_id: project_id.clone(),
             artifact_id: artifact_id.clone(),
-            playground_id: playground_id.clone(),
+            workspace_id: workspace_id.clone(),
             storage_volume_id,
             region: "local".to_owned(),
-            display_name: "Playground".to_owned(),
+            display_name: "Workspace".to_owned(),
             base_commit_id: None,
             head_commit_id: None,
-            state: PlaygroundState::Creating,
+            state: WorkspaceState::Creating,
             resource_version: 1,
             lifecycle: ResourceLifecycle::active(),
-            relative_root: format!("playgrounds/{project_id}/{artifact_id}/{playground_id}"),
+            relative_root: format!("workspaces/{project_id}/{artifact_id}/{workspace_id}"),
             created_at_unix_ms: UnixMillis::new(100),
             updated_at_unix_ms: UnixMillis::new(100),
         };
         components
             .control_catalog
-            .insert_playground(playground.clone())
+            .insert_workspace(workspace.clone())
             .await
             .unwrap();
         let (_, coordinator) = test_coordinator(
@@ -1581,7 +1607,7 @@ mod tests {
         );
 
         let job = coordinator
-            .ensure_workspace_materialization(&playground)
+            .ensure_workspace_materialization(&workspace)
             .await
             .unwrap();
         let workspace_spec = job.workspace_spec.as_ref().unwrap();
@@ -1595,7 +1621,7 @@ mod tests {
                     tenant_id,
                     project_id,
                     artifact_id,
-                    playground_id,
+                    workspace_id,
                 },
                 version: IndexVersion::from_snapshot(1, &[]).unwrap().into(),
                 records: Vec::new(),
@@ -1663,6 +1689,7 @@ mod tests {
                 agent_id: agent_id.clone(),
                 report: AgentReport::Accepted(JobAccepted {
                     job_id: assignment.job_id.clone(),
+                    task_fence: assignment.task_fence.clone(),
                     assignment_id: assignment.assignment_id.clone(),
                     assignment_generation: assignment.assignment_generation,
                     accepted_at_unix_ms: UnixMillis::new(101),
@@ -1678,6 +1705,7 @@ mod tests {
                 agent_id: agent_id.clone(),
                 report: AgentReport::Progress(JobProgress {
                     job_id: assignment.job_id,
+                    task_fence: assignment.task_fence.clone(),
                     assignment_id: assignment.assignment_id,
                     assignment_generation: assignment.assignment_generation,
                     state: JobState::Succeeded,
@@ -1885,6 +1913,7 @@ mod tests {
                 agent_id: target.agent_id.clone(),
                 report: AgentReport::Accepted(JobAccepted {
                     job_id: spec.job_id.clone(),
+                    task_fence: test_task_fence(&spec.job_id, "scan_changes"),
                     assignment_id: target.assignment_id.clone(),
                     assignment_generation: target.assignment_generation,
                     accepted_at_unix_ms: UnixMillis::new(101),
@@ -1900,6 +1929,7 @@ mod tests {
                 agent_id: target.agent_id.clone(),
                 report: AgentReport::Progress(JobProgress {
                     job_id: spec.job_id.clone(),
+                    task_fence: test_task_fence(&spec.job_id, "scan_changes"),
                     assignment_id: target.assignment_id.clone(),
                     assignment_generation: target.assignment_generation,
                     state: JobState::Running,
@@ -2028,14 +2058,14 @@ mod tests {
         let tenant_id = TenantId::new("tenant-a").unwrap();
         let project_id = ProjectId::new("project-a").unwrap();
         let artifact_id = ArtifactId::new("artifact-a").unwrap();
-        let playground_id = PlaygroundId::new("playground-a").unwrap();
+        let workspace_id = WorkspaceId::new("workspace-a").unwrap();
         let expected_index_version = components
             .publisher
             .current_version(&IndexKey {
                 tenant_id: tenant_id.clone(),
                 project_id: project_id.clone(),
                 artifact_id: artifact_id.clone(),
-                playground_id: playground_id.clone(),
+                workspace_id: workspace_id.clone(),
             })
             .await
             .unwrap();
@@ -2050,13 +2080,14 @@ mod tests {
             tenant_id,
             project_id,
             artifact_id,
-            playground_id,
+            workspace_id,
             expected_index_version,
             data_layout: neoengram_domain::protocol::CommitDataLayout::FastCdc,
             request_digest: ContentDigest::from_bytes([0; 32]),
             deadline_unix_ms: UnixMillis::new(deadline_unix_ms),
             paths: vec![LogicalPath::parse("dataset/file.bin").unwrap()],
             all: false,
+            operation_task_id: None,
             extensions: Extensions::new(),
         };
         spec.request_digest = spec.computed_request_digest().unwrap();
@@ -2113,7 +2144,7 @@ mod tests {
             tenant_id: spec.tenant_id.clone(),
             project_id: spec.project_id.clone(),
             artifact_id: spec.artifact_id.clone(),
-            playground_id: spec.playground_id.clone(),
+            workspace_id: spec.workspace_id.clone(),
             job_id: spec.job_id.clone(),
             base_index_version: spec.expected_index_version.clone(),
             extensions: Extensions::new(),
@@ -2177,6 +2208,7 @@ mod tests {
             .unwrap();
         let prepared = JobPrepared::new(
             spec.job_id.clone(),
+            test_task_fence(&spec.job_id, "scan_changes"),
             target.assignment_id.clone(),
             target.assignment_generation,
             spec.expected_index_version.clone(),

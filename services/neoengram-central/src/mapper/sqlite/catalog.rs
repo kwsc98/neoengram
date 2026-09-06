@@ -5,36 +5,36 @@ use neoengram_domain::core::{ContentDigest, ObjectId};
 use neoengram_domain::protocol::{
     ArtifactId, DecimalU64, DeletionCompletion, DeletionId, DeletionMutation, DeletionMutationKind,
     DeletionOperation, DeletionOperationState, DeliveryGeneration, EdgeClusterId, HardlinkPolicy,
-    PlaygroundId, ProjectId, RequestId, ResourceLifecycle, ResourceLifecycleState, ResourceRef,
-    ResourceVersion, RetentionHold, RetentionHoldId, RetentionHoldState, S3AccessPointId,
-    S3CredentialId, SnapshotDeliveryId, SnapshotDeliveryMode, SnapshotDeliveryState, SnapshotId,
-    StorageVolumeId, TenantId, UnixMillis, DELETION_RECOVERY_WINDOW_MILLIS,
+    ProjectId, RequestId, ResourceLifecycle, ResourceLifecycleState, ResourceRef, ResourceVersion,
+    RetentionHold, RetentionHoldId, RetentionHoldState, S3AccessPointId, S3CredentialId,
+    SnapshotDeliveryId, SnapshotDeliveryMode, SnapshotDeliveryState, SnapshotId, StorageVolumeId,
+    TenantId, UnixMillis, WorkspaceId, DELETION_RECOVERY_WINDOW_MILLIS,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use sqlx::{sqlite::SqliteRow, QueryBuilder, Row, Sqlite, Transaction};
 
 use crate::{
-    AdvancePlaygroundCommitOutcome, AdvancePlaygroundCommitRequest, AgentRegistryRecord,
+    AdvanceWorkspaceCommitOutcome, AdvanceWorkspaceCommitRequest, AgentRegistryRecord,
     ArtifactHeadExpectation, ArtifactInitialization, ArtifactListCursor, ArtifactListPage,
     ArtifactListRequest, ArtifactRecord, CatalogInsertOutcome, CatalogNfsReference,
     CatalogPvcReference, CentralError, CentralErrorCode, CentralResult, ControlCatalogRepository,
     CreateDeletionRequest, CreateRetentionHoldRequest, DeletionImpactQuery, DeletionImpactRecord,
     DeletionListCursor, DeletionListPage, DeletionListRequest, DeletionTransitionRequest,
     DerivedVolumeState, LifecycleAssignmentInsertOutcome, LifecycleAssignmentOutboxRecord,
-    LifecycleEvidenceBatch, PlaygroundInsertRequest, PlaygroundListCursor, PlaygroundListPage,
-    PlaygroundListRequest, PlaygroundRecord, PlaygroundState, ProjectListCursor, ProjectListPage,
-    ProjectListRequest, ProjectRecord, ReleaseRetentionHoldRequest, RestoreDeletionRequest,
-    RetryDeletionRequest, S3AccessPointCreateResult, S3AccessPointInsertOutcome,
-    S3AccessPointListCursor, S3AccessPointListPage, S3AccessPointListRequest, S3AccessPointRecord,
-    S3AccessPointState, S3CredentialInsertOutcome, S3CredentialRecord, S3CredentialState,
-    S3MutationKind, S3MutationRecord, SnapshotDeliveryInsertOutcome, SnapshotDeliveryInsertRequest,
+    LifecycleEvidenceBatch, ProjectListCursor, ProjectListPage, ProjectListRequest, ProjectRecord,
+    ReleaseRetentionHoldRequest, RestoreDeletionRequest, RetryDeletionRequest,
+    S3AccessPointCreateResult, S3AccessPointInsertOutcome, S3AccessPointListCursor,
+    S3AccessPointListPage, S3AccessPointListRequest, S3AccessPointRecord, S3AccessPointState,
+    S3CredentialInsertOutcome, S3CredentialRecord, S3CredentialState, S3MutationKind,
+    S3MutationRecord, SnapshotDeliveryInsertOutcome, SnapshotDeliveryInsertRequest,
     SnapshotDeliveryListRequest, SnapshotDeliveryMutationKind, SnapshotDeliveryMutationRecord,
     SnapshotDeliveryMutationRequest, SnapshotDeliveryRecord, SnapshotDeliveryRetentionRoot,
     SnapshotListCursor, SnapshotListPage, SnapshotListRequest, SnapshotRecord, SnapshotState,
     SnapshotWithDeliveryInsertRequest, SnapshotWithDeliveryInsertResult, StorageAccessMode,
     StorageBackendType, StorageEnrollmentAccessMode, StorageVolumeListCursor,
     StorageVolumeListPage, StorageVolumeListRequest, StorageVolumeRecord, StorageVolumeState,
-    TenantListCursor, TenantListPage, TenantListRequest, TenantRecord,
+    TenantListCursor, TenantListPage, TenantListRequest, TenantRecord, WorkspaceInsertRequest,
+    WorkspaceListCursor, WorkspaceListPage, WorkspaceListRequest, WorkspaceRecord, WorkspaceState,
 };
 
 use super::agent_registry::SqliteAgentRegistryStore;
@@ -42,7 +42,9 @@ use super::agent_registry::SqliteAgentRegistryStore;
 const TENANT_COLUMNS: &str =
     "tenant_id, display_name, description, resource_version, created_at_unix_ms, updated_at_unix_ms";
 const PROJECT_COLUMNS: &str =
-    "tenant_id, project_id, display_name, description, resource_version, created_at_unix_ms, updated_at_unix_ms";
+    "tenant_id, project_id, display_name, description, resource_version, \
+    lifecycle_state, lifecycle_generation, active_deletion_id, delete_requested_at_unix_ms, \
+    purge_after_unix_ms, deleted_at_unix_ms, created_at_unix_ms, updated_at_unix_ms";
 const ARTIFACT_COLUMNS: &str = "tenant_id, project_id, artifact_id, display_name, description, \
     initialization_mode, source_project_id, source_artifact_id, source_commit_digest, \
     head_commit_digest, resource_version, lifecycle_state, lifecycle_generation, \
@@ -55,7 +57,7 @@ const VOLUME_COLUMNS: &str =
     resource_version, lifecycle_state, lifecycle_generation, active_deletion_id, \
     delete_requested_at_unix_ms, purge_after_unix_ms, deleted_at_unix_ms, created_at_unix_ms, \
     updated_at_unix_ms";
-const PLAYGROUND_COLUMNS: &str = "tenant_id, project_id, artifact_id, playground_id, \
+const WORKSPACE_COLUMNS: &str = "tenant_id, project_id, artifact_id, workspace_id, \
     storage_volume_id, region, display_name, base_commit_digest, head_commit_digest, \
     state, relative_root, resource_version, lifecycle_state, lifecycle_generation, \
     active_deletion_id, delete_requested_at_unix_ms, purge_after_unix_ms, deleted_at_unix_ms, \
@@ -214,6 +216,7 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
             "SELECT {PROJECT_COLUMNS} FROM project_catalog_records WHERE tenant_id = "
         ));
         query.push_bind(request.tenant_id.as_str());
+        query.push(" AND lifecycle_state = 'active'");
         if let Some(search) = &request.query {
             let pattern = format!("%{}%", escape_like(&search.to_lowercase()));
             query
@@ -263,14 +266,30 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
         }
         let result = sqlx::query(
             "INSERT INTO project_catalog_records \
-             (tenant_id, project_id, display_name, description, resource_version, created_at_unix_ms, updated_at_unix_ms) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             (tenant_id, project_id, display_name, description, resource_version, lifecycle_state, \
+              lifecycle_generation, active_deletion_id, delete_requested_at_unix_ms, \
+              purge_after_unix_ms, deleted_at_unix_ms, created_at_unix_ms, updated_at_unix_ms) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(record.tenant_id.as_str())
         .bind(record.project_id.as_str())
         .bind(&record.display_name)
         .bind(&record.description)
         .bind(record.resource_version.to_string())
+        .bind(resource_lifecycle_state_name(record.lifecycle.state))
+        .bind(record.lifecycle.generation.to_string())
+        .bind(
+            record
+                .lifecycle
+                .active_deletion_id
+                .as_ref()
+                .map(ToString::to_string),
+        )
+        .bind(optional_as_i64(
+            record.lifecycle.delete_requested_at_unix_ms,
+        )?)
+        .bind(optional_as_i64(record.lifecycle.purge_after_unix_ms)?)
+        .bind(optional_as_i64(record.lifecycle.deleted_at_unix_ms)?)
         .bind(as_i64(record.created_at_unix_ms)?)
         .bind(as_i64(record.updated_at_unix_ms)?)
         .execute(&self.pool)
@@ -699,60 +718,60 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
         }
     }
 
-    async fn get_playground(
+    async fn get_workspace(
         &self,
         tenant_id: &TenantId,
         project_id: &ProjectId,
         artifact_id: &ArtifactId,
-        playground_id: &PlaygroundId,
-    ) -> CentralResult<Option<PlaygroundRecord>> {
+        workspace_id: &WorkspaceId,
+    ) -> CentralResult<Option<WorkspaceRecord>> {
         let sql = format!(
-            "SELECT {PLAYGROUND_COLUMNS} FROM playground_catalog_records \
-             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND playground_id = ? \
+            "SELECT {WORKSPACE_COLUMNS} FROM workspace_catalog_records \
+             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND workspace_id = ? \
                AND lifecycle_state = 'active'"
         );
         sqlx::query(&sql)
             .bind(tenant_id.as_str())
             .bind(project_id.as_str())
             .bind(artifact_id.as_str())
-            .bind(playground_id.as_str())
+            .bind(workspace_id.as_str())
             .fetch_optional(&self.pool)
             .await
             .map_err(storage_error)?
-            .map(decode_playground)
+            .map(decode_workspace)
             .transpose()
     }
 
-    async fn get_playground_for_lifecycle(
+    async fn get_workspace_for_lifecycle(
         &self,
         tenant_id: &TenantId,
         project_id: &ProjectId,
         artifact_id: &ArtifactId,
-        playground_id: &PlaygroundId,
-    ) -> CentralResult<Option<PlaygroundRecord>> {
+        workspace_id: &WorkspaceId,
+    ) -> CentralResult<Option<WorkspaceRecord>> {
         let sql = format!(
-            "SELECT {PLAYGROUND_COLUMNS} FROM playground_catalog_records \
-             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND playground_id = ?"
+            "SELECT {WORKSPACE_COLUMNS} FROM workspace_catalog_records \
+             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND workspace_id = ?"
         );
         sqlx::query(&sql)
             .bind(tenant_id.as_str())
             .bind(project_id.as_str())
             .bind(artifact_id.as_str())
-            .bind(playground_id.as_str())
+            .bind(workspace_id.as_str())
             .fetch_optional(&self.pool)
             .await
             .map_err(storage_error)?
-            .map(decode_playground)
+            .map(decode_workspace)
             .transpose()
     }
 
-    async fn list_playgrounds(
+    async fn list_workspaces(
         &self,
-        request: &PlaygroundListRequest,
-    ) -> CentralResult<PlaygroundListPage> {
+        request: &WorkspaceListRequest,
+    ) -> CentralResult<WorkspaceListPage> {
         validate_limit(request.limit)?;
         let mut query = QueryBuilder::<Sqlite>::new(format!(
-            "SELECT {PLAYGROUND_COLUMNS} FROM playground_catalog_records WHERE tenant_id = "
+            "SELECT {WORKSPACE_COLUMNS} FROM workspace_catalog_records WHERE tenant_id = "
         ));
         query.push_bind(request.tenant_id.as_str());
         query.push(" AND lifecycle_state = 'active'");
@@ -772,12 +791,12 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
         if let Some(state) = request.state {
             query
                 .push(" AND state = ")
-                .push_bind(playground_state_name(state));
+                .push_bind(workspace_state_name(state));
         }
         if let Some(search) = &request.query {
             let pattern = format!("%{}%", escape_like(&search.to_lowercase()));
             query
-                .push(" AND (LOWER(playground_id) LIKE ")
+                .push(" AND (LOWER(workspace_id) LIKE ")
                 .push_bind(pattern.clone())
                 .push(" ESCAPE '\\' OR LOWER(display_name) LIKE ")
                 .push_bind(pattern)
@@ -798,13 +817,13 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
                 .push_bind(after.artifact_id.as_str())
                 .push(" OR (artifact_id = ")
                 .push_bind(after.artifact_id.as_str())
-                .push(" AND playground_id > ")
-                .push_bind(after.playground_id.as_str())
+                .push(" AND workspace_id > ")
+                .push_bind(after.workspace_id.as_str())
                 .push("))))))");
         }
         query
             .push(
-                " ORDER BY created_at_unix_ms DESC, project_id ASC, artifact_id ASC, playground_id ASC LIMIT ",
+                " ORDER BY created_at_unix_ms DESC, project_id ASC, artifact_id ASC, workspace_id ASC LIMIT ",
             )
             .push_bind(i64::from(request.limit) + 1);
         let rows = query
@@ -812,38 +831,38 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
             .fetch_all(&self.pool)
             .await
             .map_err(storage_error)?;
-        playground_page(rows, request.limit)
+        workspace_page(rows, request.limit)
     }
 
-    async fn insert_playground_fenced(
+    async fn insert_workspace_fenced(
         &self,
-        request: PlaygroundInsertRequest,
-    ) -> CentralResult<CatalogInsertOutcome<PlaygroundRecord>> {
-        let PlaygroundInsertRequest {
+        request: WorkspaceInsertRequest,
+    ) -> CentralResult<CatalogInsertOutcome<WorkspaceRecord>> {
+        let WorkspaceInsertRequest {
             record,
             artifact_head,
         } = request;
-        validate_new_resource(record.resource_version, &record.lifecycle, "Playground")?;
+        validate_new_resource(record.resource_version, &record.lifecycle, "Workspace")?;
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
-        let playground_sql = format!(
-            "SELECT {PLAYGROUND_COLUMNS} FROM playground_catalog_records \
-             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND playground_id = ?"
+        let workspace_sql = format!(
+            "SELECT {WORKSPACE_COLUMNS} FROM workspace_catalog_records \
+             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND workspace_id = ?"
         );
-        let existing = sqlx::query(&playground_sql)
+        let existing = sqlx::query(&workspace_sql)
             .bind(record.tenant_id.as_str())
             .bind(record.project_id.as_str())
             .bind(record.artifact_id.as_str())
-            .bind(record.playground_id.as_str())
+            .bind(record.workspace_id.as_str())
             .fetch_optional(&mut *transaction)
             .await
             .map_err(storage_error)?
-            .map(decode_playground)
+            .map(decode_workspace)
             .transpose()?;
         if let Some(existing) = existing {
-            require_active(&existing.lifecycle, "Playground")?;
-            if !playground_create_matches_insert(&existing, &record, &artifact_head) {
+            require_active(&existing.lifecycle, "Workspace")?;
+            if !workspace_create_matches_insert(&existing, &record, &artifact_head) {
                 return Err(id_reused(
-                    "Playground ID is already bound to another create request",
+                    "Workspace ID is already bound to another create request",
                 ));
             }
             transaction.commit().await.map_err(storage_error)?;
@@ -865,21 +884,21 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
             .ok_or_else(|| {
                 catalog_parent_error(
                     CentralErrorCode::ArtifactNotFound,
-                    "Playground Artifact does not exist",
+                    "Workspace Artifact does not exist",
                 )
             })?;
-        require_active(&artifact.lifecycle, "Playground Artifact")?;
+        require_active(&artifact.lifecycle, "Workspace Artifact")?;
         if record.base_commit_id != record.head_commit_id {
             return Err(catalog_parent_error(
                 CentralErrorCode::ArtifactHeadMismatch,
-                "Playground base Commit must match its initial head Commit",
+                "Workspace base Commit must match its initial head Commit",
             ));
         }
         if let ArtifactHeadExpectation::Exact(expected) = artifact_head {
             if record.base_commit_id != expected {
                 return Err(CentralError::new(
                     CentralErrorCode::ProtocolInvalid,
-                    "fenced Playground base Commit does not match the observed Artifact Head",
+                    "fenced Workspace base Commit does not match the observed Artifact Head",
                 )
                 .with_retryable(false));
             }
@@ -902,25 +921,25 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
             .ok_or_else(|| {
                 catalog_parent_error(
                     CentralErrorCode::StorageVolumeNotFound,
-                    "Playground StorageVolume does not exist",
+                    "Workspace StorageVolume does not exist",
                 )
             })?;
-        require_active(&volume.lifecycle, "Playground StorageVolume")?;
+        require_active(&volume.lifecycle, "Workspace StorageVolume")?;
         if volume.state != StorageVolumeState::Ready {
             return Err(catalog_parent_error(
                 CentralErrorCode::StorageVolumeNotReady,
-                "Playground StorageVolume is not ready",
+                "Workspace StorageVolume is not ready",
             ));
         }
         if record.region != volume.region {
             return Err(catalog_parent_error(
                 CentralErrorCode::StorageVolumeRegionMismatch,
-                "Playground region must match the StorageVolume region",
+                "Workspace region must match the StorageVolume region",
             ));
         }
         let result = sqlx::query(
-            "INSERT INTO playground_catalog_records \
-             (tenant_id, project_id, artifact_id, playground_id, storage_volume_id, region, \
+            "INSERT INTO workspace_catalog_records \
+             (tenant_id, project_id, artifact_id, workspace_id, storage_volume_id, region, \
               display_name, base_commit_digest, head_commit_digest, \
               state, relative_root, resource_version, lifecycle_state, lifecycle_generation, \
               active_deletion_id, delete_requested_at_unix_ms, purge_after_unix_ms, \
@@ -930,7 +949,7 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
         .bind(record.tenant_id.as_str())
         .bind(record.project_id.as_str())
         .bind(record.artifact_id.as_str())
-        .bind(record.playground_id.as_str())
+        .bind(record.workspace_id.as_str())
         .bind(record.storage_volume_id.as_str())
         .bind(&record.region)
         .bind(&record.display_name)
@@ -944,7 +963,7 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
                 .head_commit_id
                 .map(|digest| digest.as_bytes().to_vec()),
         )
-        .bind(playground_state_name(record.state))
+        .bind(workspace_state_name(record.state))
         .bind(&record.relative_root)
         .bind(record.resource_version.to_string())
         .bind(resource_lifecycle_state_name(record.lifecycle.state))
@@ -971,25 +990,25 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
                 Ok(CatalogInsertOutcome::Inserted(record))
             }
             Err(error) if is_unique(&error) => {
-                let existing = sqlx::query(&playground_sql)
+                let existing = sqlx::query(&workspace_sql)
                     .bind(record.tenant_id.as_str())
                     .bind(record.project_id.as_str())
                     .bind(record.artifact_id.as_str())
-                    .bind(record.playground_id.as_str())
+                    .bind(record.workspace_id.as_str())
                     .fetch_optional(&mut *transaction)
                     .await
                     .map_err(storage_error)?
-                    .map(decode_playground)
+                    .map(decode_workspace)
                     .transpose()?
                     .ok_or_else(|| {
-                        storage_error("Playground uniqueness conflict could not be resolved")
+                        storage_error("Workspace uniqueness conflict could not be resolved")
                     })?;
-                if playground_create_matches_insert(&existing, &record, &artifact_head) {
+                if workspace_create_matches_insert(&existing, &record, &artifact_head) {
                     transaction.commit().await.map_err(storage_error)?;
                     Ok(CatalogInsertOutcome::Existing(existing))
                 } else {
                     Err(id_reused(
-                        "Playground ID is already bound to another create request",
+                        "Workspace ID is already bound to another create request",
                     ))
                 }
             }
@@ -997,60 +1016,60 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
         }
     }
 
-    async fn transition_playground_state(
+    async fn transition_workspace_state(
         &self,
         tenant_id: &TenantId,
         project_id: &ProjectId,
         artifact_id: &ArtifactId,
-        playground_id: &PlaygroundId,
-        expected: PlaygroundState,
-        next: PlaygroundState,
+        workspace_id: &WorkspaceId,
+        expected: WorkspaceState,
+        next: WorkspaceState,
         updated_at_unix_ms: UnixMillis,
-    ) -> CentralResult<PlaygroundRecord> {
+    ) -> CentralResult<WorkspaceRecord> {
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         let update = sqlx::query(
-            "UPDATE playground_catalog_records SET state = ?, updated_at_unix_ms = ? \
-             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND playground_id = ? \
+            "UPDATE workspace_catalog_records SET state = ?, updated_at_unix_ms = ? \
+             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND workspace_id = ? \
                AND state = ?",
         )
-        .bind(playground_state_name(next))
+        .bind(workspace_state_name(next))
         .bind(as_i64(updated_at_unix_ms)?)
         .bind(tenant_id.as_str())
         .bind(project_id.as_str())
         .bind(artifact_id.as_str())
-        .bind(playground_id.as_str())
-        .bind(playground_state_name(expected))
+        .bind(workspace_id.as_str())
+        .bind(workspace_state_name(expected))
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;
 
         let select = format!(
-            "SELECT {PLAYGROUND_COLUMNS} FROM playground_catalog_records \
-             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND playground_id = ?"
+            "SELECT {WORKSPACE_COLUMNS} FROM workspace_catalog_records \
+             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND workspace_id = ?"
         );
         let record = sqlx::query(&select)
             .bind(tenant_id.as_str())
             .bind(project_id.as_str())
             .bind(artifact_id.as_str())
-            .bind(playground_id.as_str())
+            .bind(workspace_id.as_str())
             .fetch_optional(&mut *transaction)
             .await
             .map_err(storage_error)?
-            .map(decode_playground)
+            .map(decode_workspace)
             .transpose()?
             .ok_or_else(|| {
                 CentralError::new(
                     CentralErrorCode::ArtifactNotFound,
-                    "Playground does not exist",
+                    "Workspace does not exist",
                 )
                 .with_retryable(false)
             })?;
-        require_active(&record.lifecycle, "Playground")?;
+        require_active(&record.lifecycle, "Workspace")?;
         if update.rows_affected() == 0 && record.state != next {
             return Err(CentralError::new(
                 CentralErrorCode::ConcurrentUpdate,
                 format!(
-                    "Playground is in {:?}, expected {:?} for state transition",
+                    "Workspace is in {:?}, expected {:?} for state transition",
                     record.state, expected
                 ),
             ));
@@ -1059,10 +1078,10 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
         Ok(record)
     }
 
-    async fn advance_playground_commit(
+    async fn advance_workspace_commit(
         &self,
-        request: AdvancePlaygroundCommitRequest,
-    ) -> CentralResult<AdvancePlaygroundCommitOutcome> {
+        request: AdvanceWorkspaceCommitRequest,
+    ) -> CentralResult<AdvanceWorkspaceCommitOutcome> {
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         let artifact_sql = format!(
             "SELECT {ARTIFACT_COLUMNS} FROM artifact_catalog_records \
@@ -1083,48 +1102,48 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
                     "Commit Artifact does not exist",
                 )
             })?;
-        let playground_sql = format!(
-            "SELECT {PLAYGROUND_COLUMNS} FROM playground_catalog_records \
-             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND playground_id = ?"
+        let workspace_sql = format!(
+            "SELECT {WORKSPACE_COLUMNS} FROM workspace_catalog_records \
+             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND workspace_id = ?"
         );
-        let mut playground = sqlx::query(&playground_sql)
+        let mut workspace = sqlx::query(&workspace_sql)
             .bind(request.tenant_id.as_str())
             .bind(request.project_id.as_str())
             .bind(request.artifact_id.as_str())
-            .bind(request.playground_id.as_str())
+            .bind(request.workspace_id.as_str())
             .fetch_optional(&mut *transaction)
             .await
             .map_err(storage_error)?
-            .map(decode_playground)
+            .map(decode_workspace)
             .transpose()?
             .ok_or_else(|| {
                 catalog_parent_error(
                     CentralErrorCode::ArtifactNotFound,
-                    "Commit Playground does not exist",
+                    "Commit Workspace does not exist",
                 )
             })?;
         require_active(&artifact.lifecycle, "Commit Artifact")?;
-        require_active(&playground.lifecycle, "Commit Playground")?;
-        // The Playground Head is the branch-local CAS fence. Artifact Head is only a mutable
-        // convenience pointer and may have advanced through another Playground branch.
-        if playground.head_commit_id == Some(request.commit_id) {
+        require_active(&workspace.lifecycle, "Commit Workspace")?;
+        // The Workspace Head is the branch-local CAS fence. Artifact Head is only a mutable
+        // convenience pointer and may have advanced through another Workspace branch.
+        if workspace.head_commit_id == Some(request.commit_id) {
             transaction.commit().await.map_err(storage_error)?;
-            return Ok(AdvancePlaygroundCommitOutcome {
+            return Ok(AdvanceWorkspaceCommitOutcome {
                 artifact,
-                playground,
+                workspace,
                 replayed: true,
             });
         }
-        if playground.head_commit_id != request.expected_head_commit_id {
+        if workspace.head_commit_id != request.expected_head_commit_id {
             return Err(catalog_parent_error(
                 CentralErrorCode::ArtifactHeadMismatch,
-                "Playground Head changed after Pre-commit",
+                "Workspace Head changed after Pre-commit",
             ));
         }
-        if playground.state != PlaygroundState::Ready {
+        if workspace.state != WorkspaceState::Ready {
             return Err(catalog_parent_error(
                 CentralErrorCode::InvalidState,
-                "only a Ready Playground can publish a Commit",
+                "only a Ready Workspace can publish a Commit",
             ));
         }
         let next_resource_version = artifact.resource_version.checked_add(1).ok_or_else(|| {
@@ -1157,10 +1176,10 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
                 "Artifact Head changed during Commit publication",
             ));
         }
-        let playground_update = sqlx::query(
-            "UPDATE playground_catalog_records \
+        let workspace_update = sqlx::query(
+            "UPDATE workspace_catalog_records \
              SET head_commit_digest = ?, updated_at_unix_ms = ? \
-             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND playground_id = ? \
+             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND workspace_id = ? \
                AND ((head_commit_digest IS NULL AND ? IS NULL) OR head_commit_digest = ?)",
         )
         .bind(&commit_digest)
@@ -1168,27 +1187,27 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
         .bind(request.tenant_id.as_str())
         .bind(request.project_id.as_str())
         .bind(request.artifact_id.as_str())
-        .bind(request.playground_id.as_str())
+        .bind(request.workspace_id.as_str())
         .bind(expected_digest.clone())
         .bind(expected_digest)
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;
-        if playground_update.rows_affected() != 1 {
+        if workspace_update.rows_affected() != 1 {
             return Err(catalog_parent_error(
                 CentralErrorCode::ArtifactHeadMismatch,
-                "Playground Head changed during Commit publication",
+                "Workspace Head changed during Commit publication",
             ));
         }
         artifact.head_commit_id = Some(request.commit_id);
         artifact.resource_version = next_resource_version;
         artifact.updated_at_unix_ms = request.updated_at_unix_ms;
-        playground.head_commit_id = Some(request.commit_id);
-        playground.updated_at_unix_ms = request.updated_at_unix_ms;
+        workspace.head_commit_id = Some(request.commit_id);
+        workspace.updated_at_unix_ms = request.updated_at_unix_ms;
         transaction.commit().await.map_err(storage_error)?;
-        Ok(AdvancePlaygroundCommitOutcome {
+        Ok(AdvanceWorkspaceCommitOutcome {
             artifact,
-            playground,
+            workspace,
             replayed: false,
         })
     }
@@ -2542,6 +2561,11 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
         let expected_operation = match state {
             S3AccessPointState::Active => S3MutationKind::AccessPointEnable,
             S3AccessPointState::Disabled => S3MutationKind::AccessPointDisable,
+            S3AccessPointState::Deleted => {
+                return Err(id_reused(
+                    "deleted state requires the Access Point delete operation",
+                ));
+            }
         };
         if mutation.operation != expected_operation {
             return Err(id_reused("invalid S3 Access Point state mutation binding"));
@@ -2570,6 +2594,10 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
                         "S3 Access Point does not exist",
                     )
                 })?;
+        if state == S3AccessPointState::Active && access_point.state == S3AccessPointState::Deleted
+        {
+            return Err(id_reused("deleted S3 Access Point cannot be enabled"));
+        }
         if state == S3AccessPointState::Active {
             require_active_s3_snapshot(&mut transaction, &access_point).await?;
         }
@@ -2616,6 +2644,73 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
             .await
             .map_err(storage_error)?;
         }
+        insert_s3_mutation_row(&mut transaction, &mutation).await?;
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(CatalogInsertOutcome::Inserted(access_point))
+    }
+
+    async fn delete_s3_access_point_idempotent(
+        &self,
+        mutation: S3MutationRecord,
+        access_point_id: &S3AccessPointId,
+        updated_at_unix_ms: UnixMillis,
+    ) -> CentralResult<CatalogInsertOutcome<S3AccessPointRecord>> {
+        if mutation.operation != S3MutationKind::AccessPointDelete {
+            return Err(id_reused("invalid S3 Access Point delete mutation binding"));
+        }
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        if let Some(existing) =
+            load_s3_mutation(&mut transaction, &mutation.tenant_id, &mutation.request_id).await?
+        {
+            ensure_same_s3_mutation(&existing, &mutation)?;
+            let current =
+                load_s3_access_point(&mut transaction, &mutation.tenant_id, access_point_id)
+                    .await?
+                    .ok_or_else(|| corruption("S3 mutation references a missing Access Point"))?;
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(CatalogInsertOutcome::Existing(current));
+        }
+        let mut access_point =
+            load_s3_access_point(&mut transaction, &mutation.tenant_id, access_point_id)
+                .await?
+                .ok_or_else(|| {
+                    catalog_parent_error(
+                        CentralErrorCode::ArtifactNotFound,
+                        "S3 Access Point does not exist",
+                    )
+                })?;
+        if access_point.state != S3AccessPointState::Deleted {
+            access_point.policy_generation = access_point
+                .policy_generation
+                .checked_add(1)
+                .ok_or_else(|| id_reused("S3 policy generation exhausted"))?;
+            access_point.state = S3AccessPointState::Deleted;
+            access_point.updated_at_unix_ms = updated_at_unix_ms;
+            sqlx::query(
+                "UPDATE s3_access_point_records SET state = 'deleted', policy_generation = ?, \
+                 updated_at_unix_ms = ? WHERE tenant_id = ? AND access_point_id = ?",
+            )
+            .bind(i64::try_from(access_point.policy_generation).map_err(|_| {
+                CentralError::new(
+                    CentralErrorCode::ProtocolInvalid,
+                    "S3 policy generation is too large",
+                )
+            })?)
+            .bind(as_i64(updated_at_unix_ms)?)
+            .bind(mutation.tenant_id.as_str())
+            .bind(access_point_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(storage_error)?;
+        }
+        sqlx::query(
+            "UPDATE s3_credential_records SET state = 'revoked', encrypted_secret = X'00' \
+             WHERE access_point_id = ? AND state = 'active'",
+        )
+        .bind(access_point_id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
         insert_s3_mutation_row(&mut transaction, &mutation).await?;
         transaction.commit().await.map_err(storage_error)?;
         Ok(CatalogInsertOutcome::Inserted(access_point))
@@ -3001,13 +3096,14 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
         request: DeletionImpactQuery,
     ) -> CentralResult<DeletionImpactRecord> {
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
-        let (artifacts, volumes, playgrounds, snapshots, access_points, credentials) =
+        let (projects, artifacts, volumes, workspaces, snapshots, access_points, credentials) =
             load_lifecycle_catalog(&mut transaction, &request.tenant_id).await?;
         let impact = crate::catalog_memory::build_deletion_impact(
             &request,
+            &projects,
             &artifacts,
             &volumes,
-            &playgrounds,
+            &workspaces,
             &snapshots,
             &access_points,
             &credentials,
@@ -3444,9 +3540,10 @@ impl ControlCatalogRepository for SqliteAgentRegistryStore {
 }
 
 type LifecycleCatalogMaps = (
+    BTreeMap<(TenantId, ProjectId), ProjectRecord>,
     BTreeMap<(TenantId, ArtifactId), ArtifactRecord>,
     BTreeMap<(TenantId, StorageVolumeId), StorageVolumeRecord>,
-    BTreeMap<(TenantId, ProjectId, ArtifactId, PlaygroundId), PlaygroundRecord>,
+    BTreeMap<(TenantId, ProjectId, ArtifactId, WorkspaceId), WorkspaceRecord>,
     BTreeMap<(TenantId, SnapshotId), SnapshotRecord>,
     BTreeMap<(TenantId, S3AccessPointId), S3AccessPointRecord>,
     BTreeMap<S3CredentialId, S3CredentialRecord>,
@@ -3456,6 +3553,24 @@ async fn load_lifecycle_catalog(
     transaction: &mut Transaction<'_, Sqlite>,
     tenant_id: &TenantId,
 ) -> CentralResult<LifecycleCatalogMaps> {
+    let project_sql =
+        format!("SELECT {PROJECT_COLUMNS} FROM project_catalog_records WHERE tenant_id = ?");
+    let projects = sqlx::query(&project_sql)
+        .bind(tenant_id.as_str())
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(storage_error)?
+        .into_iter()
+        .map(decode_project)
+        .map(|result| {
+            result.map(|record| {
+                (
+                    (record.tenant_id.clone(), record.project_id.clone()),
+                    record,
+                )
+            })
+        })
+        .collect::<CentralResult<BTreeMap<_, _>>>()?;
     let artifact_sql =
         format!("SELECT {ARTIFACT_COLUMNS} FROM artifact_catalog_records WHERE tenant_id = ?");
     let artifacts = sqlx::query(&artifact_sql)
@@ -3492,15 +3607,15 @@ async fn load_lifecycle_catalog(
             })
         })
         .collect::<CentralResult<BTreeMap<_, _>>>()?;
-    let playground_sql =
-        format!("SELECT {PLAYGROUND_COLUMNS} FROM playground_catalog_records WHERE tenant_id = ?");
-    let playgrounds = sqlx::query(&playground_sql)
+    let workspace_sql =
+        format!("SELECT {WORKSPACE_COLUMNS} FROM workspace_catalog_records WHERE tenant_id = ?");
+    let workspaces = sqlx::query(&workspace_sql)
         .bind(tenant_id.as_str())
         .fetch_all(&mut **transaction)
         .await
         .map_err(storage_error)?
         .into_iter()
-        .map(decode_playground)
+        .map(decode_workspace)
         .map(|result| {
             result.map(|record| {
                 (
@@ -3508,7 +3623,7 @@ async fn load_lifecycle_catalog(
                         record.tenant_id.clone(),
                         record.project_id.clone(),
                         record.artifact_id.clone(),
-                        record.playground_id.clone(),
+                        record.workspace_id.clone(),
                     ),
                     record,
                 )
@@ -3568,9 +3683,10 @@ async fn load_lifecycle_catalog(
         .map(|result| result.map(|record| (record.credential_id.clone(), record)))
         .collect::<CentralResult<BTreeMap<_, _>>>()?;
     Ok((
+        projects,
         artifacts,
         volumes,
-        playgrounds,
+        workspaces,
         snapshots,
         access_points,
         credentials,
@@ -3724,14 +3840,22 @@ async fn create_deletion_transaction(
         DELETION_RECOVERY_WINDOW_MILLIS,
         "deletion recovery deadline overflow",
     )?;
-    let (mut artifacts, mut volumes, mut playgrounds, mut snapshots, _access_points, _credentials) =
-        load_lifecycle_catalog(transaction, &request.tenant_id).await?;
+    let (
+        mut projects,
+        mut artifacts,
+        mut volumes,
+        mut workspaces,
+        mut snapshots,
+        _access_points,
+        _credentials,
+    ) = load_lifecycle_catalog(transaction, &request.tenant_id).await?;
     crate::catalog_memory::validate_current_targets(
         &request.tenant_id,
         &impact.targets,
+        &projects,
         &artifacts,
         &volumes,
-        &playgrounds,
+        &workspaces,
         &snapshots,
     )?;
     let targets = crate::catalog_memory::fence_targets_for_delete(
@@ -3740,9 +3864,10 @@ async fn create_deletion_transaction(
         &request.deletion_id,
         request.now_unix_ms,
         purge_after_unix_ms,
+        &mut projects,
         &mut artifacts,
         &mut volumes,
-        &mut playgrounds,
+        &mut workspaces,
         &mut snapshots,
     )?;
     persist_lifecycle_targets(
@@ -3750,9 +3875,10 @@ async fn create_deletion_transaction(
         &request.tenant_id,
         &impact.targets,
         &targets,
+        &projects,
         &artifacts,
         &volumes,
-        &playgrounds,
+        &workspaces,
         &snapshots,
     )
     .await?;
@@ -3806,9 +3932,10 @@ async fn persist_lifecycle_targets(
     tenant_id: &TenantId,
     previous_targets: &[neoengram_domain::protocol::DeletionTarget],
     updated_targets: &[neoengram_domain::protocol::DeletionTarget],
+    projects: &BTreeMap<(TenantId, ProjectId), ProjectRecord>,
     artifacts: &BTreeMap<(TenantId, ArtifactId), ArtifactRecord>,
     volumes: &BTreeMap<(TenantId, StorageVolumeId), StorageVolumeRecord>,
-    playgrounds: &BTreeMap<(TenantId, ProjectId, ArtifactId, PlaygroundId), PlaygroundRecord>,
+    workspaces: &BTreeMap<(TenantId, ProjectId, ArtifactId, WorkspaceId), WorkspaceRecord>,
     snapshots: &BTreeMap<(TenantId, SnapshotId), SnapshotRecord>,
 ) -> CentralResult<()> {
     for updated in updated_targets {
@@ -3817,6 +3944,25 @@ async fn persist_lifecycle_targets(
             .find(|target| target.resource == updated.resource)
             .ok_or_else(|| corruption("updated lifecycle target has no prior fence"))?;
         let result = match &updated.resource {
+            ResourceRef::Project { project_id } => {
+                let record = projects
+                    .get(&(tenant_id.clone(), project_id.clone()))
+                    .ok_or_else(|| corruption("updated Project is missing"))?;
+                update_lifecycle_row(
+                    transaction,
+                    tenant_id,
+                    "project_catalog_records",
+                    "project_id",
+                    project_id.as_str(),
+                    None,
+                    None,
+                    previous,
+                    record.resource_version,
+                    &record.lifecycle,
+                    record.updated_at_unix_ms,
+                )
+                .await?
+            }
             ResourceRef::StorageVolume { storage_volume_id } => {
                 let record = volumes
                     .get(&(tenant_id.clone(), storage_volume_id.clone()))
@@ -3859,25 +4005,25 @@ async fn persist_lifecycle_targets(
                 )
                 .await?
             }
-            ResourceRef::Playground {
+            ResourceRef::Workspace {
                 project_id,
                 artifact_id,
-                playground_id,
+                workspace_id,
             } => {
-                let record = playgrounds
+                let record = workspaces
                     .get(&(
                         tenant_id.clone(),
                         project_id.clone(),
                         artifact_id.clone(),
-                        playground_id.clone(),
+                        workspace_id.clone(),
                     ))
-                    .ok_or_else(|| corruption("updated Playground is missing"))?;
+                    .ok_or_else(|| corruption("updated Workspace is missing"))?;
                 update_lifecycle_row(
                     transaction,
                     tenant_id,
-                    "playground_catalog_records",
-                    "playground_id",
-                    playground_id.as_str(),
+                    "workspace_catalog_records",
+                    "workspace_id",
+                    workspace_id.as_str(),
                     Some(("project_id", project_id.as_str())),
                     Some(("artifact_id", artifact_id.as_str())),
                     previous,
@@ -3988,7 +4134,7 @@ async fn disable_snapshot_s3_access_sqlite<'a>(
     );
     select
         .push_bind(tenant_id.as_str())
-        .push(" AND snapshot_id IN (");
+        .push(" AND state <> 'deleted' AND snapshot_id IN (");
     let mut separated = select.separated(", ");
     for snapshot_id in snapshot_ids {
         separated.push_bind(snapshot_id.as_str());
@@ -4197,17 +4343,25 @@ async fn restore_deletion_transaction(
     }
     let previous_operation_version = operation.resource_version;
     let previous_targets = operation.targets.clone();
-    let (mut artifacts, mut volumes, mut playgrounds, mut snapshots, _access_points, _credentials) =
-        load_lifecycle_catalog(transaction, &request.tenant_id).await?;
+    let (
+        mut projects,
+        mut artifacts,
+        mut volumes,
+        mut workspaces,
+        mut snapshots,
+        _access_points,
+        _credentials,
+    ) = load_lifecycle_catalog(transaction, &request.tenant_id).await?;
     operation.targets = crate::catalog_memory::set_target_lifecycle_state(
         &request.tenant_id,
         &previous_targets,
         &request.deletion_id,
         ResourceLifecycleState::Restoring,
         request.now_unix_ms,
+        &mut projects,
         &mut artifacts,
         &mut volumes,
-        &mut playgrounds,
+        &mut workspaces,
         &mut snapshots,
     )?;
     persist_lifecycle_targets(
@@ -4215,9 +4369,10 @@ async fn restore_deletion_transaction(
         &request.tenant_id,
         &previous_targets,
         &operation.targets,
+        &projects,
         &artifacts,
         &volumes,
-        &playgrounds,
+        &workspaces,
         &snapshots,
     )
     .await?;
@@ -4358,8 +4513,15 @@ async fn transition_deletion_transaction(
     }
     let previous_operation_version = operation.resource_version;
     let previous_targets = operation.targets.clone();
-    let (mut artifacts, mut volumes, mut playgrounds, mut snapshots, _access_points, _credentials) =
-        load_lifecycle_catalog(transaction, &request.tenant_id).await?;
+    let (
+        mut projects,
+        mut artifacts,
+        mut volumes,
+        mut workspaces,
+        mut snapshots,
+        _access_points,
+        _credentials,
+    ) = load_lifecycle_catalog(transaction, &request.tenant_id).await?;
     if request.next_state == DeletionOperationState::Quarantining {
         operation.targets = crate::catalog_memory::set_target_lifecycle_state(
             &request.tenant_id,
@@ -4367,9 +4529,10 @@ async fn transition_deletion_transaction(
             &request.deletion_id,
             ResourceLifecycleState::Deleting,
             request.now_unix_ms,
+            &mut projects,
             &mut artifacts,
             &mut volumes,
-            &mut playgrounds,
+            &mut workspaces,
             &mut snapshots,
         )?;
     } else if request.expected_state == DeletionOperationState::Restoring
@@ -4381,9 +4544,10 @@ async fn transition_deletion_transaction(
             &request.deletion_id,
             DeletionCompletion::Restored,
             request.now_unix_ms,
+            &mut projects,
             &mut artifacts,
             &mut volumes,
-            &mut playgrounds,
+            &mut workspaces,
             &mut snapshots,
         )?;
         operation.completion = Some(DeletionCompletion::Restored);
@@ -4396,9 +4560,10 @@ async fn transition_deletion_transaction(
             &request.deletion_id,
             DeletionCompletion::Purged,
             request.now_unix_ms,
+            &mut projects,
             &mut artifacts,
             &mut volumes,
-            &mut playgrounds,
+            &mut workspaces,
             &mut snapshots,
         )?;
         operation.completion = Some(DeletionCompletion::Purged);
@@ -4409,9 +4574,10 @@ async fn transition_deletion_transaction(
             &request.tenant_id,
             &previous_targets,
             &operation.targets,
+            &projects,
             &artifacts,
             &volumes,
-            &playgrounds,
+            &workspaces,
             &snapshots,
         )
         .await?;
@@ -5300,10 +5466,10 @@ fn volume_page(rows: Vec<SqliteRow>, limit: u16) -> CentralResult<StorageVolumeL
     Ok(StorageVolumeListPage { records, next })
 }
 
-fn playground_page(rows: Vec<SqliteRow>, limit: u16) -> CentralResult<PlaygroundListPage> {
+fn workspace_page(rows: Vec<SqliteRow>, limit: u16) -> CentralResult<WorkspaceListPage> {
     let mut records = rows
         .into_iter()
-        .map(decode_playground)
+        .map(decode_workspace)
         .collect::<CentralResult<Vec<_>>>()?;
     let has_more = records.len() > usize::from(limit);
     records.truncate(usize::from(limit));
@@ -5311,14 +5477,14 @@ fn playground_page(rows: Vec<SqliteRow>, limit: u16) -> CentralResult<Playground
         let last = records
             .last()
             .expect("a non-zero page with more rows has a cursor");
-        PlaygroundListCursor {
+        WorkspaceListCursor {
             created_at_unix_ms: last.created_at_unix_ms,
             project_id: last.project_id.clone(),
             artifact_id: last.artifact_id.clone(),
-            playground_id: last.playground_id.clone(),
+            workspace_id: last.workspace_id.clone(),
         }
     });
-    Ok(PlaygroundListPage { records, next })
+    Ok(WorkspaceListPage { records, next })
 }
 
 /// Legacy transaction helper retained for adapters that need to compose the lower-level insert.
@@ -5376,6 +5542,7 @@ fn decode_project(row: SqliteRow) -> CentralResult<ProjectRecord> {
             row.try_get("resource_version").map_err(storage_error)?,
             "Project resource version",
         )?,
+        lifecycle: decode_resource_lifecycle(&row)?,
         created_at_unix_ms: unix_ms(row.try_get("created_at_unix_ms").map_err(storage_error)?)?,
         updated_at_unix_ms: unix_ms(row.try_get("updated_at_unix_ms").map_err(storage_error)?)?,
     })
@@ -5509,8 +5676,8 @@ fn decode_volume(row: SqliteRow) -> CentralResult<StorageVolumeRecord> {
     Ok(record)
 }
 
-fn decode_playground(row: SqliteRow) -> CentralResult<PlaygroundRecord> {
-    Ok(PlaygroundRecord {
+fn decode_workspace(row: SqliteRow) -> CentralResult<WorkspaceRecord> {
+    Ok(WorkspaceRecord {
         tenant_id: parse_id(
             row.try_get("tenant_id").map_err(storage_error)?,
             TenantId::new,
@@ -5523,9 +5690,9 @@ fn decode_playground(row: SqliteRow) -> CentralResult<PlaygroundRecord> {
             row.try_get("artifact_id").map_err(storage_error)?,
             ArtifactId::new,
         )?,
-        playground_id: parse_id(
-            row.try_get("playground_id").map_err(storage_error)?,
-            PlaygroundId::new,
+        workspace_id: parse_id(
+            row.try_get("workspace_id").map_err(storage_error)?,
+            WorkspaceId::new,
         )?,
         storage_volume_id: parse_id(
             row.try_get("storage_volume_id").map_err(storage_error)?,
@@ -5541,11 +5708,11 @@ fn decode_playground(row: SqliteRow) -> CentralResult<PlaygroundRecord> {
             row.try_get("head_commit_digest").map_err(storage_error)?,
             "head Commit digest",
         )?,
-        state: parse_playground_state(row.try_get("state").map_err(storage_error)?)?,
+        state: parse_workspace_state(row.try_get("state").map_err(storage_error)?)?,
         relative_root: row.try_get("relative_root").map_err(storage_error)?,
         resource_version: parse_u64(
             row.try_get("resource_version").map_err(storage_error)?,
-            "Playground resource version",
+            "Workspace resource version",
         )?,
         lifecycle: decode_resource_lifecycle(&row)?,
         created_at_unix_ms: unix_ms(row.try_get("created_at_unix_ms").map_err(storage_error)?)?,
@@ -5890,9 +6057,9 @@ fn volume_create_matches(left: &StorageVolumeRecord, right: &StorageVolumeRecord
         && left.nfs_reference == right.nfs_reference
 }
 
-fn playground_create_matches_insert(
-    existing: &PlaygroundRecord,
-    requested: &PlaygroundRecord,
+fn workspace_create_matches_insert(
+    existing: &WorkspaceRecord,
+    requested: &WorkspaceRecord,
     artifact_head: &ArtifactHeadExpectation,
 ) -> bool {
     let commit_selection_matches = match artifact_head {
@@ -5905,7 +6072,7 @@ fn playground_create_matches_insert(
     existing.tenant_id == requested.tenant_id
         && existing.project_id == requested.project_id
         && existing.artifact_id == requested.artifact_id
-        && existing.playground_id == requested.playground_id
+        && existing.workspace_id == requested.workspace_id
         && existing.storage_volume_id == requested.storage_volume_id
         && existing.region == requested.region
         && existing.display_name == requested.display_name
@@ -6012,20 +6179,20 @@ fn parse_volume_state(value: String) -> CentralResult<StorageVolumeState> {
     }
 }
 
-fn playground_state_name(value: PlaygroundState) -> &'static str {
+fn workspace_state_name(value: WorkspaceState) -> &'static str {
     match value {
-        PlaygroundState::Creating => "creating",
-        PlaygroundState::Ready => "ready",
-        PlaygroundState::Abnormal => "abnormal",
+        WorkspaceState::Creating => "creating",
+        WorkspaceState::Ready => "ready",
+        WorkspaceState::Abnormal => "abnormal",
     }
 }
 
-fn parse_playground_state(value: String) -> CentralResult<PlaygroundState> {
+fn parse_workspace_state(value: String) -> CentralResult<WorkspaceState> {
     match value.as_str() {
-        "creating" => Ok(PlaygroundState::Creating),
-        "ready" => Ok(PlaygroundState::Ready),
-        "abnormal" => Ok(PlaygroundState::Abnormal),
-        _ => Err(corruption("stored Playground state is invalid")),
+        "creating" => Ok(WorkspaceState::Creating),
+        "ready" => Ok(WorkspaceState::Ready),
+        "abnormal" => Ok(WorkspaceState::Abnormal),
+        _ => Err(corruption("stored Workspace state is invalid")),
     }
 }
 
@@ -6099,6 +6266,7 @@ fn s3_access_point_state_name(value: S3AccessPointState) -> &'static str {
     match value {
         S3AccessPointState::Active => "active",
         S3AccessPointState::Disabled => "disabled",
+        S3AccessPointState::Deleted => "deleted",
     }
 }
 
@@ -6106,6 +6274,7 @@ fn parse_s3_access_point_state(value: String) -> CentralResult<S3AccessPointStat
     match value.as_str() {
         "active" => Ok(S3AccessPointState::Active),
         "disabled" => Ok(S3AccessPointState::Disabled),
+        "deleted" => Ok(S3AccessPointState::Deleted),
         _ => Err(corruption("stored S3 Access Point state is invalid")),
     }
 }
@@ -6166,6 +6335,7 @@ fn same_snapshot_delivery_mutation_identity(
 fn s3_mutation_kind_name(value: S3MutationKind) -> &'static str {
     match value {
         S3MutationKind::AccessPointCreate => "access_point_create",
+        S3MutationKind::AccessPointDelete => "access_point_delete",
         S3MutationKind::AccessPointEnable => "access_point_enable",
         S3MutationKind::AccessPointDisable => "access_point_disable",
         S3MutationKind::CredentialCreate => "credential_create",
@@ -6176,6 +6346,7 @@ fn s3_mutation_kind_name(value: S3MutationKind) -> &'static str {
 fn parse_s3_mutation_kind(value: String) -> CentralResult<S3MutationKind> {
     match value.as_str() {
         "access_point_create" => Ok(S3MutationKind::AccessPointCreate),
+        "access_point_delete" => Ok(S3MutationKind::AccessPointDelete),
         "access_point_enable" => Ok(S3MutationKind::AccessPointEnable),
         "access_point_disable" => Ok(S3MutationKind::AccessPointDisable),
         "credential_create" => Ok(S3MutationKind::CredentialCreate),
@@ -6303,7 +6474,7 @@ fn catalog_parent_error(code: CentralErrorCode, message: &'static str) -> Centra
 fn artifact_head_changed() -> CentralError {
     CentralError::new(
         CentralErrorCode::ArtifactHeadMismatch,
-        "Artifact Head changed before Playground creation",
+        "Artifact Head changed before Workspace creation",
     )
     .with_retryable(true)
 }

@@ -25,11 +25,21 @@ use neoengram_domain::protocol::{
     LeaseGrant, LeaseId, LeaseMode, ManifestRecord, MetadataBatchDescriptor, MetadataBatchId,
     MetadataBatchKind, MetadataBatchPage, MetadataBatchRecords, MetadataBatchScope,
     MetadataPublication, MountGeneration, ObjectReceiptId, ObjectReceiptRecord, OwnerGeneration,
-    PlacementGeneration, PlaygroundId, PrincipalId, PrincipalKind, PrincipalRef, ProjectId,
-    PublishDecision, SessionGeneration, StorageVolumeId, TenantId, UnixMillis, WireChunkRef,
-    WireChunkingStrategy, WireIndexVersion,
+    PlacementGeneration, PrincipalId, PrincipalKind, PrincipalRef, ProjectId, PublishDecision,
+    SessionGeneration, StorageVolumeId, TaskExecutionFence, TaskId, TenantId, UnixMillis,
+    WireChunkRef, WireChunkingStrategy, WireIndexVersion, WorkspaceId,
 };
 use tokio::sync::Barrier;
+
+fn task_fence(job_id: &neoengram_domain::protocol::JobId, stage_key: &str) -> TaskExecutionFence {
+    TaskExecutionFence::new(
+        TaskId::new(format!("task-{job_id}")).unwrap(),
+        neoengram_domain::protocol::Generation::new(1),
+        stage_key,
+        neoengram_domain::protocol::Generation::new(1),
+        neoengram_domain::protocol::Generation::new(1),
+    )
+}
 
 struct Scenario {
     components: InMemoryComponents,
@@ -112,7 +122,7 @@ impl Scenario {
             tenant_id: self.spec.tenant_id.clone(),
             project_id: self.spec.project_id.clone(),
             artifact_id: self.spec.artifact_id.clone(),
-            playground_id: self.spec.playground_id.clone(),
+            workspace_id: self.spec.workspace_id.clone(),
         }
     }
 }
@@ -455,6 +465,7 @@ async fn accepted_assignment_retirement_prevents_stable_prefix_starvation() {
 
     let accepted = JobAccepted {
         job_id: first_spec.job_id.clone(),
+        task_fence: task_fence(&first_spec.job_id, "scan_changes"),
         assignment_id: first_target.assignment_id.clone(),
         assignment_generation: first_target.assignment_generation,
         accepted_at_unix_ms: UnixMillis::new(200),
@@ -543,6 +554,7 @@ async fn accepted_replay_recovers_when_retirement_failed_after_job_cas() {
         .unwrap();
     let accepted = JobAccepted {
         job_id: spec.job_id.clone(),
+        task_fence: task_fence(&spec.job_id, "scan_changes"),
         assignment_id: target.assignment_id.clone(),
         assignment_generation: target.assignment_generation,
         accepted_at_unix_ms: UnixMillis::new(200),
@@ -622,7 +634,7 @@ async fn metadata_staging_scopes_reused_batch_ids_by_tenant() {
             tenant_id: TenantId::new(tenant).unwrap(),
             project_id: ProjectId::new("project-a").unwrap(),
             artifact_id: ArtifactId::new("artifact-a").unwrap(),
-            playground_id: PlaygroundId::new("playground-a").unwrap(),
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
             job_id: neoengram_domain::protocol::JobId::new("job-a").unwrap(),
             base_index_version: WireIndexVersion {
                 revision: neoengram_domain::protocol::IndexRevision::new(0),
@@ -1114,6 +1126,7 @@ async fn failed_report_rejects_invalid_generation_state_and_tenant_scope() {
     let failure = JobFailed {
         tenant_id: scenario.spec.tenant_id.clone(),
         job_id: scenario.spec.job_id.clone(),
+        task_fence: task_fence(&scenario.spec.job_id, "scan_changes"),
         assignment_id: scenario.target.assignment_id.clone(),
         assignment_generation: scenario.target.assignment_generation,
         final_state: JobState::Failed,
@@ -1455,7 +1468,7 @@ async fn invalid_resulting_snapshot_becomes_a_stable_failed_decision() {
         tenant_id: TenantId::new("tenant-a").unwrap(),
         project_id: ProjectId::new("project-a").unwrap(),
         artifact_id: ArtifactId::new("artifact-a").unwrap(),
-        playground_id: PlaygroundId::new("playground-a").unwrap(),
+        workspace_id: WorkspaceId::new("workspace-a").unwrap(),
     };
     let prefix = FileRecord::new(
         LogicalPath::parse("dataset").unwrap(),
@@ -1512,7 +1525,7 @@ async fn cas_mismatch_becomes_a_stable_conflicted_decision_and_replays() {
                 tenant_id: scenario.spec.tenant_id.clone(),
                 project_id: scenario.spec.project_id.clone(),
                 artifact_id: scenario.spec.artifact_id.clone(),
-                playground_id: scenario.spec.playground_id.clone(),
+                workspace_id: scenario.spec.workspace_id.clone(),
             },
             1,
             Vec::new(),
@@ -1624,6 +1637,7 @@ async fn publishing_replay_converges_after_terminal_persist_failure_and_deadline
             report: AgentReport::Failed(JobFailed {
                 tenant_id: scenario.spec.tenant_id.clone(),
                 job_id: scenario.spec.job_id.clone(),
+                task_fence: task_fence(&scenario.spec.job_id, "scan_changes"),
                 assignment_id: scenario.target.assignment_id.clone(),
                 assignment_generation: scenario.target.assignment_generation,
                 final_state: JobState::RecoveryRequired,
@@ -2410,6 +2424,7 @@ async fn build_scenario_with_candidate_overrides(
 
     let accepted = JobAccepted {
         job_id: spec.job_id.clone(),
+        task_fence: task_fence(&spec.job_id, "scan_changes"),
         assignment_id: target.assignment_id.clone(),
         assignment_generation: target.assignment_generation,
         accepted_at_unix_ms: UnixMillis::new(200),
@@ -2426,6 +2441,7 @@ async fn build_scenario_with_candidate_overrides(
         .unwrap();
     let progress = JobProgress {
         job_id: spec.job_id.clone(),
+        task_fence: task_fence(&spec.job_id, "scan_changes"),
         assignment_id: target.assignment_id.clone(),
         assignment_generation: target.assignment_generation,
         state: JobState::Running,
@@ -2470,7 +2486,7 @@ async fn build_scenario_with_candidate_overrides(
         tenant_id: spec.tenant_id.clone(),
         project_id: spec.project_id.clone(),
         artifact_id: spec.artifact_id.clone(),
-        playground_id: spec.playground_id.clone(),
+        workspace_id: spec.workspace_id.clone(),
         job_id: spec.job_id.clone(),
         base_index_version: spec.expected_index_version.clone(),
         extensions: Extensions::new(),
@@ -2649,6 +2665,7 @@ async fn build_scenario_with_candidate_overrides(
         .unwrap_or(computed_publication_digest);
     let prepared = JobPrepared::new(
         spec.job_id.clone(),
+        task_fence(&spec.job_id, "scan_changes"),
         target.assignment_id.clone(),
         target.assignment_generation,
         spec.expected_index_version.clone(),
@@ -2690,14 +2707,14 @@ async fn inputs(components: &InMemoryComponents) -> (PrincipalRef, AddJobSpec, A
     let tenant_id = TenantId::new("tenant-a").unwrap();
     let project_id = ProjectId::new("project-a").unwrap();
     let artifact_id = ArtifactId::new("artifact-a").unwrap();
-    let playground_id = PlaygroundId::new("playground-a").unwrap();
+    let workspace_id = WorkspaceId::new("workspace-a").unwrap();
     let expected_index_version = components
         .publisher
         .current_version(&IndexKey {
             tenant_id: tenant_id.clone(),
             project_id: project_id.clone(),
             artifact_id: artifact_id.clone(),
-            playground_id: playground_id.clone(),
+            workspace_id: workspace_id.clone(),
         })
         .await
         .unwrap();
@@ -2707,13 +2724,14 @@ async fn inputs(components: &InMemoryComponents) -> (PrincipalRef, AddJobSpec, A
         tenant_id,
         project_id,
         artifact_id,
-        playground_id,
+        workspace_id,
         expected_index_version,
         data_layout: neoengram_domain::protocol::CommitDataLayout::FastCdc,
         request_digest: ContentDigest::from_bytes([0; 32]),
         deadline_unix_ms: UnixMillis::new(10_000),
         paths: vec![LogicalPath::parse("dataset/file.bin").unwrap()],
         all: false,
+        operation_task_id: None,
         extensions: Extensions::new(),
     };
     spec.request_digest = spec.computed_request_digest().unwrap();

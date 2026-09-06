@@ -859,10 +859,10 @@ mod tests {
     use neoengram_domain::core::{ChunkRef, FileRecord, IndexVersion, Manifest, ObjectSpec};
     use neoengram_domain::protocol::{
         AddAssignment, AgentMountId, ArtifactId, AssignmentGeneration, AssignmentId, ContentDigest,
-        DecimalU64, DeliveryGeneration, Extensions, JobId, MetadataBatchDescriptor,
+        DecimalU64, DeliveryGeneration, Extensions, Generation, JobId, MetadataBatchDescriptor,
         MetadataBatchPage, PlacementGeneration, PrincipalId, PrincipalKind, PrincipalRef,
         ProjectId, SnapshotDeliveryAction, SnapshotDeliveryId, SnapshotDeliveryOperation,
-        SnapshotId, UnixMillis, WorkspaceMaterializeAssignment,
+        SnapshotId, TaskExecutionFence, TaskId, UnixMillis, WorkspaceMaterializeAssignment,
     };
     use tempfile::TempDir;
 
@@ -1004,6 +1004,13 @@ mod tests {
             .sum();
         let mut assignment = SnapshotDeliveryAssignment {
             job_id: JobId::new("job-delivery-a").unwrap(),
+            task_fence: TaskExecutionFence::new(
+                TaskId::new("task-job-delivery-a").unwrap(),
+                Generation::new(1),
+                "delivery_materialize",
+                Generation::new(1),
+                Generation::new(1),
+            ),
             assignment_id: AssignmentId::new("assignment-delivery-a").unwrap(),
             assignment_generation: AssignmentGeneration::new(1),
             agent_id: AgentId::new("agent-a").unwrap(),

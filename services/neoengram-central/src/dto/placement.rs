@@ -18,6 +18,16 @@ pub struct CreateCommitMaterializationRequest {
     pub object_namespace_id: String,
     pub commit_id: String,
     pub target_storage_volume_id: String,
+    /// The execution purpose selects the shared copy/repair planner. It is part of execution
+    /// identity and is therefore required on every request.
+    pub purpose: neoengram_domain::protocol::TaskPurpose,
+    /// Digest of the complete integrity observation that caused a repair. This is part of the
+    /// semantic execution identity so a later observation cannot be incorrectly deduplicated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_observation_digest: Option<String>,
+    /// Alternative repair fence for callers that have a Placement generation but no scan digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_placement_generation: Option<String>,
     #[serde(default)]
     pub coverage_goal: Option<neoengram_domain::protocol::materialization::CoverageGoal>,
     pub request_id: String,
@@ -109,6 +119,7 @@ pub struct MaterializationView {
     pub object_namespace_id: String,
     pub commit_id: String,
     pub target_storage_volume_id: String,
+    pub purpose: neoengram_domain::protocol::TaskPurpose,
     pub plan_revision: String,
     pub coverage_goal: neoengram_domain::protocol::materialization::CoverageGoal,
     pub state: String,
@@ -129,7 +140,8 @@ pub struct MaterializationView {
 #[sensitive(opaque)]
 pub struct CreateCommitMaterializationResponse {
     pub materialization: MaterializationView,
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }
@@ -146,7 +158,8 @@ pub struct QueryCommitMaterializationResponse {
 #[sensitive(opaque)]
 pub struct RetryCommitMaterializationResponse {
     pub materialization: MaterializationView,
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
@@ -256,7 +269,7 @@ pub struct QueryCommitAvailabilityRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
-pub struct CreateWorkspaceRequest {
+pub struct CreateWorkspacePlacementRequest {
     pub tenant_id: String,
     pub project_id: String,
     pub artifact_id: String,
@@ -329,7 +342,8 @@ pub struct ReplicationView {
 #[sensitive(opaque)]
 pub struct CreateCommitReplicationResponse {
     pub replication: ReplicationView,
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
@@ -373,7 +387,8 @@ pub struct RetryCommitReplicationRequest {
 #[sensitive(opaque)]
 pub struct RetryCommitReplicationResponse {
     pub replication: ReplicationView,
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
@@ -458,7 +473,7 @@ pub struct QueryCommitAvailabilityResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
-pub struct WorkspaceView {
+pub struct PlacementWorkspaceView {
     pub workspace_id: String,
     pub tenant_id: String,
     pub project_id: String,
@@ -471,9 +486,10 @@ pub struct WorkspaceView {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
-pub struct CreateWorkspaceResponse {
-    pub workspace: WorkspaceView,
-    pub replayed: bool,
+pub struct CreateWorkspacePlacementResponse {
+    pub workspace: PlacementWorkspaceView,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }

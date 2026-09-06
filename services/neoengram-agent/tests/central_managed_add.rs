@@ -27,9 +27,9 @@ use neoengram_domain::protocol::{
     DecimalU64, EdgeClusterId, Extensions, IndexDeltaRecord, JobState, ManifestRecord,
     MetadataBatchDescriptor, MetadataBatchId, MetadataBatchPage, MetadataBatchRecords,
     MetadataBatchScope, MountGeneration, ObjectReceiptId, ObjectReceiptRecord, OwnerGeneration,
-    PlacementGeneration, PlaygroundId, PrincipalId, PrincipalKind, PrincipalRef, ProjectId,
-    RequestId, SessionGeneration, StorageVolumeId, TenantId, TraceId, UnixMillis, WireChunkRef,
-    WireChunkingStrategy,
+    PlacementGeneration, PrincipalId, PrincipalKind, PrincipalRef, ProjectId, RequestId,
+    SessionGeneration, StorageVolumeId, TenantId, TraceId, UnixMillis, WireChunkRef,
+    WireChunkingStrategy, WorkspaceId,
 };
 use neoengram_runtime::engine::{AddStatistics, ManagedResource, PreparedAdd};
 
@@ -43,12 +43,12 @@ async fn agent_and_control_plane_complete_managed_add_with_replayed_boundaries()
     let tenant_id = TenantId::new("tenant-e2e").unwrap();
     let project_id = ProjectId::new("project-e2e").unwrap();
     let artifact_id = ArtifactId::new("artifact-e2e").unwrap();
-    let playground_id = PlaygroundId::new("playground-e2e").unwrap();
+    let workspace_id = WorkspaceId::new("workspace-e2e").unwrap();
     let index_key = IndexKey {
         tenant_id: tenant_id.clone(),
         project_id: project_id.clone(),
         artifact_id: artifact_id.clone(),
-        playground_id: playground_id.clone(),
+        workspace_id: workspace_id.clone(),
     };
     let expected = central.publisher.current_version(&index_key).await.unwrap();
     let mut spec = AddJobSpec {
@@ -57,13 +57,14 @@ async fn agent_and_control_plane_complete_managed_add_with_replayed_boundaries()
         tenant_id: tenant_id.clone(),
         project_id,
         artifact_id: artifact_id.clone(),
-        playground_id: playground_id.clone(),
+        workspace_id: workspace_id.clone(),
         expected_index_version: expected.clone(),
         data_layout: CommitDataLayout::FastCdc,
         request_digest: ContentDigest::from_bytes([0; 32]),
         deadline_unix_ms: UnixMillis::new(NOW + 100_000),
         paths: vec![LogicalPath::parse("dataset/value.bin").unwrap()],
         all: false,
+        operation_task_id: None,
         extensions: Extensions::new(),
     };
     spec.request_digest = spec.computed_request_digest().unwrap();
@@ -236,14 +237,14 @@ async fn agent_failure_round_trips_over_wire_into_the_control_plane() {
     let tenant_id = TenantId::new("tenant-failure-e2e").unwrap();
     let project_id = ProjectId::new("project-failure-e2e").unwrap();
     let artifact_id = ArtifactId::new("artifact-failure-e2e").unwrap();
-    let playground_id = PlaygroundId::new("playground-failure-e2e").unwrap();
+    let workspace_id = WorkspaceId::new("workspace-failure-e2e").unwrap();
     let expected = central
         .publisher
         .current_version(&IndexKey {
             tenant_id: tenant_id.clone(),
             project_id: project_id.clone(),
             artifact_id: artifact_id.clone(),
-            playground_id: playground_id.clone(),
+            workspace_id: workspace_id.clone(),
         })
         .await
         .unwrap();
@@ -253,13 +254,14 @@ async fn agent_failure_round_trips_over_wire_into_the_control_plane() {
         tenant_id: tenant_id.clone(),
         project_id,
         artifact_id,
-        playground_id,
+        workspace_id,
         expected_index_version: expected,
         data_layout: CommitDataLayout::FastCdc,
         request_digest: ContentDigest::from_bytes([0; 32]),
         deadline_unix_ms: UnixMillis::new(NOW + 100_000),
         paths: vec![LogicalPath::parse("dataset/failure.bin").unwrap()],
         all: false,
+        operation_task_id: None,
         extensions: Extensions::new(),
     };
     spec.request_digest = spec.computed_request_digest().unwrap();
@@ -570,7 +572,7 @@ fn metadata_for(assignment: &neoengram_domain::protocol::AddAssignment) -> TestM
             tenant_id: assignment.tenant_id.to_string(),
             project_id: assignment.project_id.to_string(),
             artifact_id: assignment.artifact_id.to_string(),
-            playground_id: assignment.playground_id.to_string(),
+            workspace_id: assignment.workspace_id.to_string(),
             job_id: assignment.job_id.to_string(),
         },
         base,
@@ -594,7 +596,7 @@ fn metadata_for(assignment: &neoengram_domain::protocol::AddAssignment) -> TestM
         tenant_id: assignment.tenant_id.clone(),
         project_id: assignment.project_id.clone(),
         artifact_id: assignment.artifact_id.clone(),
-        playground_id: assignment.playground_id.clone(),
+        workspace_id: assignment.workspace_id.clone(),
         job_id: assignment.job_id.clone(),
         base_index_version: assignment.expected_index_version.clone(),
         extensions: Extensions::new(),

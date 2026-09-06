@@ -140,13 +140,13 @@ project_test_run_step placement-replication-contract cargo test --locked \
 project_test_run_step agent-replication-contract cargo test --locked \
   -p neoengram-agent --lib replication
 
-cp -a "${LOCAL_EXPORT}/." "${SOURCE_VOLUME}/playgrounds/commit-source/"
-mkdir -p "${TARGET_VOLUME}/playgrounds/commit-target"
-cp -a "${SOURCE_VOLUME}/playgrounds/commit-source/." "${TARGET_VOLUME}/playgrounds/commit-target/"
+cp -a "${LOCAL_EXPORT}/." "${SOURCE_VOLUME}/workspaces/commit-source/"
+mkdir -p "${TARGET_VOLUME}/workspaces/commit-target"
+cp -a "${SOURCE_VOLUME}/workspaces/commit-source/." "${TARGET_VOLUME}/workspaces/commit-target/"
 volume_copy_integrity() {
   set -Eeuo pipefail
-  local source_root="${SOURCE_VOLUME}/playgrounds/commit-source"
-  local target_root="${TARGET_VOLUME}/playgrounds/commit-target"
+  local source_root="${SOURCE_VOLUME}/workspaces/commit-source"
+  local target_root="${TARGET_VOLUME}/workspaces/commit-target"
   local source_manifest="${PROJECT_TEST_TEMP_ROOT}/source-digests.txt"
   local target_manifest="${PROJECT_TEST_TEMP_ROOT}/target-digests.txt"
   local relative path

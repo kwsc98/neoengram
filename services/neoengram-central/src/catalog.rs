@@ -4,9 +4,9 @@ use neoengram_domain::core::{ContentDigest, LogicalPath};
 use neoengram_domain::protocol::{
     AgentResourceLifecycleAssignment, ArtifactId, DecimalU64, DeletionId, DeletionImpact,
     DeletionOperation, DeletionOperationState, DeletionProof, EdgeClusterId, HardlinkPolicy,
-    LifecycleEvent, PlaygroundId, ProjectId, RequestId, ResourceLifecycle, ResourceRef,
-    RetentionHoldId, SnapshotDeliveryId, SnapshotDeliveryMode, SnapshotDeliveryPolicy,
-    SnapshotDeliveryState, SnapshotId, StorageVolumeId, TenantId, UnixMillis,
+    LifecycleEvent, ProjectId, RequestId, ResourceLifecycle, ResourceRef, RetentionHoldId,
+    SnapshotDeliveryId, SnapshotDeliveryMode, SnapshotDeliveryPolicy, SnapshotDeliveryState,
+    SnapshotId, StorageVolumeId, TenantId, UnixMillis, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +66,7 @@ pub struct ProjectRecord {
     pub display_name: String,
     pub description: Option<String>,
     pub resource_version: u64,
+    pub lifecycle: ResourceLifecycle,
     pub created_at_unix_ms: UnixMillis,
     pub updated_at_unix_ms: UnixMillis,
 }
@@ -133,19 +134,19 @@ impl StorageVolumeRecord {
     }
 }
 
-/// Minimal authoritative Playground placement used by scheduling and the Web flow.
+/// Minimal authoritative Workspace placement used by scheduling and the Web flow.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlaygroundRecord {
+pub struct WorkspaceRecord {
     pub tenant_id: TenantId,
     pub project_id: ProjectId,
     pub artifact_id: ArtifactId,
-    pub playground_id: PlaygroundId,
+    pub workspace_id: WorkspaceId,
     pub storage_volume_id: StorageVolumeId,
     pub region: String,
     pub display_name: String,
     pub base_commit_id: Option<ContentDigest>,
     pub head_commit_id: Option<ContentDigest>,
-    pub state: PlaygroundState,
+    pub state: WorkspaceState,
     pub resource_version: u64,
     pub lifecycle: ResourceLifecycle,
     /// Relative to the Agent's approved Volume mount; never an absolute host path.
@@ -155,7 +156,7 @@ pub struct PlaygroundRecord {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlaygroundState {
+pub enum WorkspaceState {
     Creating,
     Ready,
     Abnormal,
@@ -278,29 +279,29 @@ pub struct StorageVolumeListPage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlaygroundListRequest {
+pub struct WorkspaceListRequest {
     pub tenant_id: TenantId,
     pub project_id: Option<ProjectId>,
     pub artifact_id: Option<ArtifactId>,
     pub region: Option<String>,
-    pub state: Option<PlaygroundState>,
+    pub state: Option<WorkspaceState>,
     pub query: Option<String>,
-    pub after: Option<PlaygroundListCursor>,
+    pub after: Option<WorkspaceListCursor>,
     pub limit: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlaygroundListCursor {
+pub struct WorkspaceListCursor {
     pub created_at_unix_ms: UnixMillis,
     pub project_id: ProjectId,
     pub artifact_id: ArtifactId,
-    pub playground_id: PlaygroundId,
+    pub workspace_id: WorkspaceId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlaygroundListPage {
-    pub records: Vec<PlaygroundRecord>,
-    pub next: Option<PlaygroundListCursor>,
+pub struct WorkspaceListPage {
+    pub records: Vec<WorkspaceRecord>,
+    pub next: Option<WorkspaceListCursor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -581,6 +582,8 @@ pub struct S3AccessPointRecord {
 pub enum S3AccessPointState {
     Active,
     Disabled,
+    /// Tombstone retained for auditability after an explicit Access Point deletion.
+    Deleted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -619,6 +622,7 @@ pub struct S3MutationRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum S3MutationKind {
     AccessPointCreate,
+    AccessPointDelete,
     AccessPointEnable,
     AccessPointDisable,
     CredentialCreate,
@@ -668,7 +672,7 @@ pub enum CatalogInsertOutcome<T> {
     Existing(T),
 }
 
-/// Artifact Head condition captured while resolving a Playground create request.
+/// Artifact Head condition captured while resolving a Workspace create request.
 ///
 /// `Any` is used for an explicitly selected immutable Commit. `Exact` is used when the caller
 /// omitted the base Commit and the service resolved it from the current Artifact Head; the
@@ -679,10 +683,10 @@ pub enum ArtifactHeadExpectation {
     Exact(Option<ContentDigest>),
 }
 
-/// Internal, storage-independent request for an atomic Playground insertion.
+/// Internal, storage-independent request for an atomic Workspace insertion.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlaygroundInsertRequest {
-    pub record: PlaygroundRecord,
+pub struct WorkspaceInsertRequest {
+    pub record: WorkspaceRecord,
     pub artifact_head: ArtifactHeadExpectation,
 }
 
@@ -711,23 +715,23 @@ pub struct SnapshotWithDeliveryInsertResult {
 
 /// One atomic control-catalog publication of an immutable Commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdvancePlaygroundCommitRequest {
+pub struct AdvanceWorkspaceCommitRequest {
     pub tenant_id: TenantId,
     pub project_id: ProjectId,
     pub artifact_id: ArtifactId,
-    pub playground_id: PlaygroundId,
-    /// Branch-local Playground Head frozen by the Pre-commit. Artifact Head is a convenience
+    pub workspace_id: WorkspaceId,
+    /// Branch-local Workspace Head frozen by the Pre-commit. Artifact Head is a convenience
     /// pointer and is deliberately not part of this compare-and-swap fence.
     pub expected_head_commit_id: Option<ContentDigest>,
     pub commit_id: ContentDigest,
     pub updated_at_unix_ms: UnixMillis,
 }
 
-/// Artifact and Playground heads observed after a successful branch-local publication CAS.
+/// Artifact and Workspace heads observed after a successful branch-local publication CAS.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdvancePlaygroundCommitOutcome {
+pub struct AdvanceWorkspaceCommitOutcome {
     pub artifact: ArtifactRecord,
-    pub playground: PlaygroundRecord,
+    pub workspace: WorkspaceRecord,
     pub replayed: bool,
 }
 

@@ -95,7 +95,7 @@ function mockBaseQueries(): void {
     requestId: 'request-commit-graph',
   });
   api.createSnapshot.mockResolvedValue({
-    data: { snapshot, replayed: true },
+    data: { snapshot, request_replayed: true },
     requestId: 'request-create',
   });
   api.querySnapshot.mockResolvedValue({ data: { snapshot }, requestId: 'request-snapshot' });
@@ -200,7 +200,7 @@ describe('Snapshot create page', () => {
     });
     api.createSnapshot
       .mockRejectedValueOnce(new TypeError('transport interrupted'))
-      .mockResolvedValueOnce({ data: { snapshot, replayed: true }, requestId: 'retry' });
+      .mockResolvedValueOnce({ data: { snapshot, request_replayed: true }, requestId: 'retry' });
     await elementButton(wrapper, '创建 Snapshot').trigger('click');
     await flushPromises();
     await elementButton(wrapper, '创建 Snapshot').trigger('click');
@@ -238,7 +238,7 @@ describe('Snapshot create page', () => {
     await button.trigger('click');
     await button.trigger('click');
     expect(api.createSnapshot).toHaveBeenCalledTimes(1);
-    resolveCreate({ data: { snapshot, replayed: false }, requestId: 'pending' });
+    resolveCreate({ data: { snapshot, request_replayed: false }, requestId: 'pending' });
     await flushPromises();
     wrapper.unmount();
     queryClient.clear();

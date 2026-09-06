@@ -17,10 +17,9 @@ use crate::{
     ProtocolError, ProtocolResult, ProtocolVersion, ReplicationId, ReplicationObjectState,
     ReplicationState, RequestId, ResourceLifecycleAction, ResourceLifecycleAssignment, ResourceRef,
     ResourceVersion, SessionGeneration, SignedTransferTicket, SnapshotDeliveryAssignment,
-    SnapshotId, StorageVolumeId, TenantId, TraceId, UnixMillis, VolumeMarkerId, WireIndexVersion,
-    AGENT_JOB_REPORT_ACTION, AGENT_MATERIALIZATION_ASSIGNMENT_ACTION,
-    AGENT_MATERIALIZATION_REPORT_ACTION, AGENT_PROTOCOL_ERROR_ACTION,
-    AGENT_REPLICATION_ASSIGNMENT_ACTION, AGENT_REPLICATION_REPORT_ACTION, CURRENT_WIRE_VERSION,
+    SnapshotId, StorageVolumeId, TaskExecutionFence, TenantId, TraceId, UnixMillis, VolumeMarkerId,
+    WireIndexVersion, AGENT_JOB_REPORT_ACTION, AGENT_MATERIALIZATION_ASSIGNMENT_ACTION,
+    AGENT_MATERIALIZATION_REPORT_ACTION, AGENT_PROTOCOL_ERROR_ACTION, CURRENT_WIRE_VERSION,
     MAX_CONTROL_MESSAGE_BYTES, MAX_RECORDS_PER_PAGE,
 };
 
@@ -39,8 +38,11 @@ pub fn control_action(message: &ControlMessage) -> &'static str {
         ControlMessage::Decision(_) => crate::AGENT_JOB_DECISION_ACTION,
         ControlMessage::LifecycleAssignment(_) => crate::AGENT_LIFECYCLE_ASSIGNMENT_ACTION,
         ControlMessage::LifecycleReport(_) => AGENT_JOB_REPORT_ACTION,
-        ControlMessage::ReplicationAssignment(_) => AGENT_REPLICATION_ASSIGNMENT_ACTION,
-        ControlMessage::ReplicationReport(_) => AGENT_REPLICATION_REPORT_ACTION,
+        // Legacy replication variants remain private Rust values for inventory/reset handling,
+        // but are deliberately not assigned a transport action in wire v2.
+        ControlMessage::ReplicationAssignment(_) | ControlMessage::ReplicationReport(_) => {
+            AGENT_PROTOCOL_ERROR_ACTION
+        }
         ControlMessage::MaterializationAssignment(_) => AGENT_MATERIALIZATION_ASSIGNMENT_ACTION,
         ControlMessage::MaterializationReport(_) => AGENT_MATERIALIZATION_REPORT_ACTION,
         ControlMessage::Error(_) => AGENT_PROTOCOL_ERROR_ACTION,
@@ -135,8 +137,6 @@ pub fn decode_control_envelope(bytes: &[u8]) -> ProtocolResult<Envelope<ControlM
             | crate::AGENT_JOB_DECISION_ACTION
             | crate::AGENT_LIFECYCLE_ASSIGNMENT_ACTION
             | AGENT_JOB_REPORT_ACTION
-            | AGENT_REPLICATION_ASSIGNMENT_ACTION
-            | AGENT_REPLICATION_REPORT_ACTION
             | AGENT_MATERIALIZATION_ASSIGNMENT_ACTION
             | AGENT_MATERIALIZATION_REPORT_ACTION
             | AGENT_PROTOCOL_ERROR_ACTION
@@ -189,8 +189,10 @@ pub enum ControlMessage {
     LifecycleAssignment(Box<AgentResourceLifecycleAssignment>),
     #[serde(rename = "resource.lifecycle.report")]
     LifecycleReport(Box<ResourceLifecycleReport>),
+    #[schemars(skip)]
     #[serde(rename = "replication.assignment")]
     ReplicationAssignment(Box<ReplicationAssignment>),
+    #[schemars(skip)]
     #[serde(rename = "replication.report")]
     ReplicationReport(Box<ReplicationProgressReport>),
     #[serde(rename = "materialization.assignment")]
@@ -217,8 +219,6 @@ impl ControlMessage {
                 | "job.finalized"
                 | "resource.lifecycle.assignment"
                 | "resource.lifecycle.report"
-                | "replication.assignment"
-                | "replication.report"
                 | "materialization.assignment"
                 | "materialization.report"
                 | "protocol.error"
@@ -269,10 +269,12 @@ pub enum AgentResourceLifecycleScope {
         artifact_placement_id: ArtifactPlacementId,
         placement_generation: PlacementGeneration,
     },
-    Playground {
+    #[serde(rename = "workspace")]
+    Workspace {
         project_id: ProjectId,
         artifact_id: ArtifactId,
-        playground_id: crate::PlaygroundId,
+        #[serde(rename = "workspace_id")]
+        workspace_id: crate::WorkspaceId,
         storage_volume_id: StorageVolumeId,
         artifact_placement_id: ArtifactPlacementId,
         placement_generation: PlacementGeneration,
@@ -302,15 +304,15 @@ impl AgentResourceLifecycleScope {
                 project_id: project_id.clone(),
                 artifact_id: artifact_id.clone(),
             },
-            Self::Playground {
+            Self::Workspace {
                 project_id,
                 artifact_id,
-                playground_id,
+                workspace_id,
                 ..
-            } => ResourceRef::Playground {
+            } => ResourceRef::Workspace {
                 project_id: project_id.clone(),
                 artifact_id: artifact_id.clone(),
-                playground_id: playground_id.clone(),
+                workspace_id: workspace_id.clone(),
             },
             Self::Snapshot { snapshot_id, .. } => ResourceRef::Snapshot {
                 snapshot_id: snapshot_id.clone(),
@@ -325,7 +327,7 @@ impl AgentResourceLifecycleScope {
             | Self::Artifact {
                 storage_volume_id, ..
             }
-            | Self::Playground {
+            | Self::Workspace {
                 storage_volume_id, ..
             }
             | Self::Snapshot {
@@ -342,7 +344,7 @@ impl AgentResourceLifecycleScope {
                 placement_generation,
                 ..
             }
-            | Self::Playground {
+            | Self::Workspace {
                 placement_generation,
                 ..
             }
@@ -362,7 +364,7 @@ impl AgentResourceLifecycleScope {
         let roots = match self {
             Self::StorageVolume { .. } => vec![
                 "objects".to_owned(),
-                "playgrounds".to_owned(),
+                "workspaces".to_owned(),
                 "snapshots".to_owned(),
             ],
             Self::Artifact {
@@ -371,16 +373,16 @@ impl AgentResourceLifecycleScope {
                 ..
             } => vec![
                 format!("objects/tenants/{tenant_id}/artifacts/{artifact_id}"),
-                format!("playgrounds/{project_id}/{artifact_id}"),
+                format!("workspaces/{project_id}/{artifact_id}"),
                 format!("snapshots/{project_id}/{artifact_id}"),
             ],
-            Self::Playground {
+            Self::Workspace {
                 project_id,
                 artifact_id,
-                playground_id,
+                workspace_id,
                 ..
             } => vec![format!(
-                "playgrounds/{project_id}/{artifact_id}/{playground_id}"
+                "workspaces/{project_id}/{artifact_id}/{workspace_id}"
             )],
             Self::Snapshot {
                 project_id,
@@ -414,6 +416,9 @@ impl AgentResourceLifecycleScope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentResourceLifecycleAssignment {
     pub assignment: ResourceLifecycleAssignment,
+    /// Root operation/stage fence copied into every lifecycle delivery.
+    #[serde(flatten)]
+    pub task_fence: TaskExecutionFence,
     pub resource_scope: AgentResourceLifecycleScope,
     pub agent_id: AgentId,
     pub edge_cluster_id: EdgeClusterId,
@@ -428,6 +433,7 @@ pub struct AgentResourceLifecycleAssignment {
 
 impl AgentResourceLifecycleAssignment {
     pub fn validate(&self) -> ProtocolResult<()> {
+        self.task_fence.validate()?;
         for (field, generation) in [
             (
                 "lifecycle_generation",
@@ -464,6 +470,11 @@ impl AgentResourceLifecycleAssignment {
             &self.extensions,
             &[
                 "assignment",
+                "task_id",
+                "attempt",
+                "stage_key",
+                "stage_attempt",
+                "plan_revision",
                 "resource_scope",
                 "agent_id",
                 "edge_cluster_id",
@@ -520,6 +531,9 @@ pub struct ResourceLifecycleEvidence {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ResourceLifecycleReport {
     pub assignment_id: LifecycleAssignmentId,
+    /// Exact root operation/stage fence echoed from the assignment.
+    #[serde(flatten)]
+    pub task_fence: TaskExecutionFence,
     pub deletion_id: DeletionId,
     pub tenant_id: TenantId,
     pub resource: ResourceRef,
@@ -555,6 +569,7 @@ impl ResourceLifecycleReport {
     ) -> Self {
         Self {
             assignment_id: command.assignment.assignment_id.clone(),
+            task_fence: command.task_fence.clone(),
             deletion_id: command.assignment.deletion_id.clone(),
             tenant_id: command.assignment.tenant_id.clone(),
             resource: command.assignment.resource.clone(),
@@ -576,6 +591,7 @@ impl ResourceLifecycleReport {
     }
 
     pub fn validate(&self) -> ProtocolResult<()> {
+        self.task_fence.validate()?;
         for (field, generation) in [
             ("lifecycle_generation", self.lifecycle_generation.get()),
             ("session_generation", self.session_generation.get()),
@@ -679,6 +695,11 @@ impl ResourceLifecycleReport {
             &self.extensions,
             &[
                 "assignment_id",
+                "task_id",
+                "attempt",
+                "stage_key",
+                "stage_attempt",
+                "plan_revision",
                 "deletion_id",
                 "tenant_id",
                 "resource",
@@ -709,6 +730,7 @@ impl ResourceLifecycleReport {
         self.validate()?;
         command.validate()?;
         let matches = self.assignment_id == command.assignment.assignment_id
+            && self.task_fence == command.task_fence
             && self.deletion_id == command.assignment.deletion_id
             && self.tenant_id == command.assignment.tenant_id
             && self.resource == command.assignment.resource
@@ -907,10 +929,14 @@ impl JobAssignment {
 #[serde(deny_unknown_fields)]
 pub struct ReplicationAssignment {
     pub replication_id: ReplicationId,
+    #[serde(flatten)]
+    pub task_fence: TaskExecutionFence,
     pub tenant_id: TenantId,
     /// Artifact namespace bound by the Central-signed transfer ticket.
     pub artifact_id: ArtifactId,
     pub commit_id: CommitId,
+    /// Legacy replication-attempt fence, distinct from the root task attempt.
+    #[serde(rename = "replication_attempt")]
     pub attempt: u64,
     pub signed_ticket: SignedTransferTicket,
     pub object_set: ObjectSet,
@@ -920,6 +946,7 @@ pub struct ReplicationAssignment {
 
 impl ReplicationAssignment {
     pub fn validate(&self) -> ProtocolResult<()> {
+        self.task_fence.validate()?;
         if self.attempt == 0 {
             return Err(ProtocolError::InvalidField {
                 field: "attempt",
@@ -976,10 +1003,15 @@ impl ReplicationAssignment {
             &self.extensions,
             &[
                 "replication_id",
+                "task_id",
+                "attempt",
+                "stage_key",
+                "stage_attempt",
+                "plan_revision",
                 "tenant_id",
                 "artifact_id",
                 "commit_id",
-                "attempt",
+                "replication_attempt",
                 "signed_ticket",
                 "object_set",
             ],
@@ -1003,6 +1035,9 @@ pub enum ReplicationProgressReport {
     State {
         replication_id: ReplicationId,
         tenant_id: TenantId,
+        #[serde(flatten)]
+        task_fence: TaskExecutionFence,
+        #[serde(rename = "replication_attempt")]
         attempt: u64,
         state: ReplicationState,
         completed_objects: u64,
@@ -1017,6 +1052,9 @@ pub enum ReplicationProgressReport {
     Object {
         replication_id: ReplicationId,
         tenant_id: TenantId,
+        #[serde(flatten)]
+        task_fence: TaskExecutionFence,
+        #[serde(rename = "replication_attempt")]
         attempt: u64,
         object_id: ObjectId,
         offset: u64,
@@ -1027,6 +1065,9 @@ pub enum ReplicationProgressReport {
     Published {
         replication_id: ReplicationId,
         tenant_id: TenantId,
+        #[serde(flatten)]
+        task_fence: TaskExecutionFence,
+        #[serde(rename = "replication_attempt")]
         attempt: u64,
         commit_id: CommitId,
         object_set_digest: ContentDigest,
@@ -1063,7 +1104,17 @@ impl ReplicationProgressReport {
         }
     }
 
+    #[must_use]
+    pub fn task_fence(&self) -> &TaskExecutionFence {
+        match self {
+            Self::State { task_fence, .. }
+            | Self::Object { task_fence, .. }
+            | Self::Published { task_fence, .. } => task_fence,
+        }
+    }
+
     pub fn validate(&self) -> ProtocolResult<()> {
+        self.task_fence().validate()?;
         let (replication_id, tenant_id, attempt) = match self {
             Self::State {
                 replication_id,
@@ -1107,7 +1158,12 @@ impl ReplicationProgressReport {
                 &[
                     "replication_id",
                     "tenant_id",
+                    "task_id",
                     "attempt",
+                    "stage_key",
+                    "stage_attempt",
+                    "plan_revision",
+                    "replication_attempt",
                     "state",
                     "completed_objects",
                     "completed_bytes",
@@ -1120,7 +1176,12 @@ impl ReplicationProgressReport {
                 &[
                     "replication_id",
                     "tenant_id",
+                    "task_id",
                     "attempt",
+                    "stage_key",
+                    "stage_attempt",
+                    "plan_revision",
+                    "replication_attempt",
                     "object_id",
                     "offset",
                     "state",
@@ -1131,7 +1192,12 @@ impl ReplicationProgressReport {
                 &[
                     "replication_id",
                     "tenant_id",
+                    "task_id",
                     "attempt",
+                    "stage_key",
+                    "stage_attempt",
+                    "plan_revision",
+                    "replication_attempt",
                     "commit_id",
                     "object_set_digest",
                 ],
@@ -1148,7 +1214,7 @@ pub enum AssignmentOperation {
         #[serde(default, flatten)]
         extensions: Extensions,
     },
-    /// Creates the server-derived Playground directory below the approved Agent mount.
+    /// Creates the server-derived Workspace directory below the approved Agent mount.
     ///
     /// This operation deliberately reuses the normal job accepted/progress/failed reports. It
     /// does not enter the managed-Add publication state machine: successful materialization is
@@ -1197,7 +1263,8 @@ pub struct AddOperation {
     pub tenant_id: TenantId,
     pub project_id: ProjectId,
     pub artifact_id: ArtifactId,
-    pub playground_id: crate::PlaygroundId,
+    #[serde(rename = "workspace_id")]
+    pub workspace_id: crate::WorkspaceId,
     pub expected_index_version: WireIndexVersion,
     pub data_layout: CommitDataLayout,
     pub deadline_unix_ms: UnixMillis,
@@ -1240,7 +1307,7 @@ impl AddOperation {
                 "tenant_id",
                 "project_id",
                 "artifact_id",
-                "playground_id",
+                "workspace_id",
                 "expected_index_version",
                 "data_layout",
                 "deadline_unix_ms",
@@ -1261,6 +1328,9 @@ impl AddOperation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct AddAssignment {
     pub job_id: JobId,
+    /// Root operation/stage fence for this Agent delivery.
+    #[serde(flatten)]
+    pub task_fence: TaskExecutionFence,
     pub assignment_id: AssignmentId,
     pub assignment_generation: AssignmentGeneration,
     pub agent_id: AgentId,
@@ -1268,7 +1338,8 @@ pub struct AddAssignment {
     pub tenant_id: TenantId,
     pub project_id: ProjectId,
     pub artifact_id: ArtifactId,
-    pub playground_id: crate::PlaygroundId,
+    #[serde(rename = "workspace_id")]
+    pub workspace_id: crate::WorkspaceId,
     pub edge_cluster_id: EdgeClusterId,
     pub storage_volume_id: StorageVolumeId,
     pub artifact_placement_id: ArtifactPlacementId,
@@ -1306,7 +1377,7 @@ impl AddAssignment {
             tenant_id: self.tenant_id.clone(),
             project_id: self.project_id.clone(),
             artifact_id: self.artifact_id.clone(),
-            playground_id: self.playground_id.clone(),
+            workspace_id: self.workspace_id.clone(),
             expected_index_version: self.expected_index_version.clone(),
             data_layout: self.data_layout,
             deadline_unix_ms: self.deadline_unix_ms,
@@ -1321,6 +1392,7 @@ impl AddAssignment {
     }
 
     pub fn validate(&self) -> ProtocolResult<()> {
+        self.task_fence.validate()?;
         for (field, generation) in [
             ("assignment_generation", self.assignment_generation.get()),
             ("placement_generation", self.placement_generation.get()),
@@ -1343,6 +1415,11 @@ impl AddAssignment {
             &self.extensions,
             &[
                 "job_id",
+                "task_id",
+                "attempt",
+                "stage_key",
+                "stage_attempt",
+                "plan_revision",
                 "assignment_id",
                 "assignment_generation",
                 "agent_id",
@@ -1350,7 +1427,7 @@ impl AddAssignment {
                 "tenant_id",
                 "project_id",
                 "artifact_id",
-                "playground_id",
+                "workspace_id",
                 "edge_cluster_id",
                 "storage_volume_id",
                 "artifact_placement_id",
@@ -1376,7 +1453,7 @@ impl AddAssignment {
 ///
 /// Agent identity, mount identity, and assignment generations are intentionally excluded because
 /// the scheduler chooses them after accepting this immutable operation. The selected Volume and
-/// canonical Playground path remain bound because they are part of the create request itself.
+/// canonical Workspace path remain bound because they are part of the create request itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkspaceMaterializeOperation {
     pub job_id: JobId,
@@ -1384,7 +1461,8 @@ pub struct WorkspaceMaterializeOperation {
     pub tenant_id: TenantId,
     pub project_id: ProjectId,
     pub artifact_id: ArtifactId,
-    pub playground_id: crate::PlaygroundId,
+    #[serde(rename = "workspace_id")]
+    pub workspace_id: crate::WorkspaceId,
     pub storage_volume_id: StorageVolumeId,
     /// Server-derived path relative to the approved Volume mount.
     #[schemars(with = "String")]
@@ -1406,10 +1484,10 @@ impl WorkspaceMaterializeOperation {
     pub fn canonical_relative_root(
         project_id: &ProjectId,
         artifact_id: &ArtifactId,
-        playground_id: &crate::PlaygroundId,
+        workspace_id: &crate::WorkspaceId,
     ) -> ProtocolResult<LogicalPath> {
         LogicalPath::parse(format!(
-            "playgrounds/{project_id}/{artifact_id}/{playground_id}"
+            "workspaces/{project_id}/{artifact_id}/{workspace_id}"
         ))
         .map_err(|error| ProtocolError::InvalidField {
             field: "relative_root",
@@ -1428,15 +1506,12 @@ impl WorkspaceMaterializeOperation {
         if let Some(version) = &self.base_index_version {
             version.validate()?;
         }
-        let canonical = Self::canonical_relative_root(
-            &self.project_id,
-            &self.artifact_id,
-            &self.playground_id,
-        )?;
+        let canonical =
+            Self::canonical_relative_root(&self.project_id, &self.artifact_id, &self.workspace_id)?;
         if self.relative_root != canonical {
             return Err(ProtocolError::InvalidField {
                 field: "relative_root",
-                reason: format!("must equal the server-derived Playground path {canonical}"),
+                reason: format!("must equal the server-derived Workspace path {canonical}"),
             });
         }
         validate_extension_keys(
@@ -1447,7 +1522,7 @@ impl WorkspaceMaterializeOperation {
                 "tenant_id",
                 "project_id",
                 "artifact_id",
-                "playground_id",
+                "workspace_id",
                 "storage_volume_id",
                 "relative_root",
                 "base_commit_id",
@@ -1464,7 +1539,7 @@ impl WorkspaceMaterializeOperation {
     }
 }
 
-/// Complete immutable scope required to create one server-derived Playground directory.
+/// Complete immutable scope required to create one server-derived Workspace directory.
 ///
 /// `relative_root` is carried for explicit protocol observability, but is not trusted by the
 /// Agent. Validation requires it to equal the canonical path derived from the typed resource
@@ -1472,6 +1547,9 @@ impl WorkspaceMaterializeOperation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct WorkspaceMaterializeAssignment {
     pub job_id: JobId,
+    /// Root operation/stage fence for this Agent delivery.
+    #[serde(flatten)]
+    pub task_fence: TaskExecutionFence,
     pub assignment_id: AssignmentId,
     pub assignment_generation: AssignmentGeneration,
     pub agent_id: AgentId,
@@ -1479,7 +1557,8 @@ pub struct WorkspaceMaterializeAssignment {
     pub tenant_id: TenantId,
     pub project_id: ProjectId,
     pub artifact_id: ArtifactId,
-    pub playground_id: crate::PlaygroundId,
+    #[serde(rename = "workspace_id")]
+    pub workspace_id: crate::WorkspaceId,
     pub storage_volume_id: StorageVolumeId,
     pub agent_mount_id: AgentMountId,
     pub mount_generation: MountGeneration,
@@ -1508,12 +1587,12 @@ impl WorkspaceMaterializeAssignment {
     pub fn canonical_relative_root(
         project_id: &ProjectId,
         artifact_id: &ArtifactId,
-        playground_id: &crate::PlaygroundId,
+        workspace_id: &crate::WorkspaceId,
     ) -> ProtocolResult<LogicalPath> {
         WorkspaceMaterializeOperation::canonical_relative_root(
             project_id,
             artifact_id,
-            playground_id,
+            workspace_id,
         )
     }
 
@@ -1525,7 +1604,7 @@ impl WorkspaceMaterializeAssignment {
             tenant_id: self.tenant_id.clone(),
             project_id: self.project_id.clone(),
             artifact_id: self.artifact_id.clone(),
-            playground_id: self.playground_id.clone(),
+            workspace_id: self.workspace_id.clone(),
             storage_volume_id: self.storage_volume_id.clone(),
             relative_root: self.relative_root.clone(),
             base_commit_id: self.base_commit_id,
@@ -1541,6 +1620,7 @@ impl WorkspaceMaterializeAssignment {
     }
 
     pub fn validate(&self) -> ProtocolResult<()> {
+        self.task_fence.validate()?;
         for (field, generation) in [
             ("assignment_generation", self.assignment_generation.get()),
             ("mount_generation", self.mount_generation.get()),
@@ -1560,6 +1640,11 @@ impl WorkspaceMaterializeAssignment {
             &self.extensions,
             &[
                 "job_id",
+                "task_id",
+                "attempt",
+                "stage_key",
+                "stage_attempt",
+                "plan_revision",
                 "assignment_id",
                 "assignment_generation",
                 "agent_id",
@@ -1567,7 +1652,7 @@ impl WorkspaceMaterializeAssignment {
                 "tenant_id",
                 "project_id",
                 "artifact_id",
-                "playground_id",
+                "workspace_id",
                 "storage_volume_id",
                 "agent_mount_id",
                 "mount_generation",
@@ -1648,6 +1733,9 @@ pub enum LeaseMode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct JobAccepted {
     pub job_id: JobId,
+    /// Root operation/stage fence echoed from the assignment.
+    #[serde(flatten)]
+    pub task_fence: TaskExecutionFence,
     pub assignment_id: AssignmentId,
     pub assignment_generation: AssignmentGeneration,
     pub accepted_at_unix_ms: UnixMillis,
@@ -1663,11 +1751,17 @@ pub struct JobAccepted {
 
 impl JobAccepted {
     pub fn validate(&self) -> ProtocolResult<()> {
+        self.task_fence.validate()?;
         validate_positive("assignment_generation", self.assignment_generation.get())?;
         validate_extension_keys(
             &self.extensions,
             &[
                 "job_id",
+                "task_id",
+                "attempt",
+                "stage_key",
+                "stage_attempt",
+                "plan_revision",
                 "assignment_id",
                 "assignment_generation",
                 "accepted_at_unix_ms",
@@ -1680,6 +1774,9 @@ impl JobAccepted {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct JobProgress {
     pub job_id: JobId,
+    /// Root operation/stage fence echoed from the assignment.
+    #[serde(flatten)]
+    pub task_fence: TaskExecutionFence,
     pub assignment_id: AssignmentId,
     pub assignment_generation: AssignmentGeneration,
     pub state: JobState,
@@ -1695,12 +1792,18 @@ pub struct JobProgress {
 
 impl JobProgress {
     pub fn validate(&self) -> ProtocolResult<()> {
+        self.task_fence.validate()?;
         validate_positive("assignment_generation", self.assignment_generation.get())?;
         validate_nonempty_limited("phase", &self.phase, 128)?;
         validate_extension_keys(
             &self.extensions,
             &[
                 "job_id",
+                "task_id",
+                "attempt",
+                "stage_key",
+                "stage_attempt",
+                "plan_revision",
                 "assignment_id",
                 "assignment_generation",
                 "state",
@@ -1716,6 +1819,9 @@ impl JobProgress {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct JobPrepared {
     pub job_id: JobId,
+    /// Root operation/stage fence echoed from the assignment.
+    #[serde(flatten)]
+    pub task_fence: TaskExecutionFence,
     pub assignment_id: AssignmentId,
     pub assignment_generation: AssignmentGeneration,
     pub base_index_version: WireIndexVersion,
@@ -1751,6 +1857,7 @@ impl JobPrepared {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         job_id: JobId,
+        task_fence: TaskExecutionFence,
         assignment_id: AssignmentId,
         assignment_generation: AssignmentGeneration,
         base_index_version: WireIndexVersion,
@@ -1761,6 +1868,7 @@ impl JobPrepared {
     ) -> ProtocolResult<Self> {
         let candidate_digest = prepared_candidate_digest(
             &job_id,
+            &task_fence,
             &assignment_id,
             assignment_generation,
             &base_index_version,
@@ -1771,6 +1879,7 @@ impl JobPrepared {
         )?;
         let prepared = Self {
             job_id,
+            task_fence,
             assignment_id,
             assignment_generation,
             base_index_version,
@@ -1787,6 +1896,7 @@ impl JobPrepared {
     pub fn computed_candidate_digest(&self) -> ProtocolResult<ContentDigest> {
         prepared_candidate_digest(
             &self.job_id,
+            &self.task_fence,
             &self.assignment_id,
             self.assignment_generation,
             &self.base_index_version,
@@ -1798,6 +1908,7 @@ impl JobPrepared {
     }
 
     pub fn validate(&self) -> ProtocolResult<()> {
+        self.task_fence.validate()?;
         validate_positive("assignment_generation", self.assignment_generation.get())?;
         self.base_index_version.validate()?;
         validate_collection_limit(
@@ -1812,6 +1923,11 @@ impl JobPrepared {
             &self.extensions,
             &[
                 "job_id",
+                "task_id",
+                "attempt",
+                "stage_key",
+                "stage_attempt",
+                "plan_revision",
                 "assignment_id",
                 "assignment_generation",
                 "base_index_version",
@@ -1835,6 +1951,7 @@ impl JobPrepared {
 #[allow(clippy::too_many_arguments)]
 fn prepared_candidate_digest(
     job_id: &JobId,
+    task_fence: &TaskExecutionFence,
     assignment_id: &AssignmentId,
     assignment_generation: AssignmentGeneration,
     base_index_version: &WireIndexVersion,
@@ -1845,6 +1962,7 @@ fn prepared_candidate_digest(
 ) -> ProtocolResult<ContentDigest> {
     crate::jcs_blake3(&JobPreparedDigestInput {
         job_id,
+        task_fence,
         assignment_id,
         assignment_generation,
         base_index_version,
@@ -1858,6 +1976,8 @@ fn prepared_candidate_digest(
 #[derive(Serialize)]
 struct JobPreparedDigestInput<'a> {
     job_id: &'a JobId,
+    #[serde(flatten)]
+    task_fence: &'a TaskExecutionFence,
     assignment_id: &'a AssignmentId,
     assignment_generation: AssignmentGeneration,
     base_index_version: &'a WireIndexVersion,
@@ -1876,6 +1996,9 @@ struct JobPreparedDigestInput<'a> {
 pub struct JobFailed {
     pub tenant_id: TenantId,
     pub job_id: JobId,
+    /// Root operation/stage fence echoed from the assignment.
+    #[serde(flatten)]
+    pub task_fence: TaskExecutionFence,
     pub assignment_id: AssignmentId,
     pub assignment_generation: AssignmentGeneration,
     pub final_state: JobState,
@@ -1888,6 +2011,7 @@ pub struct JobFailed {
 
 impl JobFailed {
     pub fn validate(&self) -> ProtocolResult<()> {
+        self.task_fence.validate()?;
         validate_positive("assignment_generation", self.assignment_generation.get())?;
         if !self.final_state.is_failure_terminal() {
             return Err(ProtocolError::InvalidField {
@@ -1901,6 +2025,11 @@ impl JobFailed {
             &[
                 "tenant_id",
                 "job_id",
+                "task_id",
+                "attempt",
+                "stage_key",
+                "stage_attempt",
+                "plan_revision",
                 "assignment_id",
                 "assignment_generation",
                 "final_state",
@@ -1924,6 +2053,9 @@ pub enum JobFailureStage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct JobDecision {
     pub job_id: JobId,
+    /// Root operation/stage fence echoed from the assignment.
+    #[serde(flatten)]
+    pub task_fence: TaskExecutionFence,
     pub assignment_id: AssignmentId,
     pub assignment_generation: AssignmentGeneration,
     pub decision_generation: DecisionGeneration,
@@ -1935,6 +2067,7 @@ pub struct JobDecision {
 
 impl JobDecision {
     pub fn validate(&self) -> ProtocolResult<()> {
+        self.task_fence.validate()?;
         validate_positive("assignment_generation", self.assignment_generation.get())?;
         validate_positive("decision_generation", self.decision_generation.get())?;
         self.decision.validate()?;
@@ -1964,6 +2097,11 @@ impl JobDecision {
             &self.extensions,
             &[
                 "job_id",
+                "task_id",
+                "attempt",
+                "stage_key",
+                "stage_attempt",
+                "plan_revision",
                 "assignment_id",
                 "assignment_generation",
                 "decision_generation",
@@ -2022,6 +2160,9 @@ impl PublishDecision {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct JobFinalized {
     pub job_id: JobId,
+    /// Root operation/stage fence echoed from the assignment.
+    #[serde(flatten)]
+    pub task_fence: TaskExecutionFence,
     pub assignment_id: AssignmentId,
     pub assignment_generation: AssignmentGeneration,
     pub decision_generation: DecisionGeneration,
@@ -2033,6 +2174,7 @@ pub struct JobFinalized {
 
 impl JobFinalized {
     pub fn validate(&self) -> ProtocolResult<()> {
+        self.task_fence.validate()?;
         validate_positive("assignment_generation", self.assignment_generation.get())?;
         validate_positive("decision_generation", self.decision_generation.get())?;
         if !self.final_state.is_terminal() {
@@ -2045,6 +2187,11 @@ impl JobFinalized {
             &self.extensions,
             &[
                 "job_id",
+                "task_id",
+                "attempt",
+                "stage_key",
+                "stage_attempt",
+                "plan_revision",
                 "assignment_id",
                 "assignment_generation",
                 "decision_generation",
@@ -2175,8 +2322,19 @@ mod tests {
 
     use super::*;
     use crate::{
-        MetadataBatchId, MetadataBatchPage, MetadataBatchRecords, MetadataBatchScope, PlaygroundId,
+        Generation, MetadataBatchId, MetadataBatchPage, MetadataBatchRecords, MetadataBatchScope,
+        TaskId, WorkspaceId,
     };
+
+    fn test_task_fence(stage_key: &str) -> TaskExecutionFence {
+        TaskExecutionFence::new(
+            TaskId::new("task-test-1").unwrap(),
+            Generation::new(1),
+            stage_key,
+            Generation::new(1),
+            Generation::new(1),
+        )
+    }
 
     fn canonical_add_operation() -> AddOperation {
         AddOperation {
@@ -2189,7 +2347,7 @@ mod tests {
             tenant_id: TenantId::new("tenant-digest-1").unwrap(),
             project_id: ProjectId::new("project-digest-1").unwrap(),
             artifact_id: ArtifactId::new("artifact-digest-1").unwrap(),
-            playground_id: crate::PlaygroundId::new("playground-digest-1").unwrap(),
+            workspace_id: crate::WorkspaceId::new("workspace-digest-1").unwrap(),
             expected_index_version: WireIndexVersion {
                 revision: crate::IndexRevision::new(7),
                 digest: ContentDigest::from_bytes([0x42; 32]),
@@ -2206,6 +2364,7 @@ mod tests {
     fn assignment_for(operation: &AddOperation, request_digest: ContentDigest) -> AddAssignment {
         AddAssignment {
             job_id: operation.job_id.clone(),
+            task_fence: test_task_fence("scan_changes"),
             assignment_id: AssignmentId::new("assignment-digest-1").unwrap(),
             assignment_generation: AssignmentGeneration::new(1),
             agent_id: AgentId::new("agent-digest-1").unwrap(),
@@ -2213,7 +2372,7 @@ mod tests {
             tenant_id: operation.tenant_id.clone(),
             project_id: operation.project_id.clone(),
             artifact_id: operation.artifact_id.clone(),
-            playground_id: operation.playground_id.clone(),
+            workspace_id: operation.workspace_id.clone(),
             edge_cluster_id: EdgeClusterId::new("cluster-digest-1").unwrap(),
             storage_volume_id: StorageVolumeId::new("volume-digest-1").unwrap(),
             artifact_placement_id: ArtifactPlacementId::new("placement-digest-1").unwrap(),
@@ -2236,15 +2395,16 @@ mod tests {
     fn workspace_assignment() -> WorkspaceMaterializeAssignment {
         let project_id = ProjectId::new("project-materialize-1").unwrap();
         let artifact_id = ArtifactId::new("artifact-materialize-1").unwrap();
-        let playground_id = PlaygroundId::new("playground-materialize-1").unwrap();
+        let workspace_id = WorkspaceId::new("workspace-materialize-1").unwrap();
         let relative_root = WorkspaceMaterializeAssignment::canonical_relative_root(
             &project_id,
             &artifact_id,
-            &playground_id,
+            &workspace_id,
         )
         .unwrap();
         let mut assignment = WorkspaceMaterializeAssignment {
             job_id: JobId::new("job-materialize-1").unwrap(),
+            task_fence: test_task_fence("materialize"),
             assignment_id: AssignmentId::new("assignment-materialize-1").unwrap(),
             assignment_generation: AssignmentGeneration::new(1),
             agent_id: AgentId::new("agent-materialize-1").unwrap(),
@@ -2256,7 +2416,7 @@ mod tests {
             tenant_id: TenantId::new("tenant-materialize-1").unwrap(),
             project_id,
             artifact_id,
-            playground_id,
+            workspace_id,
             storage_volume_id: StorageVolumeId::new("volume-materialize-1").unwrap(),
             agent_mount_id: AgentMountId::new("mount-materialize-1").unwrap(),
             mount_generation: MountGeneration::new(1),
@@ -2299,7 +2459,7 @@ mod tests {
                 .request_digest()
                 .unwrap()
                 .to_string(),
-            "dfff4ad5bf341f1f9102c32af760722b0dcd681ef788e06ca20f6fc001c6340b"
+            "5e39eb93ef4a0661e72061a2e5f88194266bf0dfa001aec4132fdcdbb70dfe06"
         );
     }
 
@@ -2338,12 +2498,12 @@ mod tests {
         valid.validate().unwrap();
 
         let mut absolute = serde_json::to_value(&valid).unwrap();
-        absolute["relative_root"] = json!("/tmp/playground");
+        absolute["relative_root"] = json!("/tmp/workspace");
         assert!(serde_json::from_value::<WorkspaceMaterializeAssignment>(absolute).is_err());
 
         let mut mismatched = valid.clone();
         mismatched.relative_root =
-            LogicalPath::parse("playgrounds/other/artifact/playground").unwrap();
+            LogicalPath::parse("workspaces/other/artifact/workspace").unwrap();
         assert!(matches!(
             mismatched.validate(),
             Err(ProtocolError::InvalidField {
@@ -2388,7 +2548,7 @@ mod tests {
         let prepared = test_job_prepared("batch-manifest-1");
         assert_eq!(
             prepared.candidate_digest.to_string(),
-            "dd7f5c35750f9bd2b8b419fb037a044fdff8db0b8c2dc84456281ba3c032382c"
+            "8d47e7adde6482893a9cce713282a25dea3336fffe8249a108c36a0d2b4cd6fa"
         );
         prepared.validate().unwrap();
     }
@@ -2489,7 +2649,7 @@ mod tests {
                 "tenant_id": "tenant-1",
                 "project_id": "project-1",
                 "artifact_id": "artifact-1",
-                "playground_id": "playground-1",
+                "workspace_id": "workspace-1",
                 "edge_cluster_id": "cluster-1",
                 "storage_volume_id": "volume-1",
                 "artifact_placement_id": "placement-1",
@@ -2797,6 +2957,7 @@ mod tests {
     fn test_job_decision(decision: PublishDecision, final_state: JobState) -> JobDecision {
         JobDecision {
             job_id: JobId::new("job-1").unwrap(),
+            task_fence: test_task_fence("publish_commit"),
             assignment_id: AssignmentId::new("assignment-1").unwrap(),
             assignment_generation: AssignmentGeneration::new(1),
             decision_generation: DecisionGeneration::new(1),
@@ -2853,7 +3014,7 @@ mod tests {
             tenant_id: TenantId::new("tenant-digest-1").unwrap(),
             project_id: ProjectId::new("project-digest-1").unwrap(),
             artifact_id: ArtifactId::new("artifact-digest-1").unwrap(),
-            playground_id: PlaygroundId::new("playground-digest-1").unwrap(),
+            workspace_id: WorkspaceId::new("workspace-digest-1").unwrap(),
             job_id: JobId::new("job-digest-1").unwrap(),
             base_index_version: base_index_version.clone(),
             extensions: Extensions::new(),
@@ -2876,6 +3037,7 @@ mod tests {
         .unwrap();
         JobPrepared::new(
             JobId::new("job-digest-1").unwrap(),
+            test_task_fence("build_manifest"),
             AssignmentId::new("assignment-digest-1").unwrap(),
             AssignmentGeneration::new(3),
             base_index_version,
@@ -2891,6 +3053,7 @@ mod tests {
         JobFailed {
             tenant_id: TenantId::new("tenant-failure-1").unwrap(),
             job_id: JobId::new("job-failure-1").unwrap(),
+            task_fence: test_task_fence("scan_changes"),
             assignment_id: AssignmentId::new("assignment-failure-1").unwrap(),
             assignment_generation: AssignmentGeneration::new(1),
             final_state: JobState::RecoveryRequired,
@@ -2931,6 +3094,13 @@ mod tests {
                 request_digest: ContentDigest::from_bytes([0x61; 32]),
                 deadline_unix_ms: UnixMillis::new(2_000),
             },
+            task_fence: TaskExecutionFence::new(
+                TaskId::new("task-life-1").unwrap(),
+                Generation::new(1),
+                "quarantine",
+                Generation::new(1),
+                Generation::new(1),
+            ),
             resource_scope: scope,
             agent_id: AgentId::new("agent-life-1").unwrap(),
             edge_cluster_id: EdgeClusterId::new("cluster-life-1").unwrap(),
@@ -2952,7 +3122,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "objects/tenants/tenant-life-1/artifacts/artifact-life-1",
-                "playgrounds/project-life-1/artifact-life-1",
+                "workspaces/project-life-1/artifact-life-1",
                 "snapshots/project-life-1/artifact-life-1",
             ]
         );

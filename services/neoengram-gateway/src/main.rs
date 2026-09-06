@@ -757,6 +757,9 @@ async fn run(config: GatewayConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
         identity.gateway_pool_id.clone(),
         identity.edge_cluster_id.clone(),
     );
+    if let Some(trust_domain) = config.workload_trust_domain.as_deref() {
+        transfer_fence = transfer_fence.with_workload_trust_domain(trust_domain);
+    }
     if let (Some(session), Some(mount), Some(route)) = (
         config.transfer_session_generation,
         config.transfer_mount_generation,

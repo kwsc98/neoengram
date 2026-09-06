@@ -17,17 +17,17 @@ pub struct QueryTaskListRequest {
     #[serde(default)]
     pub commit_id: Option<String>,
     #[serde(default)]
-    pub playground_id: Option<String>,
+    pub workspace_id: Option<String>,
     #[serde(default)]
     pub snapshot_id: Option<String>,
     #[serde(default)]
     pub storage_volume_id: Option<String>,
     #[serde(default)]
-    pub task_kind: Vec<String>,
+    pub intent_kind: Vec<String>,
+    #[serde(default)]
+    pub purpose: Option<String>,
     #[serde(default)]
     pub state: Vec<String>,
-    #[serde(default)]
-    pub parent_task_id: Option<String>,
     #[serde(default)]
     pub created_after_unix_ms: Option<String>,
     #[serde(default)]
@@ -76,13 +76,15 @@ pub struct QueryTaskSummaryRequest {
     #[serde(default)]
     pub commit_id: Option<String>,
     #[serde(default)]
-    pub playground_id: Option<String>,
+    pub workspace_id: Option<String>,
     #[serde(default)]
     pub snapshot_id: Option<String>,
     #[serde(default)]
     pub storage_volume_id: Option<String>,
     #[serde(default)]
-    pub task_kind: Vec<String>,
+    pub intent_kind: Vec<String>,
+    #[serde(default)]
+    pub purpose: Option<String>,
     #[serde(default)]
     pub state: Vec<String>,
 }
@@ -131,37 +133,81 @@ pub struct TaskIssueView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
-pub struct TaskView {
-    pub task_id: String,
-    pub task_kind: String,
+pub struct TaskResourceRefView {
+    pub resource_kind: String,
+    pub resource_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct TaskResourceLinkView {
+    pub resource_kind: String,
+    pub resource_id: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct TaskStageView {
+    pub stage_key: String,
+    pub stage_kind: String,
+    pub ordinal: String,
+    pub dependencies: Vec<String>,
     pub state: String,
-    pub phase: String,
-    pub tenant_id: String,
+    pub stage_attempt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub artifact_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub object_namespace_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub commit_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub playground_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub snapshot_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub storage_volume_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_task_id: Option<String>,
-    pub request_id: String,
-    pub request_digest: String,
-    pub actor: String,
-    pub attempt: String,
+    pub outcome: Option<String>,
     pub progress: TaskProgressView,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue: Option<TaskIssueView>,
+    pub created_at_unix_ms: String,
+    pub updated_at_unix_ms: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at_unix_ms: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at_unix_ms: Option<String>,
+    pub resource_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct TaskCompletionView {
+    pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at_unix_ms: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SensitiveFields)]
+#[serde(deny_unknown_fields)]
+#[sensitive(opaque)]
+pub struct TaskView {
+    pub task_id: String,
+    pub intent_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<String>,
+    pub state: String,
+    pub tenant_id: String,
+    pub primary_resource: TaskResourceRefView,
+    pub resource_links: Vec<TaskResourceLinkView>,
+    pub execution_id: String,
+    pub execution_key_digest: String,
+    pub execution_reused: bool,
+    pub current_stage: TaskStageView,
+    pub stages: Vec<TaskStageView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion: Option<TaskCompletionView>,
+    pub request_id: String,
+    pub request_digest: String,
+    pub actor: String,
+    pub attempt: String,
+    pub progress: TaskProgressView,
     pub deadline_unix_ms: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub issue: Option<TaskIssueView>,
@@ -184,7 +230,7 @@ pub struct TaskAttemptView {
     pub task_id: String,
     pub attempt: String,
     pub state: String,
-    pub phase: String,
+    pub current_stage_key: String,
     pub created_at_unix_ms: String,
     pub updated_at_unix_ms: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -237,7 +283,6 @@ pub struct QueryTaskResponse {
     pub task: TaskView,
     pub attempts: Vec<TaskAttemptView>,
     pub events: Vec<TaskEventView>,
-    pub children: Vec<TaskView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SensitiveFields)]
@@ -261,6 +306,7 @@ pub struct TaskSummaryView {
     pub succeeded: String,
     pub stalled: String,
     pub failed: String,
+    pub cancelling: String,
     pub cancelled: String,
 }
 
@@ -276,5 +322,6 @@ pub struct QueryTaskSummaryResponse {
 #[sensitive(opaque)]
 pub struct TaskMutationResponse {
     pub task: TaskView,
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
 }

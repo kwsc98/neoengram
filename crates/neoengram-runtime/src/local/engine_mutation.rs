@@ -92,7 +92,7 @@ pub(crate) fn build_plan(
         MutationIdentity {
             tenant_id: "standalone".to_owned(),
             artifact_id: "local-repository".to_owned(),
-            playground_id: workspace_id,
+            workspace_id,
             job_id: plan_id,
             storage_volume_id: "local-filesystem".to_owned(),
             owner_generation: 1,

@@ -1,14 +1,13 @@
 use std::{str::FromStr, sync::Arc};
 
 use neoengram_central::{
-    open_sqlite_authority, AdvancePlaygroundCommitRequest, ArtifactHeadExpectation,
+    open_sqlite_authority, AdvanceWorkspaceCommitRequest, ArtifactHeadExpectation,
     ArtifactInitialization, ArtifactListRequest, ArtifactRecord, AuthorityLifecycleImpact,
     CatalogInsertOutcome, CatalogNfsReference, CatalogPvcReference, CentralErrorCode,
     ControlCatalogRepository, CreateDeletionRequest, CreateRetentionHoldRequest,
     DeletionImpactQuery, DeletionTransitionRequest, GatewayPoolRecord, GatewayPoolState,
     GatewayRegistryRepository, InMemoryControlCatalog, LifecycleAssignmentInsertOutcome,
-    LifecycleAssignmentOutboxRecord, PlaygroundInsertRequest, PlaygroundListRequest,
-    PlaygroundRecord, PlaygroundState, ReleaseRetentionHoldRequest, RestoreDeletionRequest,
+    LifecycleAssignmentOutboxRecord, ReleaseRetentionHoldRequest, RestoreDeletionRequest,
     RetryDeletionRequest, S3AccessPointInsertOutcome, S3AccessPointRecord, S3AccessPointState,
     S3CredentialInsertOutcome, S3CredentialRecord, S3CredentialState, S3MutationKind,
     S3MutationRecord, SnapshotDeliveryInsertOutcome, SnapshotDeliveryInsertRequest,
@@ -16,18 +15,19 @@ use neoengram_central::{
     SnapshotDeliveryRetentionRoot, SnapshotInsertRequest, SnapshotRecord, SnapshotState,
     SnapshotWithDeliveryInsertRequest, SqliteAuthorityConfig, StorageAccessMode,
     StorageBackendType, StorageVolumeListRequest, StorageVolumeRecord, StorageVolumeState,
-    TenantListRequest, TenantRecord,
+    TenantListRequest, TenantRecord, WorkspaceInsertRequest, WorkspaceListRequest, WorkspaceRecord,
+    WorkspaceState,
 };
 use neoengram_domain::core::{ContentDigest, LogicalPath, ObjectId};
 use neoengram_domain::protocol::{
     AgentId, AgentMountId, AgentResourceLifecycleAssignment, AgentResourceLifecycleScope,
     ArtifactId, DecimalU64, DeletionId, DeletionOperationState, DeliveryGeneration, EdgeClusterId,
     Extensions, GatewayPoolId, Generation, LifecycleAssignmentId, MountGeneration, OwnerGeneration,
-    PlaygroundId, PrincipalId, PrincipalKind, PrincipalRef, ProjectId, RequestId,
-    ResourceLifecycle, ResourceLifecycleAction, ResourceLifecycleAssignment,
-    ResourceLifecycleState, ResourceRef, ResourceVersion, RetentionHoldId, S3AccessPointId,
-    S3CredentialId, SessionGeneration, SnapshotDeliveryId, SnapshotDeliveryMode,
-    SnapshotDeliveryState, SnapshotId, StorageVolumeId, TenantId, UnixMillis, VolumeMarkerId,
+    PrincipalId, PrincipalKind, PrincipalRef, ProjectId, RequestId, ResourceLifecycle,
+    ResourceLifecycleAction, ResourceLifecycleAssignment, ResourceLifecycleState, ResourceRef,
+    ResourceVersion, RetentionHoldId, S3AccessPointId, S3CredentialId, SessionGeneration,
+    SnapshotDeliveryId, SnapshotDeliveryMode, SnapshotDeliveryState, SnapshotId, StorageVolumeId,
+    TaskExecutionFence, TaskId, TenantId, UnixMillis, VolumeMarkerId, WorkspaceId,
     DELETION_RECOVERY_WINDOW_MILLIS,
 };
 use sqlx::{sqlite::SqliteConnectOptions, Connection, SqliteConnection};
@@ -114,65 +114,65 @@ async fn sqlite_catalog_persists_idempotent_resources_and_keyset_pages() {
         .unwrap();
     assert_eq!(volumes.records.len(), 2);
 
-    let mut playground = playground();
-    playground.state = PlaygroundState::Creating;
+    let mut workspace = workspace();
+    workspace.state = WorkspaceState::Creating;
     repository
         .insert_artifact(artifact("tenant-a", "project-a", "artifact-a", 150))
         .await
         .unwrap();
     repository
-        .insert_playground(playground.clone())
+        .insert_workspace(workspace.clone())
         .await
         .unwrap();
     assert_eq!(
         repository
-            .get_playground(
-                &playground.tenant_id,
-                &playground.project_id,
-                &playground.artifact_id,
-                &playground.playground_id,
+            .get_workspace(
+                &workspace.tenant_id,
+                &workspace.project_id,
+                &workspace.artifact_id,
+                &workspace.workspace_id,
             )
             .await
             .unwrap(),
-        Some(playground.clone())
+        Some(workspace.clone())
     );
     let ready = repository
-        .transition_playground_state(
-            &playground.tenant_id,
-            &playground.project_id,
-            &playground.artifact_id,
-            &playground.playground_id,
-            PlaygroundState::Creating,
-            PlaygroundState::Ready,
+        .transition_workspace_state(
+            &workspace.tenant_id,
+            &workspace.project_id,
+            &workspace.artifact_id,
+            &workspace.workspace_id,
+            WorkspaceState::Creating,
+            WorkspaceState::Ready,
             UnixMillis::new(250),
         )
         .await
         .unwrap();
-    assert_eq!(ready.state, PlaygroundState::Ready);
+    assert_eq!(ready.state, WorkspaceState::Ready);
     assert_eq!(ready.updated_at_unix_ms, UnixMillis::new(250));
     assert_eq!(
         repository
-            .transition_playground_state(
-                &playground.tenant_id,
-                &playground.project_id,
-                &playground.artifact_id,
-                &playground.playground_id,
-                PlaygroundState::Creating,
-                PlaygroundState::Ready,
+            .transition_workspace_state(
+                &workspace.tenant_id,
+                &workspace.project_id,
+                &workspace.artifact_id,
+                &workspace.workspace_id,
+                WorkspaceState::Creating,
+                WorkspaceState::Ready,
                 UnixMillis::new(300),
             )
             .await
             .unwrap(),
         ready,
-        "a terminal report replay must not mutate the Playground again"
+        "a terminal report replay must not mutate the Workspace again"
     );
     let page = repository
-        .list_playgrounds(&PlaygroundListRequest {
-            tenant_id: playground.tenant_id.clone(),
-            project_id: Some(playground.project_id.clone()),
-            artifact_id: Some(playground.artifact_id.clone()),
+        .list_workspaces(&WorkspaceListRequest {
+            tenant_id: workspace.tenant_id.clone(),
+            project_id: Some(workspace.project_id.clone()),
+            artifact_id: Some(workspace.artifact_id.clone()),
             region: Some("cn-shanghai".to_owned()),
-            state: Some(PlaygroundState::Ready),
+            state: Some(WorkspaceState::Ready),
             query: Some("label".to_owned()),
             after: None,
             limit: 10,
@@ -211,7 +211,7 @@ async fn clean_catalog_creates_current_snapshot_and_delivery_schema() {
         .fetch_one(&mut connection)
         .await
         .unwrap();
-    assert_eq!(version, 20);
+    assert_eq!(version, 21);
 
     let snapshot_columns: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM pragma_table_info('snapshot_catalog_records') ORDER BY cid",
@@ -333,22 +333,22 @@ async fn memory_and_sqlite_artifact_catalog_follow_the_same_contract() {
 }
 
 #[tokio::test]
-async fn memory_and_sqlite_playground_head_fences_follow_the_same_contract() {
+async fn memory_and_sqlite_workspace_head_fences_follow_the_same_contract() {
     let memory = InMemoryControlCatalog::default();
-    exercise_playground_head_fence_contract(&memory).await;
+    exercise_workspace_head_fence_contract(&memory).await;
 
     let directory = tempfile::tempdir().unwrap();
     let authority = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
         .await
         .unwrap();
     let sqlite = authority.authority_store().control_catalog().unwrap();
-    exercise_playground_head_fence_contract(sqlite.as_ref()).await;
+    exercise_workspace_head_fence_contract(sqlite.as_ref()).await;
     authority.integrity_check().await.unwrap();
     authority.close().await;
 }
 
 #[tokio::test]
-async fn sqlite_playground_commit_digests_are_null_or_exactly_32_bytes() {
+async fn sqlite_workspace_commit_digests_are_null_or_exactly_32_bytes() {
     let directory = tempfile::tempdir().unwrap();
     let authority = open_sqlite_authority(SqliteAuthorityConfig::new(directory.path()))
         .await
@@ -370,13 +370,13 @@ async fn sqlite_playground_commit_digests_are_null_or_exactly_32_bytes() {
 
     let options = SqliteConnectOptions::new().filename(directory.path().join("authority.sqlite3"));
     let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
-    for (playground_id, base, head) in [
+    for (workspace_id, base, head) in [
         ("invalid-base", Some(vec![1_u8]), None),
         ("invalid-head", None, Some(vec![2_u8; 31])),
     ] {
         let result = sqlx::query(
-            "INSERT INTO playground_catalog_records \
-             (tenant_id, project_id, artifact_id, playground_id, storage_volume_id, region, \
+            "INSERT INTO workspace_catalog_records \
+             (tenant_id, project_id, artifact_id, workspace_id, storage_volume_id, region, \
               display_name, base_commit_digest, head_commit_digest, state, relative_root, \
               created_at_unix_ms, updated_at_unix_ms) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -384,19 +384,19 @@ async fn sqlite_playground_commit_digests_are_null_or_exactly_32_bytes() {
         .bind("tenant-a")
         .bind("project-a")
         .bind("artifact-a")
-        .bind(playground_id)
+        .bind(workspace_id)
         .bind("volume-a")
         .bind("cn-shanghai")
         .bind("Invalid digest")
         .bind(base)
         .bind(head)
         .bind("ready")
-        .bind(format!("playgrounds/project-a/artifact-a/{playground_id}"))
+        .bind(format!("workspaces/project-a/artifact-a/{workspace_id}"))
         .bind(200_i64)
         .bind(200_i64)
         .execute(&mut connection)
         .await;
-        assert!(result.is_err(), "{playground_id} bypassed the digest CHECK");
+        assert!(result.is_err(), "{workspace_id} bypassed the digest CHECK");
     }
     connection.close().await.unwrap();
 }
@@ -491,99 +491,96 @@ async fn exercise_artifact_contract(repository: &dyn ControlCatalogRepository) {
         .insert_storage_volume(pvc_volume("tenant-a", "volume-a", "claim-a"))
         .await
         .unwrap();
-    let mut orphan_playground = playground();
-    orphan_playground.artifact_id = id(ArtifactId::new, "artifact-missing");
+    let mut orphan_workspace = workspace();
+    orphan_workspace.artifact_id = id(ArtifactId::new, "artifact-missing");
     let error = repository
-        .insert_playground(orphan_playground)
+        .insert_workspace(orphan_workspace)
         .await
         .unwrap_err();
     assert_eq!(error.code(), CentralErrorCode::ArtifactNotFound);
 
-    let mut missing_volume = playground();
+    let mut missing_volume = workspace();
     missing_volume.storage_volume_id = id(StorageVolumeId::new, "volume-missing");
     let error = repository
-        .insert_playground(missing_volume)
+        .insert_workspace(missing_volume)
         .await
         .unwrap_err();
     assert_eq!(error.code(), CentralErrorCode::StorageVolumeNotFound);
 
-    let mut historical_commit = playground();
-    historical_commit.playground_id = id(PlaygroundId::new, "playground-historical");
+    let mut historical_commit = workspace();
+    historical_commit.workspace_id = id(WorkspaceId::new, "workspace-historical");
     historical_commit.base_commit_id = Some(ContentDigest::from_bytes([0xaa; 32]));
     historical_commit.head_commit_id = historical_commit.base_commit_id;
     repository
-        .insert_playground(historical_commit)
+        .insert_workspace(historical_commit)
         .await
         .unwrap();
 
-    let mut wrong_head = playground();
+    let mut wrong_head = workspace();
     wrong_head.head_commit_id = Some(ContentDigest::from_bytes([0xbb; 32]));
-    let error = repository.insert_playground(wrong_head).await.unwrap_err();
+    let error = repository.insert_workspace(wrong_head).await.unwrap_err();
     assert_eq!(error.code(), CentralErrorCode::ArtifactHeadMismatch);
 
-    let mut wrong_region = playground();
+    let mut wrong_region = workspace();
     wrong_region.region = "cn-beijing".to_owned();
-    let error = repository
-        .insert_playground(wrong_region)
-        .await
-        .unwrap_err();
+    let error = repository.insert_workspace(wrong_region).await.unwrap_err();
     assert_eq!(error.code(), CentralErrorCode::StorageVolumeRegionMismatch);
 
     let mut degraded = pvc_volume("tenant-a", "volume-degraded", "claim-degraded");
     degraded.state = StorageVolumeState::Degraded;
     repository.insert_storage_volume(degraded).await.unwrap();
-    let mut degraded_playground = playground();
-    degraded_playground.storage_volume_id = id(StorageVolumeId::new, "volume-degraded");
+    let mut degraded_workspace = workspace();
+    degraded_workspace.storage_volume_id = id(StorageVolumeId::new, "volume-degraded");
     let error = repository
-        .insert_playground(degraded_playground)
+        .insert_workspace(degraded_workspace)
         .await
         .unwrap_err();
     assert_eq!(error.code(), CentralErrorCode::StorageVolumeNotReady);
 
-    let valid = playground();
+    let valid = workspace();
     assert!(matches!(
-        repository.insert_playground(valid.clone()).await.unwrap(),
+        repository.insert_workspace(valid.clone()).await.unwrap(),
         CatalogInsertOutcome::Inserted(_)
     ));
     assert!(matches!(
-        repository.insert_playground(valid.clone()).await.unwrap(),
+        repository.insert_workspace(valid.clone()).await.unwrap(),
         CatalogInsertOutcome::Existing(_)
     ));
     let commit_id = ContentDigest::from_bytes([0xcc; 32]);
-    let advance = AdvancePlaygroundCommitRequest {
+    let advance = AdvanceWorkspaceCommitRequest {
         tenant_id: valid.tenant_id.clone(),
         project_id: valid.project_id.clone(),
         artifact_id: valid.artifact_id.clone(),
-        playground_id: valid.playground_id.clone(),
+        workspace_id: valid.workspace_id.clone(),
         expected_head_commit_id: None,
         commit_id,
         updated_at_unix_ms: UnixMillis::new(300),
     };
     let advanced = repository
-        .advance_playground_commit(advance.clone())
+        .advance_workspace_commit(advance.clone())
         .await
         .unwrap();
     assert!(!advanced.replayed);
     assert_eq!(advanced.artifact.head_commit_id, Some(commit_id));
     assert_eq!(advanced.artifact.resource_version, 2);
-    assert_eq!(advanced.playground.head_commit_id, Some(commit_id));
-    let replayed = repository.advance_playground_commit(advance).await.unwrap();
+    assert_eq!(advanced.workspace.head_commit_id, Some(commit_id));
+    let replayed = repository.advance_workspace_commit(advance).await.unwrap();
     assert!(replayed.replayed);
     assert_eq!(replayed.artifact.resource_version, 2);
 
     let mut branch = valid.clone();
-    branch.playground_id = PlaygroundId::new("playground-branch").unwrap();
-    branch.relative_root = "playgrounds/project-a/artifact-a/playground-branch".to_owned();
+    branch.workspace_id = WorkspaceId::new("workspace-branch").unwrap();
+    branch.relative_root = "workspaces/project-a/artifact-a/workspace-branch".to_owned();
     branch.head_commit_id = None;
     branch.base_commit_id = None;
-    repository.insert_playground(branch.clone()).await.unwrap();
+    repository.insert_workspace(branch.clone()).await.unwrap();
     let branch_commit_id = ContentDigest::from_bytes([0xee; 32]);
     let branched = repository
-        .advance_playground_commit(AdvancePlaygroundCommitRequest {
+        .advance_workspace_commit(AdvanceWorkspaceCommitRequest {
             tenant_id: branch.tenant_id.clone(),
             project_id: branch.project_id.clone(),
             artifact_id: branch.artifact_id.clone(),
-            playground_id: branch.playground_id.clone(),
+            workspace_id: branch.workspace_id.clone(),
             expected_head_commit_id: None,
             commit_id: branch_commit_id,
             updated_at_unix_ms: UnixMillis::new(350),
@@ -592,13 +589,13 @@ async fn exercise_artifact_contract(repository: &dyn ControlCatalogRepository) {
         .unwrap();
     assert_eq!(branched.artifact.head_commit_id, Some(branch_commit_id));
     assert_eq!(branched.artifact.resource_version, 3);
-    assert_eq!(branched.playground.head_commit_id, Some(branch_commit_id));
+    assert_eq!(branched.workspace.head_commit_id, Some(branch_commit_id));
     let branch_replay = repository
-        .advance_playground_commit(AdvancePlaygroundCommitRequest {
+        .advance_workspace_commit(AdvanceWorkspaceCommitRequest {
             tenant_id: branch.tenant_id.clone(),
             project_id: branch.project_id.clone(),
             artifact_id: branch.artifact_id.clone(),
-            playground_id: branch.playground_id.clone(),
+            workspace_id: branch.workspace_id.clone(),
             expected_head_commit_id: None,
             commit_id: branch_commit_id,
             updated_at_unix_ms: UnixMillis::new(351),
@@ -610,11 +607,11 @@ async fn exercise_artifact_contract(repository: &dyn ControlCatalogRepository) {
 
     let third_commit_id = ContentDigest::from_bytes([0xef; 32]);
     repository
-        .advance_playground_commit(AdvancePlaygroundCommitRequest {
+        .advance_workspace_commit(AdvanceWorkspaceCommitRequest {
             tenant_id: valid.tenant_id.clone(),
             project_id: valid.project_id.clone(),
             artifact_id: valid.artifact_id.clone(),
-            playground_id: valid.playground_id.clone(),
+            workspace_id: valid.workspace_id.clone(),
             expected_head_commit_id: Some(commit_id),
             commit_id: third_commit_id,
             updated_at_unix_ms: UnixMillis::new(375),
@@ -622,11 +619,11 @@ async fn exercise_artifact_contract(repository: &dyn ControlCatalogRepository) {
         .await
         .unwrap();
     let replay_after_other_branch_advanced = repository
-        .advance_playground_commit(AdvancePlaygroundCommitRequest {
+        .advance_workspace_commit(AdvanceWorkspaceCommitRequest {
             tenant_id: branch.tenant_id.clone(),
             project_id: branch.project_id.clone(),
             artifact_id: branch.artifact_id.clone(),
-            playground_id: branch.playground_id,
+            workspace_id: branch.workspace_id,
             expected_head_commit_id: None,
             commit_id: branch_commit_id,
             updated_at_unix_ms: UnixMillis::new(376),
@@ -639,18 +636,18 @@ async fn exercise_artifact_contract(repository: &dyn ControlCatalogRepository) {
         Some(third_commit_id),
         "recovery of an older branch publication must not roll Artifact Head back"
     );
-    let stale = AdvancePlaygroundCommitRequest {
+    let stale = AdvanceWorkspaceCommitRequest {
         tenant_id: valid.tenant_id.clone(),
         project_id: valid.project_id.clone(),
         artifact_id: valid.artifact_id.clone(),
-        playground_id: valid.playground_id.clone(),
+        workspace_id: valid.workspace_id.clone(),
         expected_head_commit_id: None,
         commit_id: ContentDigest::from_bytes([0xdd; 32]),
         updated_at_unix_ms: UnixMillis::new(400),
     };
     assert_eq!(
         repository
-            .advance_playground_commit(stale)
+            .advance_workspace_commit(stale)
             .await
             .unwrap_err()
             .code(),
@@ -659,13 +656,13 @@ async fn exercise_artifact_contract(repository: &dyn ControlCatalogRepository) {
     let mut changed_region = valid;
     changed_region.region = "cn-beijing".to_owned();
     let error = repository
-        .insert_playground(changed_region)
+        .insert_workspace(changed_region)
         .await
         .unwrap_err();
     assert_eq!(error.code(), CentralErrorCode::InvalidState);
 }
 
-async fn exercise_playground_head_fence_contract(repository: &dyn ControlCatalogRepository) {
+async fn exercise_workspace_head_fence_contract(repository: &dyn ControlCatalogRepository) {
     repository
         .insert_tenant(tenant("tenant-a", "Head fences"))
         .await
@@ -681,10 +678,10 @@ async fn exercise_playground_head_fence_contract(repository: &dyn ControlCatalog
     nonempty.head_commit_id = Some(current_head);
     repository.insert_artifact(nonempty).await.unwrap();
 
-    let explicit_historical = playground_at("explicit-historical", Some(historical));
+    let explicit_historical = workspace_at("explicit-historical", Some(historical));
     assert!(matches!(
         repository
-            .insert_playground_fenced(PlaygroundInsertRequest {
+            .insert_workspace_fenced(WorkspaceInsertRequest {
                 record: explicit_historical.clone(),
                 artifact_head: ArtifactHeadExpectation::Any,
             })
@@ -693,10 +690,10 @@ async fn exercise_playground_head_fence_contract(repository: &dyn ControlCatalog
         CatalogInsertOutcome::Inserted(record) if record == explicit_historical
     ));
 
-    let inherited = playground_at("inherited-current", Some(current_head));
+    let inherited = workspace_at("inherited-current", Some(current_head));
     assert!(matches!(
         repository
-            .insert_playground_fenced(PlaygroundInsertRequest {
+            .insert_workspace_fenced(WorkspaceInsertRequest {
                 record: inherited.clone(),
                 artifact_head: ArtifactHeadExpectation::Exact(Some(current_head)),
             })
@@ -705,9 +702,9 @@ async fn exercise_playground_head_fence_contract(repository: &dyn ControlCatalog
         CatalogInsertOutcome::Inserted(record) if record == inherited
     ));
 
-    let stale_observation = playground_at("stale-nonempty", Some(historical));
+    let stale_observation = workspace_at("stale-nonempty", Some(historical));
     let stale = repository
-        .insert_playground_fenced(PlaygroundInsertRequest {
+        .insert_workspace_fenced(WorkspaceInsertRequest {
             record: stale_observation,
             artifact_head: ArtifactHeadExpectation::Exact(Some(historical)),
         })
@@ -716,13 +713,13 @@ async fn exercise_playground_head_fence_contract(repository: &dyn ControlCatalog
     assert_eq!(stale.code(), CentralErrorCode::ArtifactHeadMismatch);
     assert!(stale.retryable());
 
-    let replay_with_new_observation = playground_at(
+    let replay_with_new_observation = workspace_at(
         "inherited-current",
         Some(ContentDigest::from_bytes([0x33; 32])),
     );
     assert!(matches!(
         repository
-            .insert_playground_fenced(PlaygroundInsertRequest {
+            .insert_workspace_fenced(WorkspaceInsertRequest {
                 record: replay_with_new_observation,
                 artifact_head: ArtifactHeadExpectation::Exact(Some(ContentDigest::from_bytes(
                     [0x33; 32]
@@ -734,8 +731,8 @@ async fn exercise_playground_head_fence_contract(repository: &dyn ControlCatalog
     ));
     assert_eq!(
         repository
-            .insert_playground_fenced(PlaygroundInsertRequest {
-                record: playground_at(
+            .insert_workspace_fenced(WorkspaceInsertRequest {
+                record: workspace_at(
                     "inherited-current",
                     Some(ContentDigest::from_bytes([0x33; 32])),
                 ),
@@ -751,13 +748,12 @@ async fn exercise_playground_head_fence_contract(repository: &dyn ControlCatalog
     let mut empty = artifact("tenant-a", "project-a", "artifact-empty", 101);
     empty.artifact_id = id(ArtifactId::new, "artifact-empty");
     repository.insert_artifact(empty).await.unwrap();
-    let mut empty_baseline = playground_at("inherited-empty", None);
+    let mut empty_baseline = workspace_at("inherited-empty", None);
     empty_baseline.artifact_id = id(ArtifactId::new, "artifact-empty");
-    empty_baseline.relative_root =
-        "playgrounds/project-a/artifact-empty/inherited-empty".to_owned();
+    empty_baseline.relative_root = "workspaces/project-a/artifact-empty/inherited-empty".to_owned();
     assert!(matches!(
         repository
-            .insert_playground_fenced(PlaygroundInsertRequest {
+            .insert_workspace_fenced(WorkspaceInsertRequest {
                 record: empty_baseline.clone(),
                 artifact_head: ArtifactHeadExpectation::Exact(None),
             })
@@ -767,8 +763,8 @@ async fn exercise_playground_head_fence_contract(repository: &dyn ControlCatalog
     ));
 
     let stale_empty = repository
-        .insert_playground_fenced(PlaygroundInsertRequest {
-            record: playground_at("stale-empty", None),
+        .insert_workspace_fenced(WorkspaceInsertRequest {
+            record: workspace_at("stale-empty", None),
             artifact_head: ArtifactHeadExpectation::Exact(None),
         })
         .await
@@ -777,8 +773,8 @@ async fn exercise_playground_head_fence_contract(repository: &dyn ControlCatalog
     assert!(stale_empty.retryable());
 
     let malformed_fence = repository
-        .insert_playground_fenced(PlaygroundInsertRequest {
-            record: playground_at("malformed-fence", Some(current_head)),
+        .insert_workspace_fenced(WorkspaceInsertRequest {
+            record: workspace_at("malformed-fence", Some(current_head)),
             artifact_head: ArtifactHeadExpectation::Exact(Some(historical)),
         })
         .await
@@ -1664,6 +1660,13 @@ async fn exercise_lifecycle_outbox(repository: Arc<dyn ControlCatalogRepository>
                 request_digest,
                 deadline_unix_ms: UnixMillis::new(10_000),
             },
+            task_fence: TaskExecutionFence::new(
+                TaskId::new(format!("task-{}", operation.deletion_id)).unwrap(),
+                Generation::new(1),
+                "quarantine",
+                Generation::new(1),
+                Generation::new(1),
+            ),
             resource_scope: AgentResourceLifecycleScope::StorageVolume {
                 storage_volume_id: volume_id.clone(),
             },
@@ -2731,6 +2734,50 @@ async fn exercise_s3_mutation_ledger(repository: Arc<dyn ControlCatalogRepositor
             .unwrap(),
         CatalogInsertOutcome::Existing(record) if record.state == S3CredentialState::Revoked
     ));
+
+    let delete_id = id(RequestId::new, "s3-delete-request");
+    let deleted = repository
+        .delete_s3_access_point_idempotent(
+            s3_mutation(
+                &tenant_id,
+                &delete_id,
+                S3MutationKind::AccessPointDelete,
+                5,
+                700,
+            ),
+            &access_point_id,
+            UnixMillis::new(700),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        deleted,
+        CatalogInsertOutcome::Inserted(record) if record.state == S3AccessPointState::Deleted
+    ));
+    let replay_deleted = repository
+        .delete_s3_access_point_idempotent(
+            s3_mutation(
+                &tenant_id,
+                &delete_id,
+                S3MutationKind::AccessPointDelete,
+                5,
+                701,
+            ),
+            &access_point_id,
+            UnixMillis::new(701),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        replay_deleted,
+        CatalogInsertOutcome::Existing(record) if record.state == S3AccessPointState::Deleted
+    ));
+    assert!(repository
+        .list_s3_credentials(&access_point_id)
+        .await
+        .unwrap()
+        .iter()
+        .all(|credential| credential.state != S3CredentialState::Active));
 }
 
 fn s3_mutation(
@@ -2847,32 +2894,32 @@ fn artifact(
     }
 }
 
-fn playground() -> PlaygroundRecord {
-    PlaygroundRecord {
+fn workspace() -> WorkspaceRecord {
+    WorkspaceRecord {
         tenant_id: id(TenantId::new, "tenant-a"),
         project_id: id(ProjectId::new, "project-a"),
         artifact_id: id(ArtifactId::new, "artifact-a"),
-        playground_id: id(PlaygroundId::new, "labeling"),
+        workspace_id: id(WorkspaceId::new, "labeling"),
         storage_volume_id: id(StorageVolumeId::new, "volume-a"),
         region: "cn-shanghai".to_owned(),
         display_name: "Labeling".to_owned(),
         base_commit_id: None,
         head_commit_id: None,
-        state: PlaygroundState::Ready,
+        state: WorkspaceState::Ready,
         resource_version: 1,
         lifecycle: ResourceLifecycle::active(),
-        relative_root: "playgrounds/project-a/artifact-a/labeling".to_owned(),
+        relative_root: "workspaces/project-a/artifact-a/labeling".to_owned(),
         created_at_unix_ms: UnixMillis::new(200),
         updated_at_unix_ms: UnixMillis::new(200),
     }
 }
 
-fn playground_at(playground_id: &str, base_commit_id: Option<ContentDigest>) -> PlaygroundRecord {
-    let mut record = playground();
-    record.playground_id = id(PlaygroundId::new, playground_id);
+fn workspace_at(workspace_id: &str, base_commit_id: Option<ContentDigest>) -> WorkspaceRecord {
+    let mut record = workspace();
+    record.workspace_id = id(WorkspaceId::new, workspace_id);
     record.base_commit_id = base_commit_id;
     record.head_commit_id = base_commit_id;
-    record.relative_root = format!("playgrounds/project-a/artifact-a/{playground_id}");
+    record.relative_root = format!("workspaces/project-a/artifact-a/{workspace_id}");
     record
 }
 

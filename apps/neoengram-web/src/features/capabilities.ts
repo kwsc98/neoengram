@@ -16,18 +16,16 @@ export function supportsCommitMaterializationV2(
   return capabilities?.includes('commit_materialization_v2') ?? false;
 }
 
-export function supportsPlaygroundMaterialize(
-  capabilities: readonly string[] | undefined,
-): boolean {
-  return capabilities?.includes('playground_materialize') ?? false;
+export function supportsWorkspaceMaterialize(capabilities: readonly string[] | undefined): boolean {
+  return capabilities?.includes('workspace_materialize') ?? false;
 }
 
-export function supportsPlaygroundBrowser(capabilities: readonly string[] | undefined): boolean {
-  return capabilities?.includes('playground_browser') ?? false;
+export function supportsWorkspaceBrowser(capabilities: readonly string[] | undefined): boolean {
+  return capabilities?.includes('workspace_browser') ?? false;
 }
 
-export function supportsPlaygroundPreCommit(capabilities: readonly string[] | undefined): boolean {
-  return capabilities?.includes('playground_precommit') ?? false;
+export function supportsWorkspacePreCommit(capabilities: readonly string[] | undefined): boolean {
+  return capabilities?.includes('workspace_precommit') ?? false;
 }
 
 export function supportsSnapshotMaterialize(capabilities: readonly string[] | undefined): boolean {

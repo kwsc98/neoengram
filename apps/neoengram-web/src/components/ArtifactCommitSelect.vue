@@ -43,7 +43,7 @@ const commitGraphQuery = useQuery({
     props.tenantId,
     props.projectId,
     props.artifactId,
-    'playground-create',
+    'workspace-create',
   ]),
   queryFn: () => queryArtifactCommitGraph(props.tenantId, props.projectId, props.artifactId),
   enabled: computed(

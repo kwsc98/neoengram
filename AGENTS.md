@@ -47,6 +47,7 @@
 | Central/API/authority | `services/neoengram-central/src/controller/` -> `service/` -> `ports`/`mapper/` -> `datasource/` | `services/neoengram-central/tests/`；action registry/OpenAPI | `cargo test -p neoengram-central --tests --locked` |
 | Agent 状态、Ledger、Volume 和会话 | `services/neoengram-agent/src/agent_core/`、`src/session_*`、`src/execution.rs` | `services/neoengram-agent/tests/` | `cargo test -p neoengram-agent --all-targets --locked` |
 | Gateway、mTLS、隧道和 forwarding | `services/neoengram-gateway/src/` | `services/neoengram-gateway/tests/network_e2e.rs` | `cargo test -p neoengram-gateway --test network_e2e --locked` |
+| 本地多 Gateway 开发编排 | `scripts/dev-stack.sh` | loopback Central/Gateway/Agent 进程、PID/log/state 文件 | `bash scripts/dev-stack.sh --dry-run --gateways 3`；需要时做隔离 loopback 烟测 |
 | Web 控制台 | `apps/neoengram-web/src/` | `apps/neoengram-web/tests/` | 在 Web 目录运行 `npm run format:check && npm run lint && npm run typecheck && npm run api:check && npm test && npm run build` |
 | 公开/Agent HTTP 契约 | `docs/openapi/*.yaml`、`docs/openapi/scripts/` | OpenAPI lint/bundle/contract；`action_registry` | 在 `docs/openapi` 运行 `npm run lint && npm run bundle && npm run test:contract` |
 | Kubernetes 部署边界 | `deploy/kubernetes/{agent,gateway}/` | 对应 `check-manifests.sh`、项目 manifests 模块 | `bash deploy/kubernetes/agent/check-manifests.sh` 和 Gateway 对应脚本 |
@@ -85,7 +86,18 @@
 
 ## 必跑检查
 
-根据范围选择最小检查，并在提交说明中记录命令和结果：
+默认采用低 Token 迭代方式：只读取和修改任务直接涉及的模块，不做无关重构或重复审计。
+每次改造完成后，默认运行一次统一全量测试脚本：
+
+```bash
+bash scripts/project-test.sh --no-install all
+```
+
+首次运行、依赖缺失或依赖锁文件变化时，改用 `bash scripts/project-test.sh all`。脚本非零退出或因
+平台/依赖不可用时，必须报告失败或“未运行及原因”，不能报告为通过。除非用户明确要求完整审计，
+不额外重复运行同一批检查；真实服务、凭据和跨节点 E2E 仍不由默认迭代自动创建或启动。
+
+除上述统一脚本外，根据范围选择额外的最小检查，并在提交说明中记录命令和结果：
 
 ```bash
 # Rust/架构基础门槛
@@ -104,7 +116,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --offline
 ```
 
 跨服务、部署或全链路改动使用 `scripts/project-test.sh`；它是项目测试的统一编排入口：
-`scripts/project-test.sh module <domain|runtime|agent|central|gateway|cli|openapi|web|web-e2e|manifests|quality>`、
+`scripts/project-test.sh module <domain|runtime|agent|central|gateway|dev-stack|cli|openapi|web|web-e2e|manifests|quality|gaps>`、
 `scripts/project-test.sh modules` 或 `scripts/project-test.sh full-flow`。真实 mount probe 只在 Linux、准备好
 `NEOENGRAM_REAL_MOUNT_PROBE_ROOT` 后单独运行，不能把普通测试结果当作该验证。
 

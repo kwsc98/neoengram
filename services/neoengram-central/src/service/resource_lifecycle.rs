@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::sync::Arc;
 
 use serde::Serialize;
 
@@ -12,10 +12,11 @@ use crate::{
 use neoengram_domain::core::ContentDigest;
 use neoengram_domain::protocol::{
     AgentResourceLifecycleAssignment, AgentResourceLifecycleScope, ArtifactId, ArtifactPlacementId,
-    DeletionId, DeletionOperation, DeletionOperationState, Extensions, LifecycleAssignmentId,
-    OperationTask, PlacementGeneration, PrincipalId, PrincipalKind, PrincipalRef, RequestId,
-    ResourceLifecycleAction, ResourceRef, RetentionHoldState, TaskActor, TaskKind,
-    TaskResourceKind, TaskResourceLink, TaskResourceRole, TaskScope, TaskState, UnixMillis,
+    DeletionId, DeletionOperation, DeletionOperationState, Extensions, Generation,
+    LifecycleAssignmentId, OperationTask, PlacementGeneration, PrincipalId, PrincipalKind,
+    PrincipalRef, RequestId, ResourceLifecycleAction, ResourceRef, RetentionHoldState, StageState,
+    TaskActor, TaskExecutionFence, TaskId, TaskIntent, TaskIssue, TaskResourceKind,
+    TaskResourceLink, TaskResourceRole, TaskScope, TaskState, UnixMillis,
 };
 
 const RECONCILE_PAGE_SIZE: u16 = 100;
@@ -114,7 +115,13 @@ impl ResourceLifecycleCoordinator {
             .map_err(CentralError::from)?;
         let (task, _) = coordinator
             .create_root(
-                TaskKind::CatalogLifecycle,
+                match operation.root {
+                    ResourceRef::Project { .. } => TaskIntent::ProjectDelete,
+                    ResourceRef::StorageVolume { .. } => TaskIntent::StorageVolumeDelete,
+                    ResourceRef::Artifact { .. } => TaskIntent::ArtifactDelete,
+                    ResourceRef::Workspace { .. } => TaskIntent::WorkspaceDelete,
+                    ResourceRef::Snapshot { .. } => TaskIntent::SnapshotDelete,
+                },
                 lifecycle_task_scope(operation),
                 request_id,
                 &request,
@@ -179,6 +186,14 @@ impl ResourceLifecycleCoordinator {
             .get_deletion_operation(&operation.tenant_id, &operation.deletion_id)
             .await?
             .unwrap_or_else(|| operation.clone());
+        // The DeletionOperation has a finer-grained durable state machine than the public task.
+        // Project that state onto the one root task's coarse stages before deciding whether the
+        // task can finish.  In particular, `recoverable` is a retention wait inside the
+        // quarantine stage, and must not be reported as a successful root task.
+        let synchronized_task = self
+            .synchronize_operation_task_stages(Some(task), &latest)
+            .await?;
+        let task = synchronized_task.as_ref().unwrap_or(task);
         let (next, message) = match latest.state {
             DeletionOperationState::Completed => (
                 TaskState::Succeeded,
@@ -193,7 +208,350 @@ impl ResourceLifecycleCoordinator {
                 "resource lifecycle reconciliation remains active",
             ),
         };
+        if next == TaskState::Succeeded {
+            let Some(coordinator) = &self.task_coordinator else {
+                return Ok(());
+            };
+            let current = coordinator
+                .repository()
+                .get(&task.tenant_id, &task.task_id)
+                .await?
+                .ok_or_else(|| invalid("resource lifecycle task disappeared"))?;
+            coordinator
+                .complete_immediate(&current, lifecycle_task_actor())
+                .await?;
+            return Ok(());
+        }
         self.transition_task(task, next, message).await.map(|_| ())
+    }
+
+    /// Mirrors the deletion saga onto the fixed stage plan of its root task.  Deletion detail
+    /// records remain authoritative; these transitions are only the user-visible audit
+    /// projection and are fenced by the TaskCoordinator's stage CAS/dependency checks.
+    async fn synchronize_operation_task_stages(
+        &self,
+        task: Option<&OperationTask>,
+        operation: &DeletionOperation,
+    ) -> CentralResult<Option<OperationTask>> {
+        let Some(task) = task else {
+            return Ok(None);
+        };
+        let Some(coordinator) = &self.task_coordinator else {
+            return Ok(Some(task.clone()));
+        };
+        let current = coordinator
+            .repository()
+            .get(&task.tenant_id, &task.task_id)
+            .await?
+            .ok_or_else(|| invalid("resource lifecycle task disappeared"))?;
+
+        // Restore uses the ordinary resource lifecycle plan (`validate -> persist -> publish`),
+        // while deletion uses (`validate -> impact -> quiesce -> quarantine -> finalize`).
+        let restoring = matches!(
+            current.intent_kind,
+            TaskIntent::ProjectRestore
+                | TaskIntent::ArtifactRestore
+                | TaskIntent::WorkspaceRestore
+                | TaskIntent::SnapshotRestore
+                | TaskIntent::StorageVolumeRestore
+        );
+        async fn set_stage(
+            coordinator: &super::TaskCoordinator,
+            task: &OperationTask,
+            key: &str,
+            desired: StageState,
+            issue: Option<TaskIssue>,
+        ) -> CentralResult<()> {
+            let Some(mut stage) = coordinator
+                .repository()
+                .stages(&task.tenant_id, &task.task_id)
+                .await?
+                .into_iter()
+                .find(|stage| stage.stage_key == key)
+            else {
+                return Ok(());
+            };
+            if stage.state == desired {
+                return Ok(());
+            }
+            if stage.state.is_success() {
+                return Ok(());
+            }
+            if let Some(issue) = &issue {
+                stage.issue = Some(issue.clone());
+            }
+            match desired {
+                StageState::Running | StageState::Waiting | StageState::Succeeded => {
+                    if stage.state == StageState::Pending {
+                        coordinator
+                            .transition_stage(
+                                &task.task_id,
+                                &task.tenant_id,
+                                key,
+                                StageState::Ready,
+                                None,
+                            )
+                            .await?;
+                        stage = coordinator
+                            .repository()
+                            .stages(&task.tenant_id, &task.task_id)
+                            .await?
+                            .into_iter()
+                            .find(|candidate| candidate.stage_key == key)
+                            .ok_or_else(|| invalid("resource lifecycle stage disappeared"))?;
+                    }
+                    if stage.state == StageState::Ready
+                        && matches!(
+                            desired,
+                            StageState::Running | StageState::Waiting | StageState::Succeeded
+                        )
+                    {
+                        coordinator
+                            .transition_stage(
+                                &task.task_id,
+                                &task.tenant_id,
+                                key,
+                                StageState::Running,
+                                None,
+                            )
+                            .await?;
+                    }
+                    if desired != StageState::Running {
+                        let current = coordinator
+                            .repository()
+                            .stages(&task.tenant_id, &task.task_id)
+                            .await?
+                            .into_iter()
+                            .find(|candidate| candidate.stage_key == key)
+                            .ok_or_else(|| invalid("resource lifecycle stage disappeared"))?;
+                        if current.state != desired {
+                            coordinator
+                                .transition_stage(
+                                    &task.task_id,
+                                    &task.tenant_id,
+                                    key,
+                                    desired,
+                                    None,
+                                )
+                                .await?;
+                        }
+                    }
+                }
+                StageState::Stalled | StageState::Failed => {
+                    if stage.state == StageState::Pending {
+                        coordinator
+                            .transition_stage(
+                                &task.task_id,
+                                &task.tenant_id,
+                                key,
+                                StageState::Ready,
+                                None,
+                            )
+                            .await?;
+                    }
+                    let current = coordinator
+                        .repository()
+                        .stages(&task.tenant_id, &task.task_id)
+                        .await?
+                        .into_iter()
+                        .find(|candidate| candidate.stage_key == key)
+                        .ok_or_else(|| invalid("resource lifecycle stage disappeared"))?;
+                    if current.state == StageState::Ready {
+                        coordinator
+                            .transition_stage(
+                                &task.task_id,
+                                &task.tenant_id,
+                                key,
+                                StageState::Running,
+                                None,
+                            )
+                            .await?;
+                    }
+                    let current = coordinator
+                        .repository()
+                        .stages(&task.tenant_id, &task.task_id)
+                        .await?
+                        .into_iter()
+                        .find(|candidate| candidate.stage_key == key)
+                        .ok_or_else(|| invalid("resource lifecycle stage disappeared"))?;
+                    if current.state != desired {
+                        coordinator
+                            .transition_stage(&task.task_id, &task.tenant_id, key, desired, issue)
+                            .await?;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+
+        if restoring {
+            set_stage(
+                coordinator,
+                &current,
+                "validate",
+                StageState::Succeeded,
+                None,
+            )
+            .await?;
+            match operation.state {
+                DeletionOperationState::Restoring => {
+                    set_stage(coordinator, &current, "persist", StageState::Running, None).await?;
+                }
+                DeletionOperationState::Completed => {
+                    set_stage(
+                        coordinator,
+                        &current,
+                        "persist",
+                        StageState::Succeeded,
+                        None,
+                    )
+                    .await?;
+                    set_stage(
+                        coordinator,
+                        &current,
+                        "publish",
+                        StageState::Succeeded,
+                        None,
+                    )
+                    .await?;
+                }
+                DeletionOperationState::Blocked | DeletionOperationState::Failed => {
+                    let issue = operation.last_error.as_ref().map(|message| TaskIssue {
+                        code: "RESOURCE_LIFECYCLE_BLOCKED".to_owned(),
+                        message: bounded_issue_message(message),
+                        retryable: true,
+                        detail: None,
+                    });
+                    set_stage(coordinator, &current, "persist", StageState::Stalled, issue).await?;
+                }
+                _ => {}
+            }
+        } else {
+            for key in ["validate", "impact"] {
+                set_stage(coordinator, &current, key, StageState::Succeeded, None).await?;
+            }
+            match operation.state {
+                DeletionOperationState::Requested | DeletionOperationState::Quiescing => {
+                    set_stage(coordinator, &current, "quiesce", StageState::Running, None).await?;
+                }
+                DeletionOperationState::Quarantining => {
+                    set_stage(
+                        coordinator,
+                        &current,
+                        "quiesce",
+                        StageState::Succeeded,
+                        None,
+                    )
+                    .await?;
+                    set_stage(
+                        coordinator,
+                        &current,
+                        "quarantine",
+                        StageState::Running,
+                        None,
+                    )
+                    .await?;
+                }
+                DeletionOperationState::Recoverable => {
+                    set_stage(
+                        coordinator,
+                        &current,
+                        "quiesce",
+                        StageState::Succeeded,
+                        None,
+                    )
+                    .await?;
+                    set_stage(
+                        coordinator,
+                        &current,
+                        "quarantine",
+                        StageState::Waiting,
+                        None,
+                    )
+                    .await?;
+                }
+                DeletionOperationState::Purging => {
+                    set_stage(
+                        coordinator,
+                        &current,
+                        "quiesce",
+                        StageState::Succeeded,
+                        None,
+                    )
+                    .await?;
+                    set_stage(
+                        coordinator,
+                        &current,
+                        "quarantine",
+                        StageState::Running,
+                        None,
+                    )
+                    .await?;
+                }
+                DeletionOperationState::Finalizing => {
+                    set_stage(
+                        coordinator,
+                        &current,
+                        "quiesce",
+                        StageState::Succeeded,
+                        None,
+                    )
+                    .await?;
+                    set_stage(
+                        coordinator,
+                        &current,
+                        "quarantine",
+                        StageState::Succeeded,
+                        None,
+                    )
+                    .await?;
+                    set_stage(coordinator, &current, "finalize", StageState::Running, None).await?;
+                }
+                DeletionOperationState::Completed => {
+                    for key in ["quiesce", "quarantine", "finalize"] {
+                        set_stage(coordinator, &current, key, StageState::Succeeded, None).await?;
+                    }
+                }
+                DeletionOperationState::Blocked | DeletionOperationState::Failed => {
+                    let issue = operation.last_error.as_ref().map(|message| TaskIssue {
+                        code: "RESOURCE_LIFECYCLE_BLOCKED".to_owned(),
+                        message: bounded_issue_message(message),
+                        retryable: true,
+                        detail: None,
+                    });
+                    let key = current
+                        .stages
+                        .iter()
+                        .find(|stage| !stage.state.is_success())
+                        .map(|stage| stage.stage_key.clone())
+                        .unwrap_or_else(|| "finalize".to_owned());
+                    set_stage(
+                        coordinator,
+                        &current,
+                        &key,
+                        if operation.state == DeletionOperationState::Failed {
+                            StageState::Failed
+                        } else {
+                            StageState::Stalled
+                        },
+                        issue,
+                    )
+                    .await?;
+                }
+                DeletionOperationState::Restoring => {}
+            }
+        }
+        let mut updated = coordinator
+            .repository()
+            .get(&current.tenant_id, &current.task_id)
+            .await?
+            .ok_or_else(|| invalid("resource lifecycle task disappeared"))?;
+        updated.stages = coordinator
+            .repository()
+            .stages(&updated.tenant_id, &updated.task_id)
+            .await?;
+        Ok(Some(updated))
     }
 
     pub async fn reconcile_once(
@@ -255,7 +613,7 @@ impl ResourceLifecycleCoordinator {
                                 .await?;
                             }
                         }
-                        match self.reconcile_operation(operation).await {
+                        match self.reconcile_operation(operation, task.as_ref()).await {
                             Ok(StepOutcome::Transitioned) => {
                                 run.transitioned += 1;
                                 self.finish_operation_task(operation, task.as_ref()).await?;
@@ -302,6 +660,7 @@ impl ResourceLifecycleCoordinator {
     async fn reconcile_operation(
         &self,
         operation: &DeletionOperation,
+        task: Option<&OperationTask>,
     ) -> CentralResult<StepOutcome> {
         match operation.state {
             DeletionOperationState::Requested => {
@@ -318,10 +677,10 @@ impl ResourceLifecycleCoordinator {
             }
             DeletionOperationState::Quarantining => {
                 let published = self
-                    .ensure_assignments(operation, ResourceLifecycleAction::Quarantine)
+                    .ensure_assignments(operation, ResourceLifecycleAction::Quarantine, task)
                     .await?;
                 if self
-                    .assignments_complete(operation, ResourceLifecycleAction::Quarantine)
+                    .assignments_complete(operation, ResourceLifecycleAction::Quarantine, task)
                     .await?
                 {
                     self.transition(operation, DeletionOperationState::Recoverable, None)
@@ -345,10 +704,10 @@ impl ResourceLifecycleCoordinator {
             }
             DeletionOperationState::Purging => {
                 let published = self
-                    .ensure_assignments(operation, ResourceLifecycleAction::Purge)
+                    .ensure_assignments(operation, ResourceLifecycleAction::Purge, task)
                     .await?;
                 if self
-                    .assignments_complete(operation, ResourceLifecycleAction::Purge)
+                    .assignments_complete(operation, ResourceLifecycleAction::Purge, task)
                     .await?
                 {
                     self.transition(operation, DeletionOperationState::Finalizing, None)
@@ -370,10 +729,10 @@ impl ResourceLifecycleCoordinator {
             }
             DeletionOperationState::Restoring => {
                 let published = self
-                    .ensure_assignments(operation, ResourceLifecycleAction::Restore)
+                    .ensure_assignments(operation, ResourceLifecycleAction::Restore, task)
                     .await?;
                 if self
-                    .assignments_complete(operation, ResourceLifecycleAction::Restore)
+                    .assignments_complete(operation, ResourceLifecycleAction::Restore, task)
                     .await?
                 {
                     self.transition(operation, DeletionOperationState::Completed, None)
@@ -410,8 +769,9 @@ impl ResourceLifecycleCoordinator {
         &self,
         operation: &DeletionOperation,
         action: ResourceLifecycleAction,
+        task: Option<&OperationTask>,
     ) -> CentralResult<usize> {
-        let commands = self.commands(operation, action).await?;
+        let commands = self.commands(operation, action, task).await?;
         let mut published = 0;
         for command in commands {
             let assignment_id = command.assignment.assignment_id.clone();
@@ -451,8 +811,9 @@ impl ResourceLifecycleCoordinator {
         &self,
         operation: &DeletionOperation,
         action: ResourceLifecycleAction,
+        task: Option<&OperationTask>,
     ) -> CentralResult<bool> {
-        let commands = self.commands(operation, action).await?;
+        let commands = self.commands(operation, action, task).await?;
         if commands.is_empty() {
             return Ok(true);
         }
@@ -480,6 +841,7 @@ impl ResourceLifecycleCoordinator {
         &self,
         operation: &DeletionOperation,
         action: ResourceLifecycleAction,
+        task: Option<&OperationTask>,
     ) -> CentralResult<Vec<AgentResourceLifecycleAssignment>> {
         if matches!(
             (&operation.root, action),
@@ -490,156 +852,127 @@ impl ResourceLifecycleCoordinator {
         ) {
             self.ensure_volume_has_no_unique_replicas(operation).await?;
         }
-        let volume_ids = self.operation_volume_ids(operation).await?;
-        if matches!(operation.root, ResourceRef::Artifact { .. }) && volume_ids.is_empty() {
-            return Err(invalid(
-                "Artifact physical placement inventory is empty; refusing metadata-only cleanup",
-            ));
-        }
-        let target = operation
+        let mut commands = Vec::new();
+        for target in operation
             .targets
             .iter()
-            .find(|target| target.resource == operation.root)
-            .ok_or_else(|| internal("deletion root is absent from its target batch"))?;
-        if !target.requires_agent_cleanup {
-            return Ok(Vec::new());
-        }
-        let mut commands = Vec::with_capacity(volume_ids.len());
-        for volume_id in volume_ids {
-            let owner = self
-                .agents
-                .get_current_by_volume(&operation.tenant_id, &volume_id)
-                .await?
-                .ok_or_else(|| invalid("deletion target Volume has no enrolled Agent"))?;
-            let instance = owner
-                .instance
-                .as_ref()
-                .ok_or_else(|| invalid("deletion target Agent has no active instance"))?;
-            let session_generation = instance
-                .session_generation
-                .ok_or_else(|| invalid("deletion target Agent has no active session"))?;
-            if owner.owner.active_agent_id.as_ref() != Some(&instance.agent_id)
-                || owner.owner.active_agent_mount_id.as_ref() != Some(&owner.mount.agent_mount_id)
-            {
-                return Err(invalid("deletion target Volume owner fence is unavailable"));
+            .filter(|target| target.requires_agent_cleanup)
+        {
+            let volume_ids = self.target_volume_ids(operation, &target.resource).await?;
+            if matches!(target.resource, ResourceRef::Artifact { .. }) && volume_ids.is_empty() {
+                return Err(invalid(
+                    "Artifact physical placement inventory is empty; refusing metadata-only cleanup",
+                ));
             }
-            let scope = self.lifecycle_scope(operation, &volume_id).await?;
-            let assignment_id = lifecycle_assignment_id(
-                operation,
-                action,
-                &volume_id,
-                target.lifecycle_generation,
-            )?;
-            let command = AgentResourceLifecycleAssignment {
-                assignment: neoengram_domain::protocol::ResourceLifecycleAssignment {
-                    assignment_id,
-                    tenant_id: operation.tenant_id.clone(),
-                    deletion_id: operation.deletion_id.clone(),
-                    resource: operation.root.clone(),
+            for volume_id in volume_ids {
+                let owner = self
+                    .agents
+                    .get_current_by_volume(&operation.tenant_id, &volume_id)
+                    .await?
+                    .ok_or_else(|| invalid("deletion target Volume has no enrolled Agent"))?;
+                let instance = owner
+                    .instance
+                    .as_ref()
+                    .ok_or_else(|| invalid("deletion target Agent has no active instance"))?;
+                let session_generation = instance
+                    .session_generation
+                    .ok_or_else(|| invalid("deletion target Agent has no active session"))?;
+                if owner.owner.active_agent_id.as_ref() != Some(&instance.agent_id)
+                    || owner.owner.active_agent_mount_id.as_ref()
+                        != Some(&owner.mount.agent_mount_id)
+                {
+                    return Err(invalid("deletion target Volume owner fence is unavailable"));
+                }
+                let scope = self
+                    .lifecycle_scope_for_resource(operation, &target.resource, &volume_id)
+                    .await?;
+                let assignment_id = lifecycle_assignment_id(
+                    operation,
                     action,
-                    lifecycle_generation: target.lifecycle_generation,
-                    request_digest: operation.request_digest,
-                    deadline_unix_ms: UnixMillis::new(
-                        self.clock
-                            .now()
-                            .get()
-                            .checked_add(ASSIGNMENT_DEADLINE_MS)
-                            .ok_or_else(|| internal("lifecycle assignment deadline overflow"))?,
+                    &target.resource,
+                    &volume_id,
+                    target.lifecycle_generation,
+                )?;
+                let (task_id, task_attempt, stage_key, stage_attempt) =
+                    lifecycle_task_fence_parts(operation, action, task)?;
+                let command = AgentResourceLifecycleAssignment {
+                    assignment: neoengram_domain::protocol::ResourceLifecycleAssignment {
+                        assignment_id,
+                        tenant_id: operation.tenant_id.clone(),
+                        deletion_id: operation.deletion_id.clone(),
+                        resource: target.resource.clone(),
+                        action,
+                        lifecycle_generation: target.lifecycle_generation,
+                        request_digest: operation.request_digest,
+                        deadline_unix_ms: UnixMillis::new(
+                            self.clock
+                                .now()
+                                .get()
+                                .checked_add(ASSIGNMENT_DEADLINE_MS)
+                                .ok_or_else(|| {
+                                    internal("lifecycle assignment deadline overflow")
+                                })?,
+                        ),
+                    },
+                    task_fence: TaskExecutionFence::new(
+                        task_id,
+                        task_attempt,
+                        stage_key,
+                        stage_attempt,
+                        Generation::new(1),
                     ),
-                },
-                resource_scope: scope,
-                agent_id: instance.agent_id.clone(),
-                edge_cluster_id: owner.enrollment.edge_cluster_id.clone(),
-                agent_mount_id: owner.mount.agent_mount_id.clone(),
-                volume_marker_id: owner.mount.expected_volume_marker.clone(),
-                session_generation,
-                mount_generation: owner.mount.mount_generation,
-                owner_generation: owner.owner.owner_generation,
-                extensions: Default::default(),
-            };
-            command.validate()?;
-            commands.push(command);
+                    resource_scope: scope,
+                    agent_id: instance.agent_id.clone(),
+                    edge_cluster_id: owner.enrollment.edge_cluster_id.clone(),
+                    agent_mount_id: owner.mount.agent_mount_id.clone(),
+                    volume_marker_id: owner.mount.expected_volume_marker.clone(),
+                    session_generation,
+                    mount_generation: owner.mount.mount_generation,
+                    owner_generation: owner.owner.owner_generation,
+                    extensions: Default::default(),
+                };
+                command.validate()?;
+                commands.push(command);
+            }
         }
         Ok(commands)
     }
 
-    async fn operation_volume_ids(
+    async fn target_volume_ids(
         &self,
         operation: &DeletionOperation,
+        resource: &ResourceRef,
     ) -> CentralResult<Vec<neoengram_domain::protocol::StorageVolumeId>> {
-        let mut volumes = BTreeSet::new();
-        match &operation.root {
-            ResourceRef::StorageVolume { storage_volume_id } => {
-                volumes.insert(storage_volume_id.clone());
-            }
-            ResourceRef::Snapshot { snapshot_id } => {
-                // A Snapshot owns exactly one immutable physical Delivery. Resolve its target
-                // Volume so the lifecycle saga can fence and purge that Delivery's directory.
-                let snapshot = self
-                    .catalog
-                    .get_snapshot_for_lifecycle(&operation.tenant_id, snapshot_id)
-                    .await?
-                    .ok_or_else(|| invalid("Snapshot deletion target no longer exists"))?;
-                volumes.insert(snapshot.storage_volume_id);
-            }
-            ResourceRef::Playground {
+        match resource {
+            ResourceRef::Project { .. } => Ok(Vec::new()),
+            ResourceRef::StorageVolume { storage_volume_id } => Ok(vec![storage_volume_id.clone()]),
+            ResourceRef::Snapshot { snapshot_id } => self
+                .catalog
+                .get_snapshot_for_lifecycle(&operation.tenant_id, snapshot_id)
+                .await?
+                .map(|snapshot| vec![snapshot.storage_volume_id])
+                .ok_or_else(|| invalid("Snapshot deletion target no longer exists")),
+            ResourceRef::Workspace {
                 project_id,
                 artifact_id,
-                playground_id,
-            } => {
-                let playground = self
-                    .catalog
-                    .get_playground_for_lifecycle(
-                        &operation.tenant_id,
-                        project_id,
-                        artifact_id,
-                        playground_id,
-                    )
-                    .await?
-                    .ok_or_else(|| invalid("Playground deletion target no longer exists"))?;
-                volumes.insert(playground.storage_volume_id);
-            }
+                workspace_id,
+            } => self
+                .catalog
+                .get_workspace_for_lifecycle(
+                    &operation.tenant_id,
+                    project_id,
+                    artifact_id,
+                    workspace_id,
+                )
+                .await?
+                .map(|workspace| vec![workspace.storage_volume_id])
+                .ok_or_else(|| invalid("Workspace deletion target no longer exists")),
             ResourceRef::Artifact { artifact_id, .. } => {
-                volumes.extend(
-                    self.objects
-                        .artifact_placement_volumes(&operation.tenant_id, artifact_id)
-                        .await?,
-                );
-                for target in &operation.targets {
-                    match &target.resource {
-                        ResourceRef::Snapshot { snapshot_id } => {
-                            if let Some(snapshot) = self
-                                .catalog
-                                .get_snapshot_for_lifecycle(&operation.tenant_id, snapshot_id)
-                                .await?
-                            {
-                                volumes.insert(snapshot.storage_volume_id);
-                            }
-                        }
-                        ResourceRef::Playground {
-                            project_id,
-                            artifact_id,
-                            playground_id,
-                        } => {
-                            if let Some(playground) = self
-                                .catalog
-                                .get_playground_for_lifecycle(
-                                    &operation.tenant_id,
-                                    project_id,
-                                    artifact_id,
-                                    playground_id,
-                                )
-                                .await?
-                            {
-                                volumes.insert(playground.storage_volume_id);
-                            }
-                        }
-                        ResourceRef::StorageVolume { .. } | ResourceRef::Artifact { .. } => {}
-                    }
-                }
+                self.objects
+                    .artifact_placement_volumes(&operation.tenant_id, artifact_id)
+                    .await
             }
         }
-        Ok(volumes.into_iter().collect())
     }
 
     async fn ensure_volume_has_no_unique_replicas(
@@ -736,12 +1069,16 @@ impl ResourceLifecycleCoordinator {
         Ok(())
     }
 
-    async fn lifecycle_scope(
+    async fn lifecycle_scope_for_resource(
         &self,
         operation: &DeletionOperation,
+        resource: &ResourceRef,
         storage_volume_id: &neoengram_domain::protocol::StorageVolumeId,
     ) -> CentralResult<AgentResourceLifecycleScope> {
-        match &operation.root {
+        match resource {
+            ResourceRef::Project { .. } => Err(internal(
+                "Project lifecycle cleanup is represented by its dependent resource targets",
+            )),
             ResourceRef::StorageVolume {
                 storage_volume_id: expected,
             } => {
@@ -768,30 +1105,30 @@ impl ResourceLifecycleCoordinator {
                 )?,
                 placement_generation: PlacementGeneration::new(1),
             }),
-            ResourceRef::Playground {
+            ResourceRef::Workspace {
                 project_id,
                 artifact_id,
-                playground_id,
+                workspace_id,
             } => {
-                let playground = self
+                let workspace = self
                     .catalog
-                    .get_playground_for_lifecycle(
+                    .get_workspace_for_lifecycle(
                         &operation.tenant_id,
                         project_id,
                         artifact_id,
-                        playground_id,
+                        workspace_id,
                     )
                     .await?
-                    .ok_or_else(|| invalid("Playground deletion target no longer exists"))?;
-                if &playground.storage_volume_id != storage_volume_id {
+                    .ok_or_else(|| invalid("Workspace deletion target no longer exists"))?;
+                if &workspace.storage_volume_id != storage_volume_id {
                     return Err(internal(
-                        "Playground lifecycle command resolved an unrelated Volume",
+                        "Workspace lifecycle command resolved an unrelated Volume",
                     ));
                 }
-                Ok(AgentResourceLifecycleScope::Playground {
+                Ok(AgentResourceLifecycleScope::Workspace {
                     project_id: project_id.clone(),
                     artifact_id: artifact_id.clone(),
-                    playground_id: playground_id.clone(),
+                    workspace_id: workspace_id.clone(),
                     storage_volume_id: storage_volume_id.clone(),
                     artifact_placement_id: placement_id(
                         &operation.tenant_id,
@@ -870,6 +1207,36 @@ impl ResourceLifecycleCoordinator {
     }
 }
 
+fn lifecycle_task_fence_parts(
+    operation: &DeletionOperation,
+    action: ResourceLifecycleAction,
+    task: Option<&OperationTask>,
+) -> CentralResult<(TaskId, Generation, String, Generation)> {
+    let task_id = task
+        .map(|task| task.task_id.clone())
+        .unwrap_or(TaskId::new(format!("task-{}", operation.deletion_id))?);
+    let task_attempt = task
+        .map(|task| task.attempt)
+        .unwrap_or_else(|| Generation::new(1));
+    // Quarantine and the later physical purge are one public deletion stage. Restore is the
+    // persistence stage of a restore intent; using the actual plan key keeps reports fenced to a
+    // stage that exists in the root task rather than inventing a second public phase.
+    let preferred = match action {
+        ResourceLifecycleAction::Quarantine | ResourceLifecycleAction::Purge => "quarantine",
+        ResourceLifecycleAction::Restore => "persist",
+        ResourceLifecycleAction::CancelJobs => "quiesce",
+    };
+    let (stage_key, stage_attempt) = task
+        .and_then(|task| {
+            task.stages
+                .iter()
+                .find(|stage| stage.stage_key == preferred)
+                .map(|stage| (stage.stage_key.clone(), stage.stage_attempt))
+        })
+        .unwrap_or_else(|| (preferred.to_owned(), Generation::new(1)));
+    Ok((task_id, task_attempt, stage_key, stage_attempt))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StepOutcome {
     Idle,
@@ -892,9 +1259,24 @@ fn lifecycle_task_actor() -> TaskActor {
     })
 }
 
+fn bounded_issue_message(value: &str) -> String {
+    const MAX_BYTES: usize = 512;
+    if value.len() <= MAX_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_BYTES;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    value[..end].to_owned()
+}
+
 fn lifecycle_task_scope(operation: &DeletionOperation) -> TaskScope {
     let mut scope = TaskScope::new(operation.tenant_id.clone());
     match &operation.root {
+        ResourceRef::Project { project_id } => {
+            scope.project_id = Some(project_id.clone());
+        }
         ResourceRef::StorageVolume { storage_volume_id } => {
             scope.storage_volume_id = Some(storage_volume_id.clone());
         }
@@ -905,14 +1287,16 @@ fn lifecycle_task_scope(operation: &DeletionOperation) -> TaskScope {
             scope.project_id = Some(project_id.clone());
             scope.artifact_id = Some(artifact_id.clone());
         }
-        ResourceRef::Playground {
+        ResourceRef::Workspace {
             project_id,
             artifact_id,
-            playground_id,
+            workspace_id,
         } => {
             scope.project_id = Some(project_id.clone());
             scope.artifact_id = Some(artifact_id.clone());
-            scope.playground_id = Some(playground_id.clone());
+            scope.workspace_id = Some(workspace_id.clone());
+            scope.workspace_id =
+                neoengram_domain::protocol::WorkspaceId::new(workspace_id.to_string()).ok();
         }
         ResourceRef::Snapshot { snapshot_id } => {
             scope.snapshot_id = Some(snapshot_id.clone());
@@ -934,6 +1318,7 @@ fn placement_id(
 fn lifecycle_assignment_id(
     operation: &DeletionOperation,
     action: ResourceLifecycleAction,
+    resource: &ResourceRef,
     storage_volume_id: &neoengram_domain::protocol::StorageVolumeId,
     lifecycle_generation: neoengram_domain::protocol::LifecycleGeneration,
 ) -> CentralResult<LifecycleAssignmentId> {
@@ -945,9 +1330,10 @@ fn lifecycle_assignment_id(
     };
     let digest = blake3::hash(
         format!(
-            "{}\0{}\0{}\0{}\0{}",
+            "{}\0{}\0{}\0{}\0{}\0{}",
             operation.deletion_id,
             action,
+            serde_json::to_string(resource).map_err(|error| internal(error.to_string()))?,
             storage_volume_id,
             lifecycle_generation.get(),
             operation.retry_count.get()
@@ -959,8 +1345,9 @@ fn lifecycle_assignment_id(
 
 fn authority_target_priority(resource: &ResourceRef) -> u8 {
     match resource {
+        ResourceRef::Project { .. } => 4,
         ResourceRef::Snapshot { .. } => 0,
-        ResourceRef::Playground { .. } => 1,
+        ResourceRef::Workspace { .. } => 1,
         ResourceRef::Artifact { .. } => 2,
         ResourceRef::StorageVolume { .. } => 3,
     }
@@ -1165,7 +1552,7 @@ mod tests {
         assert_eq!(completed.resume_state, None);
         let tasks = components.tasks.all().unwrap();
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].task_kind, TaskKind::CatalogLifecycle);
+        assert_eq!(tasks[0].intent_kind, TaskIntent::ArtifactDelete);
         assert_eq!(tasks[0].state, TaskState::Succeeded);
         assert_eq!(tasks[0].detail_kind.as_deref(), Some("deletion"));
         assert_eq!(tasks[0].detail_id.as_deref(), Some("deletion-retry"));
@@ -1329,12 +1716,15 @@ mod tests {
         );
 
         assert_eq!(
-            coordinator.operation_volume_ids(&operation).await.unwrap(),
+            coordinator
+                .target_volume_ids(&operation, &operation.root)
+                .await
+                .unwrap(),
             vec![volume_id.clone()]
         );
         assert_eq!(
             coordinator
-                .lifecycle_scope(&operation, &volume_id)
+                .lifecycle_scope_for_resource(&operation, &operation.root, &volume_id)
                 .await
                 .unwrap(),
             AgentResourceLifecycleScope::Snapshot {
@@ -1402,6 +1792,7 @@ mod tests {
         let first = lifecycle_assignment_id(
             &operation,
             ResourceLifecycleAction::Purge,
+            &operation.root,
             &volume_id,
             neoengram_domain::protocol::LifecycleGeneration::new(1),
         )
@@ -1410,6 +1801,7 @@ mod tests {
         let retried = lifecycle_assignment_id(
             &operation,
             ResourceLifecycleAction::Purge,
+            &operation.root,
             &volume_id,
             neoengram_domain::protocol::LifecycleGeneration::new(1),
         )

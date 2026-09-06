@@ -133,7 +133,7 @@ describe('S3 credential dialog', () => {
 
   it('reuses request identity after failure and explains a replay without Secret', async () => {
     api.createS3Credential.mockRejectedValueOnce(new Error('response lost')).mockResolvedValueOnce({
-      data: { credential: existingCredential, replayed: true },
+      data: { credential: existingCredential, request_replayed: true },
       requestId: 'request-credential-replay',
     });
     const { wrapper, queryClient } = await mountDialog();

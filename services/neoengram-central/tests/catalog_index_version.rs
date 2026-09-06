@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use neoengram_central::{
     dto::{
-        CreateAddJobRequest, CreatePlaygroundRequest, IndexVersionBody, QueryPlaygroundListRequest,
-        QueryPlaygroundRequest,
+        CreateAddJobRequest, CreateWorkspaceRequest, IndexVersionBody, QueryWorkspaceListRequest,
+        QueryWorkspaceRequest,
     },
     AuthenticatedIdentity, CatalogService, JobService, Permission, StaticRbacPolicy,
 };
@@ -15,8 +15,8 @@ use neoengram_central::{
 };
 use neoengram_domain::core::{ChunkingStrategy, FileRecord, IndexVersion, LogicalPath, Manifest};
 use neoengram_domain::protocol::{
-    ArtifactId, DecimalU64, EdgeClusterId, Extensions, IndexDeltaRecord, JobId, PlaygroundId,
-    PrincipalKind, ProjectId, StorageVolumeId, TenantId, UnixMillis,
+    ArtifactId, DecimalU64, EdgeClusterId, Extensions, IndexDeltaRecord, JobId, PrincipalKind,
+    ProjectId, StorageVolumeId, TenantId, UnixMillis, WorkspaceId,
 };
 
 mod support;
@@ -53,7 +53,7 @@ async fn job_authorization_precedes_missing_scope_validation() {
                 tenant_id: tenant_id.to_string(),
                 project_id: "project-missing".to_owned(),
                 artifact_id: "artifact-missing".to_owned(),
-                playground_id: "playground-missing".to_owned(),
+                workspace_id: "workspace-missing".to_owned(),
                 job_id: job_id.to_string(),
                 expected_index_version: IndexVersionBody {
                     revision: index.revision.to_string(),
@@ -106,7 +106,7 @@ async fn job_scope_validation_does_not_depend_on_agent_scheduling() {
                 tenant_id: tenant_id.to_string(),
                 project_id: "project-missing".to_owned(),
                 artifact_id: "artifact-missing".to_owned(),
-                playground_id: "playground-missing".to_owned(),
+                workspace_id: "workspace-missing".to_owned(),
                 job_id: "job-missing-scope".to_owned(),
                 expected_index_version: IndexVersionBody {
                     revision: index.revision.to_string(),
@@ -132,12 +132,12 @@ async fn job_scope_validation_does_not_depend_on_agent_scheduling() {
 }
 
 #[tokio::test]
-async fn playground_responses_use_the_current_published_index_version() {
+async fn workspace_responses_use_the_current_published_index_version() {
     let components = InMemoryComponents::new(1_000);
     let tenant_id = TenantId::new("tenant-a").unwrap();
     let project_id = ProjectId::new("project-a").unwrap();
     let artifact_id = ArtifactId::new("artifact-a").unwrap();
-    let playground_id = PlaygroundId::new("playground-a").unwrap();
+    let workspace_id = WorkspaceId::new("workspace-a").unwrap();
     let storage_volume_id = StorageVolumeId::new("volume-a").unwrap();
     components
         .control_catalog
@@ -204,8 +204,8 @@ async fn playground_responses_use_the_current_published_index_version() {
             "user-a",
             [tenant_id.to_string()],
             [
-                Permission::PlaygroundRead,
-                Permission::PlaygroundCreate,
+                Permission::WorkspaceRead,
+                Permission::WorkspaceCreate,
                 Permission::CreateAddJob,
             ],
         )
@@ -227,26 +227,26 @@ async fn playground_responses_use_the_current_published_index_version() {
     let jobs = JobService::from_authority(control, &authority_store).unwrap();
     let identity =
         AuthenticatedIdentity::new("user-a", PrincipalKind::User, "test", "subject-a").unwrap();
-    let create_request = CreatePlaygroundRequest {
+    let create_request = CreateWorkspaceRequest {
         tenant_id: tenant_id.to_string(),
         project_id: project_id.to_string(),
         artifact_id: artifact_id.to_string(),
-        playground_id: playground_id.to_string(),
+        workspace_id: workspace_id.to_string(),
         storage_volume_id: storage_volume_id.to_string(),
-        display_name: "Playground A".to_owned(),
+        display_name: "Workspace A".to_owned(),
         base_commit_id: None,
     };
     let created = service
-        .create_playground(&identity, create_request.clone())
+        .create_workspace(&identity, create_request.clone())
         .await
         .unwrap();
-    assert_eq!(created.playground.index_version.revision, "0");
+    assert_eq!(created.workspace.index_version.revision, "0");
 
     let index_key = IndexKey {
         tenant_id: tenant_id.clone(),
         project_id: project_id.clone(),
         artifact_id: artifact_id.clone(),
-        playground_id: playground_id.clone(),
+        workspace_id: workspace_id.clone(),
     };
     let initial_version = components
         .publisher
@@ -257,7 +257,7 @@ async fn playground_responses_use_the_current_published_index_version() {
         tenant_id: tenant_id.to_string(),
         project_id: project_id.to_string(),
         artifact_id: artifact_id.to_string(),
-        playground_id: playground_id.to_string(),
+        workspace_id: workspace_id.to_string(),
         job_id: "job-replay".to_owned(),
         expected_index_version: IndexVersionBody {
             revision: initial_version.revision.to_string(),
@@ -303,27 +303,27 @@ async fn playground_responses_use_the_current_published_index_version() {
     assert_eq!(published_version.revision.to_string(), "1");
 
     let queried = service
-        .query_playground(
+        .query_workspace(
             &identity,
-            QueryPlaygroundRequest {
+            QueryWorkspaceRequest {
                 tenant_id: tenant_id.to_string(),
                 project_id: project_id.to_string(),
                 artifact_id: artifact_id.to_string(),
-                playground_id: playground_id.to_string(),
+                workspace_id: workspace_id.to_string(),
             },
         )
         .await
         .unwrap();
-    assert_eq!(queried.playground.index_version.revision, "1");
+    assert_eq!(queried.workspace.index_version.revision, "1");
     assert_eq!(
-        queried.playground.index_version.digest,
+        queried.workspace.index_version.digest,
         published_version.digest.to_string()
     );
 
     let listed = service
-        .list_playgrounds(
+        .list_workspaces(
             &identity,
-            QueryPlaygroundListRequest {
+            QueryWorkspaceListRequest {
                 tenant_id: tenant_id.to_string(),
                 project_id: Some(project_id.to_string()),
                 artifact_id: Some(artifact_id.to_string()),
@@ -339,11 +339,11 @@ async fn playground_responses_use_the_current_published_index_version() {
     assert_eq!(listed.items[0].index_version.revision, "1");
 
     let replayed = service
-        .create_playground(&identity, create_request)
+        .create_workspace(&identity, create_request)
         .await
         .unwrap();
-    assert!(replayed.replayed);
-    assert_eq!(replayed.playground.index_version.revision, "1");
+    assert!(replayed.request_replayed);
+    assert_eq!(replayed.workspace.index_version.revision, "1");
 
     let replayed_job = jobs.create_add_job(&identity, add_request).await.unwrap();
     assert!(replayed_job.replayed);

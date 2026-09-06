@@ -7,7 +7,25 @@
       "$ref": "#/$defs/OperationTask"
     },
     {
+      "$ref": "#/$defs/TaskIntent"
+    },
+    {
+      "$ref": "#/$defs/TaskPurpose"
+    },
+    {
+      "$ref": "#/$defs/TaskResourceRef"
+    },
+    {
       "$ref": "#/$defs/TaskScope"
+    },
+    {
+      "$ref": "#/$defs/TaskStage"
+    },
+    {
+      "$ref": "#/$defs/StageState"
+    },
+    {
+      "$ref": "#/$defs/StageOutcome"
     },
     {
       "$ref": "#/$defs/TaskAttempt"
@@ -79,55 +97,32 @@
       "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
     },
     "OperationTask": {
-      "description": "Unified task row. Domain-specific execution data is referenced by `detail_kind/detail_id`.",
+      "description": "Unified task row. Domain-specific execution data is referenced by task stages and resource\nlinks; a user operation always has one stable task identity.",
       "type": "object",
       "properties": {
         "actor": {
           "$ref": "#/$defs/TaskActor"
         },
-        "artifact_id": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ArtifactId"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "attempt": {
           "$ref": "#/$defs/Generation"
-        },
-        "commit_id": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/CommitId"
-            },
-            {
-              "type": "null"
-            }
-          ]
         },
         "created_at_unix_ms": {
           "$ref": "#/$defs/UnixMillis"
         },
+        "current_stage_key": {
+          "type": "string"
+        },
         "deadline_unix_ms": {
           "$ref": "#/$defs/UnixMillis"
         },
-        "detail_id": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "detail_kind": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "executable": {
           "type": "boolean"
+        },
+        "execution_id": {
+          "type": "string"
+        },
+        "execution_key_digest": {
+          "$ref": "#/$defs/ContentDigest"
         },
         "finished_at_unix_ms": {
           "anyOf": [
@@ -139,6 +134,9 @@
             }
           ]
         },
+        "intent_kind": {
+          "$ref": "#/$defs/TaskIntent"
+        },
         "issue": {
           "anyOf": [
             {
@@ -149,49 +147,20 @@
             }
           ]
         },
-        "object_namespace_id": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ObjectNamespaceId"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "origin": {
           "$ref": "#/$defs/TaskOrigin"
         },
-        "parent_task_id": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TaskId"
-            },
-            {
-              "type": "null"
-            }
-          ]
+        "primary_resource": {
+          "$ref": "#/$defs/TaskResourceRef"
         },
-        "phase": {
-          "type": "string"
-        },
-        "playground_id": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PlaygroundId"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "progress_summary": {
+        "progress": {
+          "description": "Aggregate progress for the root task.",
           "$ref": "#/$defs/TaskProgressSummary"
         },
-        "project_id": {
+        "purpose": {
           "anyOf": [
             {
-              "$ref": "#/$defs/ProjectId"
+              "$ref": "#/$defs/TaskPurpose"
             },
             {
               "type": "null"
@@ -204,18 +173,14 @@
         "request_id": {
           "$ref": "#/$defs/RequestId"
         },
+        "resource_links": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TaskResourceLink"
+          }
+        },
         "resource_version": {
           "$ref": "#/$defs/ResourceVersion"
-        },
-        "snapshot_id": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SnapshotId"
-            },
-            {
-              "type": "null"
-            }
-          ]
         },
         "started_at_unix_ms": {
           "anyOf": [
@@ -230,21 +195,8 @@
         "state": {
           "$ref": "#/$defs/TaskState"
         },
-        "storage_volume_id": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/StorageVolumeId"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "task_id": {
           "$ref": "#/$defs/TaskId"
-        },
-        "task_kind": {
-          "$ref": "#/$defs/TaskKind"
         },
         "tenant_id": {
           "$ref": "#/$defs/TenantId"
@@ -256,15 +208,18 @@
       "additionalProperties": false,
       "required": [
         "task_id",
-        "task_kind",
+        "intent_kind",
+        "primary_resource",
+        "execution_id",
+        "execution_key_digest",
         "state",
-        "phase",
+        "current_stage_key",
         "tenant_id",
         "request_id",
         "request_digest",
         "actor",
         "attempt",
-        "progress_summary",
+        "progress",
         "deadline_unix_ms",
         "created_at_unix_ms",
         "updated_at_unix_ms",
@@ -272,13 +227,6 @@
         "origin",
         "executable"
       ]
-    },
-    "PlaygroundId": {
-      "description": "A validated playground ID wire identifier.",
-      "type": "string",
-      "maxLength": 128,
-      "minLength": 1,
-      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
     },
     "PrincipalId": {
       "description": "A validated principal ID wire identifier.",
@@ -346,6 +294,36 @@
       "minLength": 1,
       "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
     },
+    "StageOutcome": {
+      "description": "Terminal disposition of a stage.  `Reused` records that a compatible prior validation or\nexecution was adopted without creating another task; it is still a successful stage outcome.",
+      "type": "string",
+      "enum": [
+        "succeeded",
+        "skipped",
+        "no_op",
+        "reused",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "StageState": {
+      "description": "Lifecycle of one stage in a task plan.  A stage is the smallest user-visible execution unit;\nobject batches, shards and individual objects remain detail records owned by the domain flow.",
+      "type": "string",
+      "enum": [
+        "pending",
+        "ready",
+        "running",
+        "waiting",
+        "verifying",
+        "succeeded",
+        "skipped",
+        "no_op",
+        "stalled",
+        "failed",
+        "cancelling",
+        "cancelled"
+      ]
+    },
     "StorageVolumeId": {
       "description": "A validated storage volume ID wire identifier.",
       "type": "string",
@@ -389,7 +367,7 @@
       ]
     },
     "TaskAttempt": {
-      "description": "One execution attempt. A retry keeps the parent [`TaskId`] while creating a new attempt ID.",
+      "description": "One execution attempt. A retry keeps the root [`TaskId`] while creating a new attempt ID.",
       "type": "object",
       "properties": {
         "attempt": {
@@ -400,6 +378,9 @@
         },
         "created_at_unix_ms": {
           "$ref": "#/$defs/UnixMillis"
+        },
+        "current_stage_key": {
+          "type": "string"
         },
         "finished_at_unix_ms": {
           "anyOf": [
@@ -420,9 +401,6 @@
               "type": "null"
             }
           ]
-        },
-        "phase": {
-          "type": "string"
         },
         "resource_version": {
           "$ref": "#/$defs/ResourceVersion"
@@ -453,7 +431,7 @@
         "task_id",
         "attempt",
         "state",
-        "phase",
+        "current_stage_key",
         "created_at_unix_ms",
         "updated_at_unix_ms",
         "resource_version"
@@ -590,6 +568,50 @@
       "minLength": 1,
       "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
     },
+    "TaskIntent": {
+      "description": "The user-visible intent represented by an [`OperationTask`].\n\nValues intentionally use dotted stable names because they are also used as API filters and\ndatabase/reporting dimensions. Unknown values are rejected by Serde rather than silently\nfalling back to a generic operation.",
+      "type": "string",
+      "enum": [
+        "project.create",
+        "project.delete",
+        "project.restore",
+        "artifact.create",
+        "artifact.delete",
+        "artifact.restore",
+        "workspace.create",
+        "workspace.delete",
+        "workspace.restore",
+        "snapshot.create",
+        "snapshot.delete",
+        "snapshot.restore",
+        "storage_volume.create",
+        "storage_volume.delete",
+        "storage_volume.restore",
+        "s3_access_point.create",
+        "s3_access_point.delete",
+        "s3_access_point.enable",
+        "s3_access_point.disable",
+        "commit.validate",
+        "commit.create",
+        "commit.materialize",
+        "agent_enrollment.create",
+        "agent_enrollment.approve",
+        "agent_enrollment.reject",
+        "agent_enrollment.recover",
+        "agent_enrollment.delete",
+        "gateway_pool.create",
+        "gateway_pool.update",
+        "gateway_pool.drain",
+        "gateway_pool.delete",
+        "gateway_replica.create",
+        "gateway_replica.activate",
+        "gateway_replica.drain",
+        "gateway_replica.revoke",
+        "gateway_replica.delete",
+        "s3_credential.create",
+        "s3_credential.revoke"
+      ]
+    },
     "TaskIssue": {
       "description": "Stable failure information. The retryable bit is part of the authority decision and cannot be\ninferred from a free-form error message.",
       "type": "object",
@@ -617,33 +639,12 @@
         "retryable"
       ]
     },
-    "TaskKind": {
-      "description": "The write operation represented by an [`OperationTask`].\n\nValues intentionally use dotted stable names because they are also used as API filters and\ndatabase/reporting dimensions. Unknown values are rejected by Serde rather than silently\nfalling back to a generic operation.",
-      "type": "string",
-      "enum": [
-        "workspace.create",
-        "workspace.materialize",
-        "precommit.check",
-        "add.scan",
-        "commit.create",
-        "snapshot.create",
-        "snapshot.delivery.materialize",
-        "commit.materialize",
-        "integrity.scan",
-        "resource.repair",
-        "catalog.lifecycle",
-        "storage.lifecycle",
-        "gateway.lifecycle",
-        "s3.lifecycle"
-      ]
-    },
     "TaskOrigin": {
-      "description": "Origin of a task record. Legacy records are queryable but must never be scheduled again.",
+      "description": "Origin of a task record.",
       "type": "string",
       "enum": [
         "user",
-        "system",
-        "legacy"
+        "system"
       ]
     },
     "TaskProgressSummary": {
@@ -671,6 +672,14 @@
         "total_bytes"
       ]
     },
+    "TaskPurpose": {
+      "description": "Optional semantic purpose for an intent that can reuse an existing execution plan.\n\nAt present only commit materialization uses a purpose.  The value is intentionally separate\nfrom [`TaskIntent`] so `commit.copy` and `commit.repair` share one execution implementation and\ndiffer only in their idempotency/fencing inputs.",
+      "type": "string",
+      "enum": [
+        "copy",
+        "repair"
+      ]
+    },
     "TaskRelation": {
       "type": "object",
       "properties": {
@@ -692,10 +701,9 @@
       ]
     },
     "TaskRelationKind": {
-      "description": "Explicit relationship between two task records. Parent/causal edges are queried independently\nfrom `parent_task_id` so one task can be caused by several prior tasks.",
+      "description": "Explicit causal relationship between two task records. A task has no implicit parent; all\ncross-operation edges are represented explicitly and can be many-to-many.",
       "type": "string",
       "enum": [
-        "parent",
         "caused_by",
         "triggered_by",
         "supersedes"
@@ -710,7 +718,7 @@
         "artifact",
         "object_namespace",
         "commit",
-        "playground",
+        "workspace",
         "snapshot",
         "snapshot_delivery",
         "storage_volume",
@@ -750,6 +758,23 @@
         "resource_kind",
         "resource_id",
         "role"
+      ]
+    },
+    "TaskResourceRef": {
+      "description": "The resource targeted by a task.  This is deliberately generic so a task can address a Commit,\nWorkspace, S3 access point, or infrastructure object without adding nullable columns for every\nresource type.",
+      "type": "object",
+      "properties": {
+        "resource_id": {
+          "type": "string"
+        },
+        "resource_kind": {
+          "$ref": "#/$defs/TaskResourceKind"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "resource_kind",
+        "resource_id"
       ]
     },
     "TaskResourceRole": {
@@ -795,16 +820,6 @@
             }
           ]
         },
-        "playground_id": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PlaygroundId"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "project_id": {
           "anyOf": [
             {
@@ -837,11 +852,129 @@
         },
         "tenant_id": {
           "$ref": "#/$defs/TenantId"
+        },
+        "workspace_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkspaceId"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false,
       "required": [
         "tenant_id"
+      ]
+    },
+    "TaskStage": {
+      "description": "One stage in a task's execution DAG.  Stages are persisted as separate rows so a retry can\nretain prior attempts while the root task keeps one stable identity.",
+      "type": "object",
+      "properties": {
+        "created_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        },
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "detail_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "detail_kind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "finished_at_unix_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnixMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "issue": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskIssue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ordinal": {
+          "$ref": "#/$defs/DecimalU64"
+        },
+        "outcome": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StageOutcome"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "progress": {
+          "$ref": "#/$defs/TaskProgressSummary"
+        },
+        "resource_version": {
+          "$ref": "#/$defs/ResourceVersion"
+        },
+        "stage_attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "stage_key": {
+          "type": "string"
+        },
+        "stage_kind": {
+          "type": "string"
+        },
+        "started_at_unix_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UnixMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/StageState"
+        },
+        "task_id": {
+          "$ref": "#/$defs/TaskId"
+        },
+        "updated_at_unix_ms": {
+          "$ref": "#/$defs/UnixMillis"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "task_id",
+        "stage_key",
+        "stage_kind",
+        "ordinal",
+        "dependencies",
+        "state",
+        "stage_attempt",
+        "progress",
+        "created_at_unix_ms",
+        "updated_at_unix_ms",
+        "resource_version"
       ]
     },
     "TaskState": {
@@ -855,6 +988,7 @@
         "succeeded",
         "stalled",
         "failed",
+        "cancelling",
         "cancelled"
       ]
     },
@@ -871,6 +1005,13 @@
       "maxLength": 20,
       "minLength": 1,
       "pattern": "^(0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]|1844674407370955161[0-5])$"
+    },
+    "WorkspaceId": {
+      "description": "A validated workspace ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
     }
   }
 }

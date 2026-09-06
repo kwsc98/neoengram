@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     net::Ipv4Addr,
+    pin::Pin,
     str::FromStr,
     sync::Arc,
 };
@@ -14,9 +16,8 @@ use crate::{
     CreateRetentionHoldRequest as DomainCreateRetentionHoldRequest, DeletionImpactQuery,
     DeletionListCursor, DeletionListRequest, GatewayCredentialState, GatewayPoolState,
     GatewayReplicaState, IndexKey, IndexPublisher, IndexSnapshotChangeKind,
-    PlaygroundInsertRequest, PlaygroundListCursor, PlaygroundListRequest, PlaygroundRecord,
-    PlaygroundState, PreCommitCancelRequest as DomainPreCommitCancelRequest, PreCommitId,
-    PreCommitKey, PreCommitPhase, PreCommitRecord, PreCommitRepository,
+    PreCommitCancelRequest as DomainPreCommitCancelRequest, PreCommitId, PreCommitKey,
+    PreCommitPhase, PreCommitRecord, PreCommitRepository,
     PreCommitRestartRequest as DomainPreCommitRestartRequest,
     PreCommitStartRequest as DomainPreCommitStartRequest, PreCommitState, ProjectListCursor,
     ProjectListRequest, ProjectRecord,
@@ -27,7 +28,8 @@ use crate::{
     S3MutationRecord, SnapshotDeliveryInsertRequest, SnapshotDeliveryRecord, SnapshotInsertRequest,
     SnapshotListCursor, SnapshotListRequest, SnapshotRecord, SnapshotState, StorageAccessMode,
     StorageBackendType, StorageVolumeListCursor, StorageVolumeListRequest, StorageVolumeRecord,
-    StorageVolumeState, TenantListCursor, TenantListRequest, TenantRecord,
+    StorageVolumeState, TenantListCursor, TenantListRequest, TenantRecord, WorkspaceInsertRequest,
+    WorkspaceListCursor, WorkspaceListRequest, WorkspaceRecord, WorkspaceState,
 };
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -41,14 +43,14 @@ use neoengram_domain::protocol::{
     DeletionCompletion, DeletionId, DeletionOperation, DeletionOperationState, DeliveryGeneration,
     EdgeClusterId, GatewayOpaqueBytes, GatewayPoolId, GatewayS3ReadRevocation, HardlinkPolicy,
     IndexRevision, JobId, LifecycleGeneration, MountGeneration, ObjectNamespaceId, ObjectSet,
-    OwnerGeneration, PlacementGeneration, PlaygroundId, ProjectId, PvcIdentityDigest, RequestId,
+    OwnerGeneration, PlacementGeneration, ProjectId, PvcIdentityDigest, RequestId,
     ResourceLifecycle, ResourceLifecycleState, ResourceRef, ResourceVersion, RetentionHold,
     RetentionHoldId, RetentionHoldState, S3AccessPointId, S3AuthorizeOperation, S3AuthorizeRequest,
     S3AuthorizeResponse, S3AuthorizedObject, S3CredentialId, S3PresignRequest, S3ReadTicket,
     SessionGeneration, SnapshotDeliveryMode, SnapshotDeliveryOperation, SnapshotDeliveryPolicy,
-    SnapshotDeliveryState, SnapshotId, StorageVolumeId, TaskActor, TaskKind, TaskResourceKind,
-    TaskResourceLink, TaskResourceRole, TaskScope, TaskState, TenantId, UnixMillis,
-    WireIndexVersion,
+    SnapshotDeliveryState, SnapshotId, StageState, StorageVolumeId, TaskActor, TaskId, TaskIntent,
+    TaskIssue, TaskRelation, TaskRelationKind, TaskResourceKind, TaskResourceLink,
+    TaskResourceRole, TaskScope, TaskState, TenantId, UnixMillis, WireIndexVersion, WorkspaceId,
 };
 use ring::hmac;
 use serde::{Deserialize, Serialize};
@@ -58,30 +60,23 @@ use crate::{
     dto::{
         ArtifactInitialization as ArtifactInitializationBody, ArtifactView, CancelPreCommitRequest,
         CancelPreCommitResponse, CommitDiffEntry, CommitDiffSummary, CommitDiffView,
-        CommitGraphView, CommitNodeView, CommitPlaygroundRequest, CommitPlaygroundResponse,
-        CreateArtifactRequest, CreateArtifactResponse, CreateDeletionRequest,
-        CreatePlaygroundRequest, CreatePlaygroundResponse, CreateProjectRequest,
+        CommitGraphView, CommitNodeView, CommitWorkspaceRequest, CommitWorkspaceResponse,
+        CreateArtifactRequest, CreateArtifactResponse, CreateDeletionRequest, CreateProjectRequest,
         CreateProjectResponse, CreateRetentionHoldRequest, CreateRetentionHoldResponse,
         CreateS3AccessPointRequest, CreateS3AccessPointResponse, CreateS3CredentialRequest,
         CreateS3CredentialResponse, CreateS3DownloadUrlRequest, CreateS3DownloadUrlResponse,
         CreateSnapshotRequest, CreateSnapshotResponse, CreateStorageVolumeRequest,
         CreateStorageVolumeResponse, CreateTenantRequest, CreateTenantResponse,
-        DatasetProfileSummary, DatasetProfileView, DeletionBlockerView, DeletionImpactView,
-        DeletionMutationResponse, DeletionOperationView, DeletionTargetView, FileMetadataView,
-        IndexVersionBody, LogicalFileEntry, PlaygroundChangeEntry, PlaygroundChangeSummary,
-        PlaygroundView, PreCommitCheckView, PreCommitDiffSummaryView, PreCommitNoticeView,
-        PreCommitProgressView, PreCommitView, ProjectView, PvcReference,
-        QueryArtifactCommitDiffRequest, QueryArtifactCommitDiffResponse,
-        QueryArtifactCommitGraphRequest, QueryArtifactCommitGraphResponse,
-        QueryArtifactListRequest, QueryArtifactListResponse, QueryArtifactRequest,
-        QueryArtifactResponse, QueryDeletionImpactRequest, QueryDeletionImpactResponse,
-        QueryDeletionListRequest, QueryDeletionListResponse, QueryDeletionRequest,
-        QueryDeletionResponse, QueryPlaygroundChangeListRequest, QueryPlaygroundChangeListResponse,
-        QueryPlaygroundDatasetProfileRequest, QueryPlaygroundDatasetProfileResponse,
-        QueryPlaygroundFileListRequest, QueryPlaygroundFileListResponse,
-        QueryPlaygroundFileMetadataRequest, QueryPlaygroundFileMetadataResponse,
-        QueryPlaygroundListRequest, QueryPlaygroundListResponse, QueryPlaygroundRequest,
-        QueryPlaygroundResponse, QueryPreCommitRequest, QueryPreCommitResponse,
+        CreateWorkspaceRequest, CreateWorkspaceResponse, DatasetProfileSummary, DatasetProfileView,
+        DeletionBlockerView, DeletionImpactView, DeletionMutationResponse, DeletionOperationView,
+        DeletionTargetView, FileMetadataView, IndexVersionBody, LogicalFileEntry,
+        PreCommitCheckView, PreCommitDiffSummaryView, PreCommitNoticeView, PreCommitProgressView,
+        PreCommitView, ProjectView, PvcReference, QueryArtifactCommitDiffRequest,
+        QueryArtifactCommitDiffResponse, QueryArtifactCommitGraphRequest,
+        QueryArtifactCommitGraphResponse, QueryArtifactListRequest, QueryArtifactListResponse,
+        QueryArtifactRequest, QueryArtifactResponse, QueryDeletionImpactRequest,
+        QueryDeletionImpactResponse, QueryDeletionListRequest, QueryDeletionListResponse,
+        QueryDeletionRequest, QueryDeletionResponse, QueryPreCommitRequest, QueryPreCommitResponse,
         QueryProjectListRequest, QueryProjectListResponse, QueryS3AccessPointListRequest,
         QueryS3AccessPointListResponse, QueryS3AccessPointRequest, QueryS3AccessPointResponse,
         QueryS3CredentialListRequest, QueryS3CredentialListResponse, QueryS3ObjectListRequest,
@@ -89,12 +84,18 @@ use crate::{
         QuerySnapshotRequest, QuerySnapshotResponse, QueryStorageVolumeListRequest,
         QueryStorageVolumeListResponse, QueryStorageVolumeRequest, QueryStorageVolumeResponse,
         QueryTenantListRequest, QueryTenantListResponse, QueryTenantRequest, QueryTenantResponse,
-        ReleaseRetentionHoldRequest, ReleaseRetentionHoldResponse, ResourceIssueSummary,
-        ResourceLifecycleView, ResourceRefBody, RestartPreCommitRequest, RestartPreCommitResponse,
-        RetentionHoldView, RevokeS3CredentialRequest, S3AccessPointView, S3CredentialView,
-        S3ObjectEntryView, SnapshotDeliveryMode as DeliveryModeBody, SnapshotIntegritySummary,
-        SnapshotView, StartPreCommitRequest, StartPreCommitResponse, StorageVolumeView, TaskView,
-        TenantView, UpdateDeletionRequest, UpdateS3AccessPointRequest, UpdateS3AccessPointResponse,
+        QueryWorkspaceChangeListRequest, QueryWorkspaceChangeListResponse,
+        QueryWorkspaceDatasetProfileRequest, QueryWorkspaceDatasetProfileResponse,
+        QueryWorkspaceFileListRequest, QueryWorkspaceFileListResponse,
+        QueryWorkspaceFileMetadataRequest, QueryWorkspaceFileMetadataResponse,
+        QueryWorkspaceListRequest, QueryWorkspaceListResponse, QueryWorkspaceRequest,
+        QueryWorkspaceResponse, ReleaseRetentionHoldRequest, ReleaseRetentionHoldResponse,
+        ResourceIssueSummary, ResourceLifecycleView, ResourceRefBody, RestartPreCommitRequest,
+        RestartPreCommitResponse, RetentionHoldView, RevokeS3CredentialRequest, S3AccessPointView,
+        S3CredentialView, S3ObjectEntryView, SnapshotDeliveryMode as DeliveryModeBody,
+        SnapshotIntegritySummary, SnapshotView, StartPreCommitRequest, StartPreCommitResponse,
+        StorageVolumeView, TaskView, TenantView, UpdateDeletionRequest, UpdateS3AccessPointRequest,
+        UpdateS3AccessPointResponse, WorkspaceChangeEntry, WorkspaceChangeSummary, WorkspaceView,
     },
     error::{application_error, invalid_request, map_central_error},
     identity::{AuthenticatedIdentity, Permission, StaticRbacPolicy, TenantVisibility},
@@ -108,6 +109,9 @@ const DEFAULT_PAGE_SIZE: u16 = 50;
 const MAX_PAGE_SIZE: u16 = 100;
 const CURSOR_PREFIX: &str = "ngcat_v1_";
 const MAX_QUERY_CHARS: usize = 256;
+
+type BeginOperationTaskFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(Option<TaskView>, bool), Error>> + Send + 'a>>;
 
 /// Resolves live, Agent-derived availability for one Tenant-scoped StorageVolume.
 ///
@@ -221,7 +225,7 @@ mod commit_diff_tests {
             tenant_id: TenantId::new("tenant-a").unwrap(),
             project_id: ProjectId::new("project-a").unwrap(),
             artifact_id: ArtifactId::new("artifact-a").unwrap(),
-            source_playground_id: PlaygroundId::new("playground-a").unwrap(),
+            source_workspace_id: WorkspaceId::new("workspace-a").unwrap(),
             source_precommit_id: PreCommitId::new(format!("precommit-{id}")).unwrap(),
             commit_request_id: RequestId::new(format!("request-{id}")).unwrap(),
             commit_id: CommitId::from_bytes([id; 32]),
@@ -340,7 +344,7 @@ pub trait S3ReadRevocationPublisher: Send + Sync {
     );
 }
 
-/// Public Tenant, StorageVolume, and minimal Playground application service.
+/// Public Tenant, StorageVolume, and minimal Workspace application service.
 pub struct CatalogService {
     pub(crate) repository: Arc<dyn ControlCatalogRepository>,
     pub(crate) indexes: Arc<dyn IndexPublisher>,
@@ -491,36 +495,69 @@ impl CatalogService {
     /// Creates the unified task envelope for a mutating request.  Standalone unit compositions
     /// may omit the task repository; production runtime always installs it from AuthorityStore.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn begin_operation_task<T: Serialize>(
-        &self,
-        kind: TaskKind,
+    pub(crate) fn begin_operation_task<'a, T: Serialize + Sync + 'a>(
+        &'a self,
+        kind: TaskIntent,
         scope: TaskScope,
         request_id: RequestId,
-        request: &T,
-        identity: &AuthenticatedIdentity,
-        detail_kind: Option<&str>,
-        detail_id: Option<&str>,
-    ) -> Result<(Option<TaskView>, bool), Error> {
-        let Some(coordinator) = &self.task_coordinator else {
-            return Ok((None, false));
-        };
-        let (task, replayed) = coordinator
-            .create_root(
-                kind,
-                scope,
-                request_id,
-                request,
-                TaskActor::Principal(identity.principal().clone()),
-                detail_kind,
-                detail_id,
-            )
-            .await
-            .map_err(map_central_error)?;
-        Ok((Some(super::task::task_view(&task)), replayed))
+        request: &'a T,
+        identity: &'a AuthenticatedIdentity,
+        detail_kind: Option<&'a str>,
+        detail_id: Option<&'a str>,
+    ) -> BeginOperationTaskFuture<'a> {
+        // Keep the stage-aware coordinator future off the small Tokio worker stack. It carries
+        // the full task, attempt, event, and initial stage DAG during the atomic insert.
+        Box::pin(async move {
+            let Some(coordinator) = &self.task_coordinator else {
+                return Ok((None, false));
+            };
+            // Scope links are part of the durable task index. Keep a copy of the request scope so
+            // an execution-reused task created before this indexing fix can be repaired when the
+            // same semantic operation is observed again.
+            let task_scope = scope.clone();
+            let (task, replayed) = coordinator
+                .create_root(
+                    kind,
+                    scope,
+                    request_id,
+                    request,
+                    TaskActor::Principal(identity.principal().clone()),
+                    detail_kind,
+                    detail_id,
+                )
+                .await
+                .map_err(map_central_error)?;
+            for link in super::task::scope_resource_links(&task.task_id, &task_scope) {
+                coordinator
+                    .repository()
+                    .link_resource(crate::TaskResourceLinkRecord {
+                        tenant_id: task.tenant_id.clone(),
+                        link,
+                    })
+                    .await
+                    .map_err(map_central_error)?;
+            }
+            // Reload after link repair so the response and all subsequent list queries expose the
+            // same resource index, including for a task reused from an older local database.
+            // `execution_reused` and `request_replayed` are request-local projections and are
+            // intentionally omitted from the durable payload. Preserve them while reloading the
+            // task so the scope-link repair does not turn semantic reuse into a replay.
+            let request_replayed = task.request_replayed;
+            let execution_reused = task.execution_reused;
+            let mut task = coordinator
+                .repository()
+                .get(&task.tenant_id, &task.task_id)
+                .await
+                .map_err(map_central_error)?
+                .ok_or_else(|| invalid_request("operation task disappeared after creation"))?;
+            task.request_replayed = request_replayed;
+            task.execution_reused = execution_reused;
+            Ok((Some(super::task::task_view(&task)), replayed))
+        })
     }
 
     fn derived_task_request_id<T: Serialize>(
-        kind: TaskKind,
+        kind: TaskIntent,
         request: &T,
     ) -> Result<RequestId, Error> {
         let digest = neoengram_domain::jcs_blake3(request)
@@ -557,49 +594,6 @@ impl CatalogService {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn begin_child_operation_task<T: Serialize>(
-        &self,
-        parent: &Option<TaskView>,
-        kind: TaskKind,
-        scope: TaskScope,
-        request_id: RequestId,
-        request: &T,
-        identity: &AuthenticatedIdentity,
-        detail_kind: Option<&str>,
-        detail_id: Option<&str>,
-    ) -> Result<Option<TaskView>, Error> {
-        let (Some(coordinator), Some(parent)) = (&self.task_coordinator, parent) else {
-            return Ok(None);
-        };
-        let parent_id = neoengram_domain::protocol::TaskId::new(parent.task_id.clone())
-            .map_err(|error| invalid_request(format!("parent_task_id: {error}")))?;
-        let parent_task = coordinator
-            .repository()
-            .get(
-                &TenantId::new(parent.tenant_id.clone())
-                    .map_err(|error| invalid_request(format!("tenant_id: {error}")))?,
-                &parent_id,
-            )
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(|| invalid_request("parent operation task disappeared"))?;
-        let (task, _) = coordinator
-            .create_child(
-                &parent_task,
-                kind,
-                scope,
-                request_id,
-                request,
-                TaskActor::Principal(identity.principal().clone()),
-                detail_kind,
-                detail_id,
-            )
-            .await
-            .map_err(map_central_error)?;
-        Ok(Some(super::task::task_view(&task)))
-    }
-
     pub(crate) async fn transition_operation_task(
         &self,
         task: Option<TaskView>,
@@ -613,6 +607,7 @@ impl CatalogService {
         let Some(task) = task else {
             return Ok(None);
         };
+        let execution_reused = task.execution_reused;
         let task_id = neoengram_domain::protocol::TaskId::new(task.task_id.clone())
             .map_err(|error| invalid_request(format!("task_id: {error}")))?;
         let tenant_id = TenantId::new(task.tenant_id.clone())
@@ -627,7 +622,404 @@ impl CatalogService {
             )
             .await
             .map_err(map_central_error)?;
-        Ok(Some(super::task::task_view(&updated)))
+        let mut view = super::task::task_view(&updated);
+        // The semantic-reuse bit belongs to the request that discovered this canonical task and
+        // is intentionally not persisted on the task row. Carry it through the completion read
+        // so public mutation responses can distinguish it from an exact request replay.
+        view.execution_reused |= execution_reused;
+        Ok(Some(view))
+    }
+
+    /// Records a domain failure on the public operation task before propagating the original
+    /// request error.  Task creation happens before most resource writes, so every error after
+    /// `begin_operation_task` must converge the root task instead of leaving it queued forever.
+    /// Retryable failures remain actionable in `stalled`; permanent failures are terminal.
+    pub(crate) async fn fail_operation_task(
+        &self,
+        task: &Option<TaskView>,
+        identity: &AuthenticatedIdentity,
+        error: &Error,
+    ) {
+        let Some(coordinator) = &self.task_coordinator else {
+            return;
+        };
+        let Some(task) = task else {
+            return;
+        };
+        let Ok(task_id) = TaskId::new(task.task_id.clone()) else {
+            return;
+        };
+        let Ok(tenant_id) = TenantId::new(task.tenant_id.clone()) else {
+            return;
+        };
+        let issue = TaskIssue {
+            code: bounded_task_text(error.code().as_str(), 256),
+            message: bounded_task_text(error.message(), 512),
+            retryable: error.retry_hint().is_retryable(),
+            detail: None,
+        };
+        let next = if issue.retryable {
+            TaskState::Stalled
+        } else {
+            TaskState::Failed
+        };
+        let _ = coordinator
+            .transition_with_issue(
+                &task_id,
+                &tenant_id,
+                next,
+                TaskActor::Principal(identity.principal().clone()),
+                Some(issue),
+                Some("operation failed before domain completion".to_owned()),
+            )
+            .await;
+    }
+
+    /// Runs one post-task operation result through the failure sink while preserving the
+    /// original public error. This keeps individual domain branches readable without allowing a
+    /// `?` after task creation to strand the root in `queued`.
+    pub(crate) async fn operation_result<T>(
+        &self,
+        task: &Option<TaskView>,
+        identity: &AuthenticatedIdentity,
+        result: Result<T, Error>,
+    ) -> Result<T, Error> {
+        if let Err(error) = &result {
+            self.fail_operation_task(task, identity, error).await;
+        }
+        result
+    }
+
+    /// Mirrors the durable deletion saga state onto its one public operation task.  Creating a
+    /// deletion only persists the saga in `requested`; it has not yet quiesced resources or
+    /// completed the current cleanup work.  Keep the root task active until the lifecycle
+    /// reconciler observes `completed`, and surface blocked/failed sagas without manufacturing a
+    /// second task for each cascaded target.
+    pub(crate) async fn synchronize_deletion_task(
+        &self,
+        task: Option<TaskView>,
+        deletion: &DeletionOperation,
+        identity: &AuthenticatedIdentity,
+    ) -> Result<Option<TaskView>, Error> {
+        match deletion.state {
+            DeletionOperationState::Completed => self.complete_operation_task(task, identity).await,
+            DeletionOperationState::Blocked => {
+                self.transition_operation_task(
+                    task,
+                    TaskState::Stalled,
+                    identity,
+                    Some("resource deletion is blocked; waiting for retry".to_owned()),
+                )
+                .await
+            }
+            DeletionOperationState::Failed => {
+                self.transition_operation_task(
+                    task,
+                    TaskState::Failed,
+                    identity,
+                    Some("resource deletion failed".to_owned()),
+                )
+                .await
+            }
+            _ => {
+                self.transition_operation_task(
+                    task,
+                    TaskState::Running,
+                    identity,
+                    Some("resource deletion is being reconciled".to_owned()),
+                )
+                .await
+            }
+        }
+    }
+
+    /// Advances the stages owned by an explicit `commit.validate` operation from the durable
+    /// PreCommit state. The Add Job, candidate Index and checks remain detail records; the public
+    /// task only exposes the coarse validation/scan/finalize stages.
+    pub(crate) async fn synchronize_precommit_task(
+        &self,
+        precommit: &PreCommitRecord,
+        task: Option<TaskView>,
+        identity: &AuthenticatedIdentity,
+    ) -> Result<Option<TaskView>, Error> {
+        let Some(coordinator) = &self.task_coordinator else {
+            return Ok(task);
+        };
+        let (task, execution_reused) = match task {
+            Some(task) => (Some(task), false),
+            None => {
+                let task = coordinator
+                    .repository()
+                    .get_by_request_id(&precommit.tenant_id, &precommit.precommit_request_id)
+                    .await
+                    .map_err(map_central_error)?;
+                (task.map(|value| {
+                    let execution_reused = value.execution_reused;
+                    (super::task::task_view(&value), execution_reused)
+                }))
+                .map_or((None, false), |(task, reused)| (Some(task), reused))
+            }
+        };
+        let Some(task) = task else {
+            return Ok(None);
+        };
+        let task_id = TaskId::new(task.task_id.clone())
+            .map_err(|error| invalid_request(format!("task_id: {error}")))?;
+        let tenant_id = TenantId::new(task.tenant_id.clone())
+            .map_err(|error| invalid_request(format!("tenant_id: {error}")))?;
+
+        // Every validation request has completed the request-level validation before the Add Job
+        // is accepted. Keep this stage success as the prerequisite for scan_changes.
+        let mut stages = coordinator
+            .repository()
+            .stages(&tenant_id, &task_id)
+            .await
+            .map_err(map_central_error)?;
+        let advance_success = |key: String| {
+            let coordinator = Arc::clone(coordinator);
+            let tenant_id = tenant_id.clone();
+            let task_id = task_id.clone();
+            async move {
+                loop {
+                    let current = coordinator
+                        .repository()
+                        .stages(&tenant_id, &task_id)
+                        .await
+                        .map_err(map_central_error)?
+                        .into_iter()
+                        .find(|stage| stage.stage_key == key)
+                        .ok_or_else(|| {
+                            invalid_request(format!("operation task stage {key} is missing"))
+                        })?;
+                    if current.state.is_success() {
+                        return Ok::<(), Error>(());
+                    }
+                    let next = match current.state {
+                        StageState::Pending => StageState::Ready,
+                        StageState::Ready
+                        | StageState::Waiting
+                        | StageState::Verifying
+                        | StageState::Stalled => StageState::Running,
+                        StageState::Running => StageState::Succeeded,
+                        StageState::Failed | StageState::Cancelling | StageState::Cancelled => {
+                            return Err(invalid_request(format!(
+                                "operation task stage {key} cannot be completed from {:?}",
+                                current.state
+                            )));
+                        }
+                        StageState::Skipped | StageState::NoOp | StageState::Succeeded => {
+                            unreachable!()
+                        }
+                    };
+                    coordinator
+                        .transition_stage(&task_id, &tenant_id, key.as_str(), next, None)
+                        .await
+                        .map_err(map_central_error)?;
+                }
+            }
+        };
+        let advance_running = |key: String| {
+            let coordinator = Arc::clone(coordinator);
+            let tenant_id = tenant_id.clone();
+            let task_id = task_id.clone();
+            async move {
+                loop {
+                    let current = coordinator
+                        .repository()
+                        .stages(&tenant_id, &task_id)
+                        .await
+                        .map_err(map_central_error)?
+                        .into_iter()
+                        .find(|stage| stage.stage_key == key)
+                        .ok_or_else(|| {
+                            invalid_request(format!("operation task stage {key} is missing"))
+                        })?;
+                    if matches!(current.state, StageState::Running) || current.state.is_success() {
+                        return Ok::<(), Error>(());
+                    }
+                    let next = match current.state {
+                        StageState::Pending => StageState::Ready,
+                        StageState::Ready
+                        | StageState::Waiting
+                        | StageState::Verifying
+                        | StageState::Stalled => StageState::Running,
+                        StageState::Failed | StageState::Cancelling | StageState::Cancelled => {
+                            return Err(invalid_request(format!(
+                                "operation task stage {key} cannot run from {:?}",
+                                current.state
+                            )));
+                        }
+                        StageState::Skipped | StageState::NoOp | StageState::Succeeded => {
+                            return Ok(())
+                        }
+                        StageState::Running => unreachable!(),
+                    };
+                    coordinator
+                        .transition_stage(&task_id, &tenant_id, key.as_str(), next, None)
+                        .await
+                        .map_err(map_central_error)?;
+                }
+            }
+        };
+
+        advance_success("validate".to_owned()).await?;
+        match precommit.state {
+            PreCommitState::Running => {
+                advance_running("scan_changes".to_owned()).await?;
+                let current = coordinator
+                    .repository()
+                    .get(&tenant_id, &task_id)
+                    .await
+                    .map_err(map_central_error)?
+                    .ok_or_else(|| invalid_request("operation task disappeared"))?;
+                let mut view = super::task::task_view(&current);
+                view.execution_reused |= execution_reused || task.execution_reused;
+                self.transition_operation_task(
+                    Some(view),
+                    TaskState::Running,
+                    identity,
+                    Some("pre-commit scan is running".to_owned()),
+                )
+                .await
+            }
+            PreCommitState::Ready | PreCommitState::Committed => {
+                advance_success("scan_changes".to_owned()).await?;
+                advance_success("finalize".to_owned()).await?;
+                let current = coordinator
+                    .repository()
+                    .get(&tenant_id, &task_id)
+                    .await
+                    .map_err(map_central_error)?
+                    .ok_or_else(|| invalid_request("operation task disappeared"))?;
+                let mut view = self
+                    .complete_operation_task(Some(super::task::task_view(&current)), identity)
+                    .await?;
+                if let Some(value) = view.as_mut() {
+                    value.execution_reused |= execution_reused || task.execution_reused;
+                }
+                Ok(view)
+            }
+            PreCommitState::Abnormal => {
+                // An abnormal PreCommit may be queried repeatedly after its scan stage has
+                // already been fenced as failed. Do not attempt `failed -> running` on replay;
+                // only a fresh restart may create the next stage attempt.
+                let scan_state = coordinator
+                    .repository()
+                    .stages(&tenant_id, &task_id)
+                    .await
+                    .map_err(map_central_error)?
+                    .into_iter()
+                    .find(|stage| stage.stage_key == "scan_changes")
+                    .map(|stage| stage.state);
+                if !matches!(scan_state, Some(StageState::Failed)) {
+                    advance_running("scan_changes".to_owned()).await?;
+                }
+                let issue = precommit.issue.as_ref().map(|value| TaskIssue {
+                    code: value.code.clone(),
+                    message: value.message.clone(),
+                    retryable: true,
+                    detail: value.path.clone(),
+                });
+                coordinator
+                    .transition_stage(
+                        &task_id,
+                        &tenant_id,
+                        "scan_changes",
+                        StageState::Failed,
+                        issue.clone(),
+                    )
+                    .await
+                    .map_err(map_central_error)?;
+                let mut view = self
+                    .transition_operation_task(
+                        Some(super::task::task_view(
+                            &coordinator
+                                .repository()
+                                .get(&tenant_id, &task_id)
+                                .await
+                                .map_err(map_central_error)?
+                                .ok_or_else(|| invalid_request("operation task disappeared"))?,
+                        )),
+                        TaskState::Failed,
+                        identity,
+                        Some("pre-commit validation failed".to_owned()),
+                    )
+                    .await?;
+                if let Some(value) = view.as_mut() {
+                    value.execution_reused |= execution_reused || task.execution_reused;
+                }
+                Ok(view)
+            }
+            PreCommitState::Cancelled => {
+                // The Add Job has reached its terminal cancellation state, so the task can now
+                // pass the cancellation convergence fence. All non-terminal stages are cancelled
+                // before the root is moved to `cancelled`.
+                for stage in stages.drain(..) {
+                    if stage.state.is_terminal() {
+                        continue;
+                    }
+                    let _ = coordinator
+                        .transition_stage(
+                            &task_id,
+                            &tenant_id,
+                            &stage.stage_key,
+                            StageState::Cancelling,
+                            None,
+                        )
+                        .await
+                        .map_err(map_central_error)?;
+                    coordinator
+                        .transition_stage(
+                            &task_id,
+                            &tenant_id,
+                            &stage.stage_key,
+                            StageState::Cancelled,
+                            None,
+                        )
+                        .await
+                        .map_err(map_central_error)?;
+                }
+                let current = coordinator
+                    .repository()
+                    .get(&tenant_id, &task_id)
+                    .await
+                    .map_err(map_central_error)?
+                    .ok_or_else(|| invalid_request("operation task disappeared"))?;
+                if current.state != TaskState::Cancelling {
+                    let _ = coordinator
+                        .repository()
+                        .cancel(
+                            &tenant_id,
+                            &task_id,
+                            Some(current.resource_version),
+                            TaskActor::Principal(identity.principal().clone()),
+                            self.clock.now(),
+                        )
+                        .await
+                        .map_err(map_central_error)?;
+                }
+                let current = coordinator
+                    .repository()
+                    .get(&tenant_id, &task_id)
+                    .await
+                    .map_err(map_central_error)?
+                    .ok_or_else(|| invalid_request("operation task disappeared"))?;
+                let result = coordinator
+                    .repository()
+                    .complete_cancellation(
+                        &tenant_id,
+                        &task_id,
+                        current.resource_version,
+                        TaskActor::Principal(identity.principal().clone()),
+                        self.clock.now(),
+                    )
+                    .await
+                    .map_err(map_central_error)?;
+                let mut view = super::task::task_view(&result.task);
+                view.execution_reused |= execution_reused || task.execution_reused;
+                Ok(Some(view))
+            }
+        }
     }
 
     pub(crate) async fn complete_operation_task(
@@ -641,6 +1033,7 @@ impl CatalogService {
         let Some(task) = task else {
             return Ok(None);
         };
+        let execution_reused = task.execution_reused;
         let task_id = neoengram_domain::protocol::TaskId::new(task.task_id.clone())
             .map_err(|error| invalid_request(format!("task_id: {error}")))?;
         let tenant_id = TenantId::new(task.tenant_id.clone())
@@ -657,7 +1050,9 @@ impl CatalogService {
             .complete_immediate(&current, operation)
             .await
             .map_err(map_central_error)?;
-        Ok(Some(super::task::task_view(&updated)))
+        let mut view = super::task::task_view(&updated);
+        view.execution_reused |= execution_reused;
+        Ok(Some(view))
     }
 
     /// Installs the policy used when a namespace has no explicit override.
@@ -834,9 +1229,9 @@ impl CatalogService {
         let description = request.description.map(validate_description).transpose()?;
         let (task, task_replayed) = self
             .begin_operation_task(
-                TaskKind::CatalogLifecycle,
+                TaskIntent::ProjectCreate,
                 TaskScope::new(tenant_id.clone()),
-                Self::derived_task_request_id(TaskKind::CatalogLifecycle, &task_request)?,
+                Self::derived_task_request_id(TaskIntent::ProjectCreate, &task_request)?,
                 &task_request,
                 identity,
                 Some("tenant"),
@@ -851,7 +1246,7 @@ impl CatalogService {
         )
         .await?;
         let now = self.clock.now();
-        let outcome = self
+        let outcome = match self
             .repository
             .insert_tenant(TenantRecord {
                 tenant_id,
@@ -862,12 +1257,21 @@ impl CatalogService {
                 updated_at_unix_ms: now,
             })
             .await
-            .map_err(|error| catalog_mutation_error(error, "tenant_id_reused"))?;
+            .map_err(|error| catalog_mutation_error(error, "tenant_id_reused"))
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.fail_operation_task(&task, identity, &error).await;
+                return Err(error);
+            }
+        };
         let (record, replayed) = split_outcome(outcome);
         let task = self.complete_operation_task(task, identity).await?;
         Ok(CreateTenantResponse {
             tenant: self.tenant_view(identity, &record),
-            replayed: replayed || task_replayed,
+            request_replayed: (replayed || task_replayed)
+                && !task.as_ref().is_some_and(|value| value.execution_reused),
+            execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
             task,
         })
     }
@@ -926,18 +1330,18 @@ impl CatalogService {
         let description = request.description.map(validate_description).transpose()?;
         let (task, task_replayed) = self
             .begin_operation_task(
-                TaskKind::CatalogLifecycle,
+                TaskIntent::ProjectCreate,
                 TaskScope {
                     tenant_id: tenant_id.clone(),
                     project_id: Some(project_id.clone()),
                     artifact_id: None,
                     object_namespace_id: None,
                     commit_id: None,
-                    playground_id: None,
+                    workspace_id: None,
                     snapshot_id: None,
                     storage_volume_id: None,
                 },
-                Self::derived_task_request_id(TaskKind::CatalogLifecycle, &task_request)?,
+                Self::derived_task_request_id(TaskIntent::ProjectCreate, &task_request)?,
                 &task_request,
                 identity,
                 Some("project"),
@@ -952,7 +1356,7 @@ impl CatalogService {
         )
         .await?;
         let now = self.clock.now();
-        let outcome = self
+        let outcome = match self
             .repository
             .insert_project(ProjectRecord {
                 tenant_id,
@@ -960,16 +1364,26 @@ impl CatalogService {
                 display_name,
                 description,
                 resource_version: 1,
+                lifecycle: ResourceLifecycle::active(),
                 created_at_unix_ms: now,
                 updated_at_unix_ms: now,
             })
             .await
-            .map_err(|error| catalog_mutation_error(error, "project_id_reused"))?;
+            .map_err(|error| catalog_mutation_error(error, "project_id_reused"))
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.fail_operation_task(&task, identity, &error).await;
+                return Err(error);
+            }
+        };
         let (record, replayed) = split_outcome(outcome);
         let task = self.complete_operation_task(task, identity).await?;
         Ok(CreateProjectResponse {
             project: project_view(&record),
-            replayed: replayed || task_replayed,
+            request_replayed: (replayed || task_replayed)
+                && !task.as_ref().is_some_and(|value| value.execution_reused),
+            execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
             task,
         })
     }
@@ -1193,18 +1607,18 @@ impl CatalogService {
         };
         let (task, task_replayed) = self
             .begin_operation_task(
-                TaskKind::StorageLifecycle,
+                TaskIntent::StorageVolumeCreate,
                 TaskScope {
                     tenant_id: tenant_id.clone(),
                     project_id: None,
                     artifact_id: None,
                     object_namespace_id: None,
                     commit_id: None,
-                    playground_id: None,
+                    workspace_id: None,
                     snapshot_id: None,
                     storage_volume_id: Some(storage_volume_id.clone()),
                 },
-                Self::derived_task_request_id(TaskKind::StorageLifecycle, &task_request)?,
+                Self::derived_task_request_id(TaskIntent::StorageVolumeCreate, &task_request)?,
                 &task_request,
                 identity,
                 Some("storage_volume"),
@@ -1219,7 +1633,7 @@ impl CatalogService {
         )
         .await?;
         let now = self.clock.now();
-        let outcome = self
+        let outcome = match self
             .repository
             .insert_storage_volume(StorageVolumeRecord {
                 tenant_id,
@@ -1242,12 +1656,21 @@ impl CatalogService {
                 updated_at_unix_ms: now,
             })
             .await
-            .map_err(|error| catalog_mutation_error(error, "storage_volume_id_reused"))?;
+            .map_err(|error| catalog_mutation_error(error, "storage_volume_id_reused"))
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.fail_operation_task(&task, identity, &error).await;
+                return Err(error);
+            }
+        };
         let (record, replayed) = split_outcome(outcome);
         let task = self.complete_operation_task(task, identity).await?;
         Ok(CreateStorageVolumeResponse {
             storage_volume: storage_volume_view(&record),
-            replayed: replayed || task_replayed,
+            request_replayed: (replayed || task_replayed)
+                && !task.as_ref().is_some_and(|value| value.execution_reused),
+            execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
             task,
         })
     }
@@ -1363,8 +1786,8 @@ impl CatalogService {
             .map(|cursor| decode_commit_cursor(cursor, &scope))
             .transpose()?;
         let precommits = self.precommit_repository()?;
-        // The Artifact Head is only one tip. A historical Playground can publish a sibling while
-        // another Playground advances that pointer, so walking parent links from the Head would
+        // The Artifact Head is only one tip. A historical Workspace can publish a sibling while
+        // another Workspace advances that pointer, so walking parent links from the Head would
         // hide valid commits. Read the complete immutable scope and order the current Head first,
         // followed by newest commits; the UI can reconstruct the parent tree from each node.
         let mut all_commits = self
@@ -1486,7 +1909,7 @@ impl CatalogService {
         artifact: &ArtifactRecord,
         precommits: &dyn PreCommitRepository,
     ) -> Result<Vec<CommitRecord>, Error> {
-        // Acknowledgements preserve old tips after their Playground moves. Current Head pointers
+        // Acknowledgements preserve old tips after their Workspace moves. Current Head pointers
         // close the cross-store window where catalog publication committed but acknowledgement did
         // not. Walking every seed to its root also restores an unacknowledged published parent.
         let acknowledged = precommits
@@ -1511,7 +1934,7 @@ impl CatalogService {
         loop {
             let page = self
                 .repository
-                .list_playgrounds(&PlaygroundListRequest {
+                .list_workspaces(&WorkspaceListRequest {
                     tenant_id: artifact.tenant_id.clone(),
                     project_id: Some(artifact.project_id.clone()),
                     artifact_id: Some(artifact.artifact_id.clone()),
@@ -1526,7 +1949,7 @@ impl CatalogService {
             seeds.extend(
                 page.records
                     .iter()
-                    .filter_map(|playground| playground.head_commit_id)
+                    .filter_map(|workspace| workspace.head_commit_id)
                     .map(CommitId::from_digest),
             );
             let Some(next) = page.next else {
@@ -1609,18 +2032,18 @@ impl CatalogService {
         };
         let (task, task_replayed) = self
             .begin_operation_task(
-                TaskKind::CatalogLifecycle,
+                TaskIntent::ArtifactCreate,
                 TaskScope {
                     tenant_id: tenant_id.clone(),
                     project_id: Some(project_id.clone()),
                     artifact_id: Some(artifact_id.clone()),
                     object_namespace_id: Some(ObjectNamespaceId::from_artifact(&artifact_id)),
                     commit_id: None,
-                    playground_id: None,
+                    workspace_id: None,
                     snapshot_id: None,
                     storage_volume_id: None,
                 },
-                Self::derived_task_request_id(TaskKind::CatalogLifecycle, &task_request)?,
+                Self::derived_task_request_id(TaskIntent::ArtifactCreate, &task_request)?,
                 &task_request,
                 identity,
                 Some("artifact"),
@@ -1635,7 +2058,7 @@ impl CatalogService {
         )
         .await?;
         let now = self.clock.now();
-        let outcome = self
+        let outcome = match self
             .repository
             .insert_artifact(ArtifactRecord {
                 tenant_id,
@@ -1651,23 +2074,32 @@ impl CatalogService {
                 updated_at_unix_ms: now,
             })
             .await
-            .map_err(|error| catalog_mutation_error(error, "artifact_id_reused"))?;
+            .map_err(|error| catalog_mutation_error(error, "artifact_id_reused"))
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.fail_operation_task(&task, identity, &error).await;
+                return Err(error);
+            }
+        };
         let (record, replayed) = split_outcome(outcome);
         let task = self.complete_operation_task(task, identity).await?;
         Ok(CreateArtifactResponse {
             artifact: artifact_view(&record),
-            replayed: replayed || task_replayed,
+            request_replayed: (replayed || task_replayed)
+                && !task.as_ref().is_some_and(|value| value.execution_reused),
+            execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
             task,
         })
     }
 
-    pub async fn list_playgrounds(
+    pub async fn list_workspaces(
         &self,
         identity: &AuthenticatedIdentity,
-        request: QueryPlaygroundListRequest,
-    ) -> Result<QueryPlaygroundListResponse, Error> {
+        request: QueryWorkspaceListRequest,
+    ) -> Result<QueryWorkspaceListResponse, Error> {
         let tenant_id = parse_tenant(request.tenant_id)?;
-        self.require_tenant(identity, Permission::PlaygroundRead, &tenant_id)
+        self.require_tenant(identity, Permission::WorkspaceRead, &tenant_id)
             .await?;
         if request.artifact_id.is_some() && request.project_id.is_none() {
             return Err(invalid_request(
@@ -1680,26 +2112,26 @@ impl CatalogService {
         let state = request
             .state
             .as_deref()
-            .map(parse_playground_state)
+            .map(parse_workspace_state)
             .transpose()?;
         let query = request.query.map(validate_query).transpose()?;
         let page_size = page_size(request.page_size)?;
-        let scope = CursorScope::Playground {
+        let scope = CursorScope::Workspace {
             tenant_id: tenant_id.to_string(),
             project_id: project_id.as_ref().map(ToString::to_string),
             artifact_id: artifact_id.as_ref().map(ToString::to_string),
             region: region.clone(),
-            state: state.map(playground_state_name).map(str::to_owned),
+            state: state.map(workspace_state_name).map(str::to_owned),
             query: query.clone(),
         };
         let after = request
             .cursor
             .as_deref()
-            .map(|cursor| decode_playground_cursor(cursor, &scope))
+            .map(|cursor| decode_workspace_cursor(cursor, &scope))
             .transpose()?;
         let page = self
             .repository
-            .list_playgrounds(&PlaygroundListRequest {
+            .list_workspaces(&WorkspaceListRequest {
                 tenant_id,
                 project_id,
                 artifact_id,
@@ -1714,57 +2146,68 @@ impl CatalogService {
         let next_cursor = page
             .next
             .as_ref()
-            .map(|cursor| encode_playground_cursor(&scope, cursor))
+            .map(|cursor| encode_workspace_cursor(&scope, cursor))
             .transpose()?;
         let mut items = Vec::with_capacity(page.records.len());
         for record in &page.records {
             if !record.lifecycle.is_active() {
                 continue;
             }
-            items.push(self.playground_view(record).await?);
+            items.push(self.workspace_view(record).await?);
         }
-        Ok(QueryPlaygroundListResponse { items, next_cursor })
+        Ok(QueryWorkspaceListResponse { items, next_cursor })
     }
 
-    pub async fn query_playground(
+    pub async fn query_workspace(
         &self,
         identity: &AuthenticatedIdentity,
-        request: QueryPlaygroundRequest,
-    ) -> Result<QueryPlaygroundResponse, Error> {
+        request: QueryWorkspaceRequest,
+    ) -> Result<QueryWorkspaceResponse, Error> {
         let tenant_id = parse_tenant(request.tenant_id)?;
         if !self
             .policy
-            .is_allowed(identity.principal(), Permission::PlaygroundRead, &tenant_id)
+            .is_allowed(identity.principal(), Permission::WorkspaceRead, &tenant_id)
         {
-            return Err(resource_not_found("playground"));
+            return Err(resource_not_found("workspace"));
         }
         let project_id = parse_project_id(request.project_id)?;
         let artifact_id = parse_artifact_id(request.artifact_id)?;
-        let playground_id = parse_playground_id(request.playground_id)?;
+        let workspace_id = parse_workspace_id(request.workspace_id)?;
         let record = self
             .repository
-            .get_playground(&tenant_id, &project_id, &artifact_id, &playground_id)
+            .get_workspace(&tenant_id, &project_id, &artifact_id, &workspace_id)
             .await
             .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("playground"))?;
-        require_active_for_read(&record.lifecycle, "playground")?;
-        Ok(QueryPlaygroundResponse {
-            playground: self.playground_view(&record).await?,
+            .ok_or_else(|| resource_not_found("workspace"))?;
+        require_active_for_read(&record.lifecycle, "workspace")?;
+        Ok(QueryWorkspaceResponse {
+            workspace: self.workspace_view(&record).await?,
         })
     }
 
-    pub async fn create_playground(
+    pub fn create_workspace<'a>(
+        &'a self,
+        identity: &'a AuthenticatedIdentity,
+        request: CreateWorkspaceRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<CreateWorkspaceResponse, Error>> + Send + 'a>> {
+        // Workspace creation has several fenced repository branches. Keep its large async state
+        // machine heap-backed so the public HTTP/test executor does not need a multi-megabyte
+        // worker stack merely to construct the future.
+        Box::pin(async move { self.create_workspace_inner(identity, request).await })
+    }
+
+    async fn create_workspace_inner(
         &self,
         identity: &AuthenticatedIdentity,
-        request: CreatePlaygroundRequest,
-    ) -> Result<CreatePlaygroundResponse, Error> {
+        request: CreateWorkspaceRequest,
+    ) -> Result<CreateWorkspaceResponse, Error> {
         let task_request = request.clone();
         let tenant_id = parse_tenant(request.tenant_id)?;
-        self.require_tenant(identity, Permission::PlaygroundCreate, &tenant_id)
+        self.require_tenant(identity, Permission::WorkspaceCreate, &tenant_id)
             .await?;
         let project_id = parse_project_id(request.project_id)?;
         let artifact_id = parse_artifact_id(request.artifact_id)?;
-        let playground_id = parse_playground_id(request.playground_id)?;
+        let workspace_id = parse_workspace_id(request.workspace_id)?;
         let storage_volume_id = parse_volume_id(request.storage_volume_id)?;
         let display_name = validate_display_name(request.display_name.clone())?;
         let requested_base_commit_id = request
@@ -1775,46 +2218,59 @@ impl CatalogService {
                     .map_err(|_| invalid_request("base_commit_id must be a 64-character digest"))
             })
             .transpose()?;
-        let operation_request_id = RequestId::new(format!("workspace-create-{}", playground_id))
+        let operation_request_id = RequestId::new(format!("workspace-create-{}", workspace_id))
             .map_err(|error| invalid_request(format!("task request_id: {error}")))?;
         let (task, task_replayed) = self
             .begin_operation_task(
-                TaskKind::WorkspaceCreate,
+                TaskIntent::WorkspaceCreate,
                 TaskScope {
                     tenant_id: tenant_id.clone(),
                     project_id: Some(project_id.clone()),
                     artifact_id: Some(artifact_id.clone()),
                     object_namespace_id: Some(ObjectNamespaceId::from_artifact(&artifact_id)),
                     commit_id: requested_base_commit_id.map(CommitId::from_digest),
-                    playground_id: Some(playground_id.clone()),
+                    workspace_id: Some(workspace_id.clone()),
+
                     snapshot_id: None,
                     storage_volume_id: Some(storage_volume_id.clone()),
                 },
                 operation_request_id,
                 &task_request,
                 identity,
-                Some("playground"),
-                Some(playground_id.as_str()),
+                Some("workspace"),
+                Some(workspace_id.as_str()),
             )
             .await?;
-        self.link_operation_resource(
+        self.operation_result(
             &task,
-            TaskResourceKind::Playground,
-            playground_id.to_string(),
-            TaskResourceRole::Primary,
+            identity,
+            self.link_operation_resource(
+                &task,
+                TaskResourceKind::Workspace,
+                workspace_id.to_string(),
+                TaskResourceRole::Primary,
+            )
+            .await,
         )
         .await?;
-        let relative_root = format!(
-            "playgrounds/{}/{}/{}",
-            project_id, artifact_id, playground_id
-        );
+        let relative_root = format!("workspaces/{}/{}/{}", project_id, artifact_id, workspace_id);
         if let Some(existing) = self
-            .repository
-            .get_playground(&tenant_id, &project_id, &artifact_id, &playground_id)
-            .await
-            .map_err(map_central_error)?
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .get_workspace(&tenant_id, &project_id, &artifact_id, &workspace_id)
+                    .await
+                    .map_err(map_central_error),
+            )
+            .await?
         {
-            require_active_for_mutation(&existing.lifecycle, "Playground")?;
+            self.operation_result(
+                &task,
+                identity,
+                require_active_for_mutation(&existing.lifecycle, "Workspace"),
+            )
+            .await?;
             if existing.storage_volume_id == storage_volume_id
                 && existing.display_name == display_name
                 && existing.relative_root == relative_root
@@ -1822,27 +2278,48 @@ impl CatalogService {
                     .as_ref()
                     .is_none_or(|requested| existing.base_commit_id.as_ref() == Some(requested))
             {
-                self.require_storage_availability_configured()?;
+                self.operation_result(
+                    &task,
+                    identity,
+                    self.require_storage_availability_configured(),
+                )
+                .await?;
                 self.ensure_workspace_materialization(&existing).await;
-                return Ok(CreatePlaygroundResponse {
-                    playground: self.playground_view(&existing).await?,
-                    replayed: true,
+                let workspace = self
+                    .operation_result(&task, identity, self.workspace_view(&existing).await)
+                    .await?;
+                return Ok(CreateWorkspaceResponse {
+                    workspace,
+                    request_replayed: !task.as_ref().is_some_and(|value| value.execution_reused),
+                    execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
                     task,
                 });
             }
-            return Err(catalog_conflict(
-                "playground_id_reused",
-                "PLAYGROUND_ID_REUSED",
-                "Playground ID is already bound to another create request",
-            ));
+            let error = catalog_conflict(
+                "workspace_id_reused",
+                "WORKSPACE_ID_REUSED",
+                "Workspace ID is already bound to another create request",
+            );
+            self.fail_operation_task(&task, identity, &error).await;
+            return Err(error);
         }
         let artifact = self
-            .repository
-            .get_artifact(&tenant_id, &project_id, &artifact_id)
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("artifact"))?;
-        require_active_for_mutation(&artifact.lifecycle, "Artifact")?;
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .get_artifact(&tenant_id, &project_id, &artifact_id)
+                    .await
+                    .map_err(map_central_error)
+                    .and_then(|record| record.ok_or_else(|| resource_not_found("artifact"))),
+            )
+            .await?;
+        self.operation_result(
+            &task,
+            identity,
+            require_active_for_mutation(&artifact.lifecycle, "Artifact"),
+        )
+        .await?;
         // An explicit base may select any published immutable Commit owned by this exact Artifact
         // scope. Omitting it still means "freeze the current authoritative Head", not an empty
         // baseline.
@@ -1851,8 +2328,13 @@ impl CatalogService {
                 // A Workspace may be created on any ready Volume. Central resolves a readable
                 // source Placement for hydration; the target Volume is never required to be the
                 // Commit's existing physical location.
-                self.load_published_commit(&artifact, CommitId::from_digest(commit_id))
-                    .await?;
+                self.operation_result(
+                    &task,
+                    identity,
+                    self.load_published_commit(&artifact, CommitId::from_digest(commit_id))
+                        .await,
+                )
+                .await?;
                 (Some(commit_id), ArtifactHeadExpectation::Any)
             }
             None => (
@@ -1861,92 +2343,109 @@ impl CatalogService {
             ),
         };
         let volume = self
-            .repository
-            .get_storage_volume(&tenant_id, &storage_volume_id)
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("storage volume"))?;
-        require_active_for_mutation(&volume.lifecycle, "StorageVolume")?;
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .get_storage_volume(&tenant_id, &storage_volume_id)
+                    .await
+                    .map_err(map_central_error)
+                    .and_then(|record| record.ok_or_else(|| resource_not_found("storage volume"))),
+            )
+            .await?;
+        self.operation_result(
+            &task,
+            identity,
+            require_active_for_mutation(&volume.lifecycle, "StorageVolume"),
+        )
+        .await?;
         if volume.state != StorageVolumeState::Ready {
-            return Err(catalog_conflict(
+            let error = catalog_conflict(
                 "storage_volume_not_ready",
                 "STORAGE_VOLUME_NOT_READY",
                 "the selected StorageVolume is not ready for placement",
-            ));
+            );
+            self.fail_operation_task(&task, identity, &error).await;
+            return Err(error);
         }
-        self.require_live_storage_ready(&tenant_id, &storage_volume_id, "Playground placement")
-            .await?;
-        let now = self.clock.now();
-        let outcome = self
-            .repository
-            .insert_playground_fenced(PlaygroundInsertRequest {
-                record: PlaygroundRecord {
-                    tenant_id,
-                    project_id,
-                    artifact_id,
-                    playground_id,
-                    storage_volume_id,
-                    region: volume.region,
-                    display_name,
-                    base_commit_id,
-                    head_commit_id: base_commit_id,
-                    // Physical materialization is asynchronous. The record must remain Creating
-                    // until the selected owner Agent confirms the directory is ready.
-                    state: PlaygroundState::Creating,
-                    resource_version: 1,
-                    lifecycle: ResourceLifecycle::active(),
-                    relative_root,
-                    created_at_unix_ms: now,
-                    updated_at_unix_ms: now,
-                },
-                artifact_head,
-            })
-            .await
-            .map_err(playground_mutation_error)?;
-        let (record, replayed) = split_outcome(outcome);
-        self.ensure_workspace_materialization(&record).await;
-        let materialize_task = self
-            .begin_child_operation_task(
-                &task,
-                TaskKind::WorkspaceMaterialize,
-                TaskScope {
-                    tenant_id: record.tenant_id.clone(),
-                    project_id: Some(record.project_id.clone()),
-                    artifact_id: Some(record.artifact_id.clone()),
-                    object_namespace_id: Some(ObjectNamespaceId::from_artifact(
-                        &record.artifact_id,
-                    )),
-                    commit_id: record.base_commit_id.map(CommitId::from_digest),
-                    playground_id: Some(record.playground_id.clone()),
-                    snapshot_id: None,
-                    storage_volume_id: Some(record.storage_volume_id.clone()),
-                },
-                RequestId::new(format!("{}-materialize", record.playground_id))
-                    .map_err(|error| invalid_request(format!("task request_id: {error}")))?,
-                &task_request,
-                identity,
-                Some("workspace_materialization"),
-                Some(record.playground_id.as_str()),
-            )
-            .await?;
-        self.link_operation_resource(
-            &materialize_task,
-            TaskResourceKind::Playground,
-            record.playground_id.to_string(),
-            TaskResourceRole::Target,
+        self.operation_result(
+            &task,
+            identity,
+            self.require_live_storage_ready(&tenant_id, &storage_volume_id, "Workspace placement")
+                .await,
         )
         .await?;
-        let task = self
-            .transition_operation_task(
-                task,
-                TaskState::Running,
+        let now = self.clock.now();
+        let outcome = self
+            .operation_result(
+                &task,
                 identity,
-                Some("workspace created; materialization pending".to_owned()),
+                self.repository
+                    .insert_workspace_fenced(WorkspaceInsertRequest {
+                        record: WorkspaceRecord {
+                            tenant_id,
+                            project_id,
+                            artifact_id,
+                            workspace_id,
+                            storage_volume_id,
+                            region: volume.region,
+                            display_name,
+                            base_commit_id,
+                            head_commit_id: base_commit_id,
+                            // Physical materialization is asynchronous. The record must remain Creating
+                            // until the selected owner Agent confirms the directory is ready.
+                            state: WorkspaceState::Creating,
+                            resource_version: 1,
+                            lifecycle: ResourceLifecycle::active(),
+                            relative_root,
+                            created_at_unix_ms: now,
+                            updated_at_unix_ms: now,
+                        },
+                        artifact_head,
+                    })
+                    .await
+                    .map_err(workspace_mutation_error),
             )
             .await?;
-        Ok(CreatePlaygroundResponse {
-            playground: self.playground_view(&record).await?,
-            replayed: replayed || task_replayed,
+        let (record, replayed) = split_outcome(outcome);
+        self.ensure_workspace_materialization(&record).await;
+        // Materialization is a stage of workspace.create. Attach its target to the root task;
+        // no public child task is created for this internal phase.
+        let materialize_task = task.clone();
+        self.operation_result(
+            &materialize_task,
+            identity,
+            self.link_operation_resource(
+                &materialize_task,
+                TaskResourceKind::Workspace,
+                record.workspace_id.to_string(),
+                TaskResourceRole::Target,
+            )
+            .await,
+        )
+        .await?;
+        let previous_task = task.clone();
+        let task = self
+            .operation_result(
+                &previous_task,
+                identity,
+                self.transition_operation_task(
+                    task,
+                    TaskState::Running,
+                    identity,
+                    Some("workspace created; materialization pending".to_owned()),
+                )
+                .await,
+            )
+            .await?;
+        let workspace = self
+            .operation_result(&task, identity, self.workspace_view(&record).await)
+            .await?;
+        Ok(CreateWorkspaceResponse {
+            workspace,
+            request_replayed: (replayed || task_replayed)
+                && !task.as_ref().is_some_and(|value| value.execution_reused),
+            execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
             task,
         })
     }
@@ -2068,16 +2567,17 @@ impl CatalogService {
             DeliveryModeBody::Hardlink => SnapshotDeliveryMode::Hardlink,
         };
         let snapshot_id = deterministic_snapshot_id(&tenant_id, &snapshot_request_id)?;
-        let (mut task, _task_replayed) = self
+        let (mut task, task_replayed) = self
             .begin_operation_task(
-                TaskKind::SnapshotCreate,
+                TaskIntent::SnapshotCreate,
                 TaskScope {
                     tenant_id: tenant_id.clone(),
                     project_id: Some(project_id.clone()),
                     artifact_id: Some(artifact_id.clone()),
                     object_namespace_id: Some(ObjectNamespaceId::from_artifact(&artifact_id)),
                     commit_id: Some(CommitId::from_digest(commit_id)),
-                    playground_id: None,
+                    workspace_id: None,
+
                     snapshot_id: Some(snapshot_id.clone()),
                     storage_volume_id: Some(target_storage_volume_id.clone()),
                 },
@@ -2088,20 +2588,35 @@ impl CatalogService {
                 Some(snapshot_id.as_str()),
             )
             .await?;
-        self.link_operation_resource(
+        self.operation_result(
             &task,
-            TaskResourceKind::Snapshot,
-            snapshot_id.to_string(),
-            TaskResourceRole::Primary,
+            identity,
+            self.link_operation_resource(
+                &task,
+                TaskResourceKind::Snapshot,
+                snapshot_id.to_string(),
+                TaskResourceRole::Primary,
+            )
+            .await,
         )
         .await?;
         if let Some(existing) = self
-            .repository
-            .get_snapshot(&tenant_id, &snapshot_id)
-            .await
-            .map_err(map_central_error)?
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .get_snapshot(&tenant_id, &snapshot_id)
+                    .await
+                    .map_err(map_central_error),
+            )
+            .await?
         {
-            require_active_for_mutation(&existing.lifecycle, "Snapshot")?;
+            self.operation_result(
+                &task,
+                identity,
+                require_active_for_mutation(&existing.lifecycle, "Snapshot"),
+            )
+            .await?;
             if existing.project_id != project_id
                 || existing.artifact_id != artifact_id
                 || existing.commit_id != commit_id
@@ -2110,78 +2625,119 @@ impl CatalogService {
                 || existing.edge_cluster_id != target_edge_cluster_id
                 || existing.delivery_mode != delivery_mode
             {
-                return Err(catalog_conflict(
+                let error = catalog_conflict(
                     "snapshot_request_id_reused",
                     "SNAPSHOT_REQUEST_ID_REUSED",
                     "Snapshot request ID is already bound to another create payload",
-                ));
+                );
+                self.fail_operation_task(&task, identity, &error).await;
+                return Err(error);
             }
             let delivery = self
-                .repository
-                .get_snapshot_delivery(&tenant_id, &existing.delivery_id)
-                .await
-                .map_err(map_central_error)?
-                .ok_or_else(internal_catalog_error)?;
+                .operation_result(
+                    &task,
+                    identity,
+                    self.repository
+                        .get_snapshot_delivery(&tenant_id, &existing.delivery_id)
+                        .await
+                        .map_err(map_central_error)
+                        .and_then(|delivery| delivery.ok_or_else(internal_catalog_error)),
+                )
+                .await?;
             if delivery.snapshot_id != existing.snapshot_id
                 || delivery.commit_id != existing.commit_id
                 || delivery.storage_volume_id != existing.storage_volume_id
                 || delivery.mode != existing.delivery_mode
             {
-                return Err(internal_catalog_error());
+                let error = internal_catalog_error();
+                self.fail_operation_task(&task, identity, &error).await;
+                return Err(error);
             }
             self.best_effort_schedule_snapshot_delivery(&delivery).await;
+            let snapshot = self
+                .operation_result(&task, identity, self.snapshot_view(&existing).await)
+                .await?;
             return Ok(CreateSnapshotResponse {
-                snapshot: self.snapshot_view(&existing).await?,
-                replayed: true,
+                snapshot,
+                request_replayed: !task.as_ref().is_some_and(|value| value.execution_reused),
+                execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
                 task,
             });
         }
         let artifact = self
-            .repository
-            .get_artifact(&tenant_id, &project_id, &artifact_id)
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("artifact"))?;
-        require_active_for_mutation(&artifact.lifecycle, "Artifact")?;
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .get_artifact(&tenant_id, &project_id, &artifact_id)
+                    .await
+                    .map_err(map_central_error)
+                    .and_then(|record| record.ok_or_else(|| resource_not_found("artifact"))),
+            )
+            .await?;
+        self.operation_result(
+            &task,
+            identity,
+            require_active_for_mutation(&artifact.lifecycle, "Artifact"),
+        )
+        .await?;
         let volume = self
-            .repository
-            .get_storage_volume(&tenant_id, &target_storage_volume_id)
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("storage volume"))?;
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .get_storage_volume(&tenant_id, &target_storage_volume_id)
+                    .await
+                    .map_err(map_central_error)
+                    .and_then(|record| record.ok_or_else(|| resource_not_found("storage volume"))),
+            )
+            .await?;
         if !volume.lifecycle.is_active() {
-            return Err(catalog_conflict(
+            let error = catalog_conflict(
                 "storage_volume_lifecycle_fenced",
                 "STORAGE_VOLUME_LIFECYCLE_FENCED",
                 "the target StorageVolume is not active",
-            ));
+            );
+            self.fail_operation_task(&task, identity, &error).await;
+            return Err(error);
         }
         if volume.state != StorageVolumeState::Ready {
-            return Err(application_error(
+            let error = application_error(
                 ErrorCategory::Conflict,
                 "storage_volume_not_ready",
                 "STORAGE_VOLUME_NOT_READY",
                 "the target StorageVolume is not ready",
                 true,
-            ));
+            );
+            self.fail_operation_task(&task, identity, &error).await;
+            return Err(error);
         }
         if volume.edge_cluster_id != target_edge_cluster_id {
-            return Err(catalog_conflict(
+            let error = catalog_conflict(
                 "storage_volume_edge_cluster_mismatch",
                 "STORAGE_VOLUME_EDGE_CLUSTER_MISMATCH",
                 "the target StorageVolume belongs to a different EdgeCluster",
-            ));
+            );
+            self.fail_operation_task(&task, identity, &error).await;
+            return Err(error);
         }
         if !volume.allowed_delivery_modes.contains(&delivery_mode) {
-            return Err(catalog_conflict(
+            let error = catalog_conflict(
                 "delivery_mode_not_allowed",
                 "DELIVERY_MODE_NOT_ALLOWED",
                 "the requested delivery mode is disabled by the StorageVolume policy",
-            ));
+            );
+            self.fail_operation_task(&task, identity, &error).await;
+            return Err(error);
         }
         let artifact_head = ArtifactHeadExpectation::Any;
         let commit = self
-            .load_published_commit(&artifact, CommitId::from_digest(commit_id))
+            .operation_result(
+                &task,
+                identity,
+                self.load_published_commit(&artifact, CommitId::from_digest(commit_id))
+                    .await,
+            )
             .await?;
         let now = self.clock.now();
         let delivery_id = super::snapshot_delivery::deterministic_delivery_id(
@@ -2238,142 +2794,168 @@ impl CatalogService {
         // scheduling hint.  In the production composition the coordinator also performs the
         // capability/session preflight, so an Agent that has not completed the QUIC handshake
         // cannot leave behind an apparently accepted Delivery.
-        self.require_live_storage_ready(&tenant_id, &target_storage_volume_id, "Snapshot delivery")
-            .await?;
+        self.operation_result(
+            &task,
+            identity,
+            self.require_live_storage_ready(
+                &tenant_id,
+                &target_storage_volume_id,
+                "Snapshot delivery",
+            )
+            .await,
+        )
+        .await?;
         if self.agent_registry.is_some() {
-            let coordinator = self.coordinator.as_ref().ok_or_else(|| {
-                application_error(
-                    ErrorCategory::Unavailable,
-                    "snapshot_delivery_execution_unavailable",
-                    "SNAPSHOT_DELIVERY_EXECUTION_UNAVAILABLE",
-                    "Snapshot delivery execution is not configured",
-                    true,
+            let coordinator = self
+                .operation_result(
+                    &task,
+                    identity,
+                    self.coordinator.as_ref().ok_or_else(|| {
+                        application_error(
+                            ErrorCategory::Unavailable,
+                            "snapshot_delivery_execution_unavailable",
+                            "SNAPSHOT_DELIVERY_EXECUTION_UNAVAILABLE",
+                            "Snapshot delivery execution is not configured",
+                            true,
+                        )
+                    }),
                 )
-            })?;
-            coordinator
-                .preflight_snapshot_delivery(&tenant_id, &target_storage_volume_id, delivery_mode)
-                .await
-                .map_err(map_central_error)?;
+                .await?;
+            self.operation_result(
+                &task,
+                identity,
+                coordinator
+                    .preflight_snapshot_delivery(
+                        &tenant_id,
+                        &target_storage_volume_id,
+                        delivery_mode,
+                    )
+                    .await
+                    .map_err(map_central_error),
+            )
+            .await?;
         }
         let retention_roots = if delivery_mode == SnapshotDeliveryMode::Hardlink {
-            self.hardlink_retention_roots(&tenant_id, &artifact_id, &delivery_id, &commit.records)
-                .await?
+            self.operation_result(
+                &task,
+                identity,
+                self.hardlink_retention_roots(
+                    &tenant_id,
+                    &artifact_id,
+                    &delivery_id,
+                    &commit.records,
+                )
+                .await,
+            )
+            .await?
         } else {
             Vec::new()
         };
         let outcome = self
-            .repository
-            .insert_snapshot_with_delivery(crate::SnapshotWithDeliveryInsertRequest {
-                snapshot: SnapshotInsertRequest {
-                    record: SnapshotRecord {
-                        tenant_id: tenant_id.clone(),
-                        project_id: project_id.clone(),
-                        artifact_id: artifact_id.clone(),
-                        snapshot_id: snapshot_id.clone(),
-                        snapshot_request_id: snapshot_request_id.clone(),
-                        commit_id,
-                        delivery_id: delivery_id.clone(),
-                        edge_cluster_id: target_edge_cluster_id.clone(),
-                        storage_volume_id: target_storage_volume_id.clone(),
-                        delivery_mode,
-                        state: SnapshotState::Creating,
-                        resource_version: 1,
-                        lifecycle: ResourceLifecycle::active(),
-                        created_at_unix_ms: now,
-                        updated_at_unix_ms: now,
-                    },
-                    artifact_head,
-                },
-                delivery: SnapshotDeliveryInsertRequest {
-                    record: SnapshotDeliveryRecord {
-                        tenant_id: tenant_id.clone(),
-                        delivery_id,
-                        create_request_id: snapshot_request_id.clone(),
-                        snapshot_id,
-                        commit_id,
-                        storage_volume_id: target_storage_volume_id,
-                        mode: delivery_mode,
-                        target_relative_root,
-                        state: SnapshotDeliveryState::Requested,
-                        source_index_digest: commit.index_version.digest,
-                        delivery_generation: DeliveryGeneration::new(1),
-                        file_count,
-                        size_bytes,
-                        object_set_digest: commit.object_set_digest,
-                        resource_version: 1,
-                        issue_code: None,
-                        issue_message: None,
-                        issue_retryable: false,
-                        created_at_unix_ms: now,
-                        updated_at_unix_ms: now,
-                    },
-                    request_id: snapshot_request_id,
-                    retention_roots,
-                },
-            })
-            .await
-            .map_err(snapshot_mutation_error)?;
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .insert_snapshot_with_delivery(crate::SnapshotWithDeliveryInsertRequest {
+                        snapshot: SnapshotInsertRequest {
+                            record: SnapshotRecord {
+                                tenant_id: tenant_id.clone(),
+                                project_id: project_id.clone(),
+                                artifact_id: artifact_id.clone(),
+                                snapshot_id: snapshot_id.clone(),
+                                snapshot_request_id: snapshot_request_id.clone(),
+                                commit_id,
+                                delivery_id: delivery_id.clone(),
+                                edge_cluster_id: target_edge_cluster_id.clone(),
+                                storage_volume_id: target_storage_volume_id.clone(),
+                                delivery_mode,
+                                state: SnapshotState::Creating,
+                                resource_version: 1,
+                                lifecycle: ResourceLifecycle::active(),
+                                created_at_unix_ms: now,
+                                updated_at_unix_ms: now,
+                            },
+                            artifact_head,
+                        },
+                        delivery: SnapshotDeliveryInsertRequest {
+                            record: SnapshotDeliveryRecord {
+                                tenant_id: tenant_id.clone(),
+                                delivery_id,
+                                create_request_id: snapshot_request_id.clone(),
+                                snapshot_id,
+                                commit_id,
+                                storage_volume_id: target_storage_volume_id,
+                                mode: delivery_mode,
+                                target_relative_root,
+                                state: SnapshotDeliveryState::Requested,
+                                source_index_digest: commit.index_version.digest,
+                                delivery_generation: DeliveryGeneration::new(1),
+                                file_count,
+                                size_bytes,
+                                object_set_digest: commit.object_set_digest,
+                                resource_version: 1,
+                                issue_code: None,
+                                issue_message: None,
+                                issue_retryable: false,
+                                created_at_unix_ms: now,
+                                updated_at_unix_ms: now,
+                            },
+                            request_id: snapshot_request_id,
+                            retention_roots,
+                        },
+                    })
+                    .await
+                    .map_err(snapshot_mutation_error),
+            )
+            .await?;
         let crate::SnapshotWithDeliveryInsertResult {
             snapshot: record,
             delivery,
             replayed,
         } = outcome;
-        let delivery_task = self
-            .begin_child_operation_task(
-                &task,
-                TaskKind::SnapshotDeliveryMaterialize,
-                TaskScope {
-                    tenant_id: tenant_id.clone(),
-                    project_id: Some(project_id.clone()),
-                    artifact_id: Some(artifact_id.clone()),
-                    object_namespace_id: Some(ObjectNamespaceId::from_artifact(&artifact_id)),
-                    commit_id: Some(CommitId::from_digest(record.commit_id)),
-                    playground_id: None,
-                    snapshot_id: Some(record.snapshot_id.clone()),
-                    storage_volume_id: Some(record.storage_volume_id.clone()),
-                },
-                Self::derived_task_request_id(
-                    TaskKind::SnapshotDeliveryMaterialize,
-                    &task_request,
-                )?,
-                &task_request,
-                identity,
-                Some("snapshot_delivery"),
-                Some(delivery.delivery_id.as_str()),
-            )
-            .await?;
-        self.link_operation_resource(
+        let delivery_task = task.clone();
+        self.operation_result(
             &delivery_task,
-            TaskResourceKind::SnapshotDelivery,
-            delivery.delivery_id.to_string(),
-            TaskResourceRole::Primary,
+            identity,
+            self.link_operation_resource(
+                &delivery_task,
+                TaskResourceKind::SnapshotDelivery,
+                delivery.delivery_id.to_string(),
+                TaskResourceRole::Primary,
+            )
+            .await,
         )
         .await?;
+        let previous_task = task.clone();
         task = self
-            .transition_operation_task(
-                task,
-                TaskState::Running,
+            .operation_result(
+                &previous_task,
                 identity,
-                Some("snapshot created; delivery materialization pending".to_owned()),
-            )
-            .await?;
-        let _ = self
-            .transition_operation_task(
-                delivery_task,
-                TaskState::Running,
-                identity,
-                Some("snapshot delivery scheduled".to_owned()),
+                self.transition_operation_task(
+                    task,
+                    TaskState::Running,
+                    identity,
+                    Some("snapshot created; delivery materialization pending".to_owned()),
+                )
+                .await,
             )
             .await?;
         // Commit was loaded before the fenced insert. Retain this assertion so a corrupted
         // repository cannot dispatch a different immutable Index than the public response.
         if ContentDigest::from(commit.commit_id) != record.commit_id {
-            return Err(internal_catalog_error());
+            let error = internal_catalog_error();
+            self.fail_operation_task(&task, identity, &error).await;
+            return Err(error);
         }
         self.best_effort_schedule_snapshot_delivery(&delivery).await;
+        let snapshot = self
+            .operation_result(&task, identity, self.snapshot_view(&record).await)
+            .await?;
         Ok(CreateSnapshotResponse {
-            snapshot: self.snapshot_view(&record).await?,
-            replayed,
+            snapshot,
+            request_replayed: (replayed || task_replayed)
+                && !task.as_ref().is_some_and(|value| value.execution_reused),
+            execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
             task,
         })
     }
@@ -2453,7 +3035,7 @@ impl CatalogService {
         let deletion_id = deletion_id_for_request(&tenant_id, &request_id)?;
         let (task, task_replayed) = self
             .begin_operation_task(
-                TaskKind::CatalogLifecycle,
+                delete_intent_for_resource(&root),
                 task_scope_for_resource(tenant_id.clone(), &root),
                 request_id.clone(),
                 &task_request,
@@ -2462,68 +3044,113 @@ impl CatalogService {
                 Some(deletion_id.as_str()),
             )
             .await?;
-        self.link_operation_resource(
+        self.operation_result(
             &task,
-            TaskResourceKind::Deletion,
-            deletion_id.to_string(),
-            TaskResourceRole::Primary,
+            identity,
+            self.link_operation_resource(
+                &task,
+                TaskResourceKind::Deletion,
+                deletion_id.to_string(),
+                TaskResourceRole::Primary,
+            )
+            .await,
         )
         .await?;
         let now = self.clock.now();
         if let Some(existing) = self
-            .repository
-            .get_deletion_operation(&tenant_id, &deletion_id)
-            .await
-            .map_err(map_central_error)?
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .get_deletion_operation(&tenant_id, &deletion_id)
+                    .await
+                    .map_err(map_central_error),
+            )
+            .await?
         {
             if existing.request_id == request_id && existing.request_digest == request_digest {
                 self.publish_deletion_s3_read_revocations(&existing, "deletion request replayed")
                     .await;
-                let task = self.complete_operation_task(task, identity).await?;
+                let previous_task = task.clone();
+                let task = self
+                    .operation_result(
+                        &previous_task,
+                        identity,
+                        self.synchronize_deletion_task(task, &existing, identity)
+                            .await,
+                    )
+                    .await?;
                 return Ok(DeletionMutationResponse {
                     deletion: deletion_operation_view(&existing),
-                    replayed: true,
+                    request_replayed: !task.as_ref().is_some_and(|value| value.execution_reused),
+                    execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
                     task,
                 });
             }
-            return Err(lifecycle_request_id_reused());
+            let error = lifecycle_request_id_reused();
+            self.fail_operation_task(&task, identity, &error).await;
+            return Err(error);
         }
         // The impact digest identifies the exact, short-lived snapshot returned by the
         // confirmation query. Rebuilding an impact here would change its issued/expiry timestamps
         // on every request and make a valid confirmation fail with IMPACT_CHANGED. The repository
         // transaction below re-loads that saved snapshot, checks its TTL and target versions, and
         // fences the current resources atomically before creating the deletion operation.
-        let current_blockers = self.lifecycle_authority_blockers(&tenant_id, &root).await?;
+        let current_blockers = self
+            .operation_result(
+                &task,
+                identity,
+                self.lifecycle_authority_blockers(&tenant_id, &root).await,
+            )
+            .await?;
         if !current_blockers.is_empty() {
-            return Err(lifecycle_conflict(
+            let error = lifecycle_conflict(
                 "unique_object_replica",
                 "UNIQUE_OBJECT_REPLICA",
                 "the StorageVolume now contains an object with no valid replica on another Volume",
-            ));
+            );
+            self.fail_operation_task(&task, identity, &error).await;
+            return Err(error);
         }
         let outcome = self
-            .repository
-            .create_deletion_idempotent(DomainCreateDeletionRequest {
-                deletion_id,
-                tenant_id,
-                root,
-                cascade: request.cascade,
-                confirm_managed_data_erase: request.confirm_managed_data_erase,
-                request_id,
-                request_digest,
-                impact_digest,
-                expected_resource_version,
-                now_unix_ms: now,
-            })
-            .await
-            .map_err(map_lifecycle_mutation_error)?;
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .create_deletion_idempotent(DomainCreateDeletionRequest {
+                        deletion_id,
+                        tenant_id,
+                        root,
+                        cascade: request.cascade,
+                        confirm_managed_data_erase: request.confirm_managed_data_erase,
+                        request_id,
+                        request_digest,
+                        impact_digest,
+                        expected_resource_version,
+                        now_unix_ms: now,
+                    })
+                    .await
+                    .map_err(map_lifecycle_mutation_error),
+            )
+            .await?;
         let (deletion, replayed) = split_outcome(outcome);
         self.publish_deletion_s3_read_revocations(&deletion, "resource deletion requested")
             .await;
+        let previous_task = task.clone();
+        let task = self
+            .operation_result(
+                &previous_task,
+                identity,
+                self.synchronize_deletion_task(task, &deletion, identity)
+                    .await,
+            )
+            .await?;
         Ok(DeletionMutationResponse {
             deletion: deletion_operation_view(&deletion),
-            replayed: replayed || task_replayed,
-            task: self.complete_operation_task(task, identity).await?,
+            request_replayed: (replayed || task_replayed)
+                && !task.as_ref().is_some_and(|value| value.execution_reused),
+            execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
+            task,
         })
     }
 
@@ -2653,10 +3280,16 @@ impl CatalogService {
             .await?;
         let deletion_id = parse_deletion_id(request.deletion_id)?;
         let request_id = parse_request_id(request.request_id)?;
+        let existing_deletion = self
+            .repository
+            .get_deletion_operation(&tenant_id, &deletion_id)
+            .await
+            .map_err(map_central_error)?
+            .ok_or_else(|| resource_not_found("deletion operation"))?;
         let (task, task_replayed) = self
             .begin_operation_task(
-                TaskKind::CatalogLifecycle,
-                TaskScope::new(tenant_id.clone()),
+                restore_intent_for_resource(&existing_deletion.root),
+                task_scope_for_resource(tenant_id.clone(), &existing_deletion.root),
                 request_id.clone(),
                 &task_request,
                 identity,
@@ -2664,35 +3297,63 @@ impl CatalogService {
                 Some(deletion_id.as_str()),
             )
             .await?;
-        self.link_operation_resource(
+        self.operation_result(
             &task,
-            TaskResourceKind::Deletion,
-            deletion_id.to_string(),
-            TaskResourceRole::Primary,
+            identity,
+            self.link_operation_resource(
+                &task,
+                TaskResourceKind::Deletion,
+                deletion_id.to_string(),
+                TaskResourceRole::Primary,
+            )
+            .await,
         )
         .await?;
-        let outcome = self
-            .repository
-            .restore_deletion_idempotent(DomainRestoreDeletionRequest {
-                tenant_id,
-                deletion_id,
-                request_id,
-                request_digest,
-                expected_resource_version: parse_lifecycle_resource_version(
+        let expected_resource_version = self
+            .operation_result(
+                &task,
+                identity,
+                parse_lifecycle_resource_version(
                     "expected_resource_version",
                     &request.expected_resource_version,
-                )?,
-                now_unix_ms: self.clock.now(),
-            })
-            .await
-            .map_err(map_lifecycle_mutation_error)?;
+                ),
+            )
+            .await?;
+        let outcome = self
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .restore_deletion_idempotent(DomainRestoreDeletionRequest {
+                        tenant_id,
+                        deletion_id,
+                        request_id,
+                        request_digest,
+                        expected_resource_version,
+                        now_unix_ms: self.clock.now(),
+                    })
+                    .await
+                    .map_err(map_lifecycle_mutation_error),
+            )
+            .await?;
         let (deletion, replayed) = split_outcome(outcome);
         self.publish_deletion_s3_read_revocations(&deletion, "resource restore requested")
             .await;
+        let previous_task = task.clone();
+        let task = self
+            .operation_result(
+                &previous_task,
+                identity,
+                self.synchronize_deletion_task(task, &deletion, identity)
+                    .await,
+            )
+            .await?;
         Ok(DeletionMutationResponse {
             deletion: deletion_operation_view(&deletion),
-            replayed: replayed || task_replayed,
-            task: self.complete_operation_task(task, identity).await?,
+            request_replayed: (replayed || task_replayed)
+                && !task.as_ref().is_some_and(|value| value.execution_reused),
+            execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
+            task,
         })
     }
 
@@ -2701,51 +3362,143 @@ impl CatalogService {
         identity: &AuthenticatedIdentity,
         request: UpdateDeletionRequest,
     ) -> Result<DeletionMutationResponse, Error> {
-        let task_request = request.clone();
         let request_digest = lifecycle_request_digest("deletion_retry", &request)?;
         let tenant_id = parse_tenant(request.tenant_id)?;
         self.require_tenant(identity, Permission::ResourceLifecycleManage, &tenant_id)
             .await?;
         let deletion_id = parse_deletion_id(request.deletion_id)?;
         let request_id = parse_request_id(request.request_id)?;
-        let (task, task_replayed) = self
-            .begin_operation_task(
-                TaskKind::CatalogLifecycle,
-                TaskScope::new(tenant_id.clone()),
-                request_id.clone(),
-                &task_request,
-                identity,
-                Some("deletion"),
-                Some(deletion_id.as_str()),
-            )
-            .await?;
-        self.link_operation_resource(
+        let existing_deletion = self
+            .repository
+            .get_deletion_operation(&tenant_id, &deletion_id)
+            .await
+            .map_err(map_central_error)?
+            .ok_or_else(|| resource_not_found("deletion operation"))?;
+        let expected_intent = delete_intent_for_resource(&existing_deletion.root);
+
+        // A deletion retry is a continuation of the original public operation. Resolve the task
+        // created by `deletion.create` and retry that row in place so the root `task_id` remains
+        // stable while its attempt counter advances. The retry request itself is idempotent at the
+        // DeletionOperation layer; creating a second task here would make a replay look like a new
+        // user operation and would violate the single-root contract.
+        let mut task = if let Some(coordinator) = &self.task_coordinator {
+            coordinator
+                .repository()
+                .get_by_request_id(&tenant_id, &existing_deletion.request_id)
+                .await
+                .map_err(map_central_error)?
+                .map(|value| super::task::task_view(&value))
+        } else {
+            None
+        };
+        if let Some(existing_task) = &task {
+            if existing_task.intent_kind != expected_intent.to_string() {
+                return Err(invalid_request(
+                    "deletion operation is bound to a different task intent",
+                ));
+            }
+        } else if self.task_coordinator.is_some() {
+            // Background deletions created before the task coordinator was attached still get a
+            // canonical root on their first retry. Use the original deletion request identity,
+            // never the retry request identity, so subsequent retries resolve the same task.
+            let task_payload = serde_json::json!({
+                "deletion_id": existing_deletion.deletion_id.to_string(),
+                "request_digest": existing_deletion.request_digest.to_string(),
+            });
+            let (created, _) = self
+                .begin_operation_task(
+                    expected_intent,
+                    task_scope_for_resource(tenant_id.clone(), &existing_deletion.root),
+                    existing_deletion.request_id.clone(),
+                    &task_payload,
+                    identity,
+                    Some("deletion"),
+                    Some(deletion_id.as_str()),
+                )
+                .await?;
+            task = created;
+        }
+        self.operation_result(
             &task,
-            TaskResourceKind::Deletion,
-            deletion_id.to_string(),
-            TaskResourceRole::Primary,
+            identity,
+            self.link_operation_resource(
+                &task,
+                TaskResourceKind::Deletion,
+                deletion_id.to_string(),
+                TaskResourceRole::Primary,
+            )
+            .await,
         )
         .await?;
-        let outcome = self
-            .repository
-            .retry_deletion_idempotent(DomainRetryDeletionRequest {
-                tenant_id,
-                deletion_id,
-                request_id,
-                request_digest,
-                expected_resource_version: parse_lifecycle_resource_version(
+        let expected_resource_version = self
+            .operation_result(
+                &task,
+                identity,
+                parse_lifecycle_resource_version(
                     "expected_resource_version",
                     &request.expected_resource_version,
-                )?,
-                now_unix_ms: self.clock.now(),
-            })
-            .await
-            .map_err(map_lifecycle_mutation_error)?;
+                ),
+            )
+            .await?;
+        let outcome = self
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .retry_deletion_idempotent(DomainRetryDeletionRequest {
+                        tenant_id: tenant_id.clone(),
+                        deletion_id,
+                        request_id,
+                        request_digest,
+                        expected_resource_version,
+                        now_unix_ms: self.clock.now(),
+                    })
+                    .await
+                    .map_err(map_lifecycle_mutation_error),
+            )
+            .await?;
         let (deletion, replayed) = split_outcome(outcome);
+
+        // Only the first successful retry mutation advances the task attempt. A replay of the
+        // same retry request returns the current canonical task without incrementing it again.
+        if !replayed {
+            if let (Some(coordinator), Some(task_view)) = (&self.task_coordinator, &task) {
+                let task_id = TaskId::new(task_view.task_id.clone())
+                    .map_err(|error| invalid_request(format!("task_id: {error}")))?;
+                let current = coordinator
+                    .repository()
+                    .get(&tenant_id, &task_id)
+                    .await
+                    .map_err(map_central_error)?
+                    .ok_or_else(|| invalid_request("deletion operation task disappeared"))?;
+                let retried = coordinator
+                    .repository()
+                    .retry(
+                        &tenant_id,
+                        &task_id,
+                        current.resource_version,
+                        TaskActor::Principal(identity.principal().clone()),
+                        self.clock.now(),
+                    )
+                    .await
+                    .map_err(map_central_error)?;
+                task = Some(super::task::task_view(&retried.task));
+            }
+        }
+        let previous_task = task.clone();
+        let task = self
+            .operation_result(
+                &previous_task,
+                identity,
+                self.synchronize_deletion_task(task, &deletion, identity)
+                    .await,
+            )
+            .await?;
         Ok(DeletionMutationResponse {
             deletion: deletion_operation_view(&deletion),
-            replayed: replayed || task_replayed,
-            task: self.complete_operation_task(task, identity).await?,
+            request_replayed: replayed,
+            execution_reused: false,
+            task,
         })
     }
 
@@ -2774,7 +3527,7 @@ impl CatalogService {
         }
         let (task, task_replayed) = self
             .begin_operation_task(
-                TaskKind::CatalogLifecycle,
+                TaskIntent::ProjectDelete,
                 TaskScope::new(tenant_id.clone()),
                 request_id.clone(),
                 &task_request,
@@ -2783,50 +3536,89 @@ impl CatalogService {
                 Some(retention_hold_id.as_str()),
             )
             .await?;
-        self.link_operation_resource(
+        self.operation_result(
             &task,
-            TaskResourceKind::RetentionHold,
-            retention_hold_id.to_string(),
-            TaskResourceRole::Primary,
+            identity,
+            self.link_operation_resource(
+                &task,
+                TaskResourceKind::RetentionHold,
+                retention_hold_id.to_string(),
+                TaskResourceRole::Primary,
+            )
+            .await,
         )
         .await?;
-        self.link_operation_resource(
+        self.operation_result(
             &task,
-            TaskResourceKind::Deletion,
-            deletion_id.to_string(),
-            TaskResourceRole::Related,
+            identity,
+            self.link_operation_resource(
+                &task,
+                TaskResourceKind::Deletion,
+                deletion_id.to_string(),
+                TaskResourceRole::Related,
+            )
+            .await,
         )
         .await?;
-        let outcome = self
-            .repository
-            .create_retention_hold_idempotent(DomainCreateRetentionHoldRequest {
-                tenant_id: tenant_id.clone(),
-                deletion_id: deletion_id.clone(),
-                retention_hold_id,
-                reason,
-                expires_at_unix_ms,
-                request_id,
-                request_digest,
-                expected_resource_version: parse_lifecycle_resource_version(
+        let expected_resource_version = self
+            .operation_result(
+                &task,
+                identity,
+                parse_lifecycle_resource_version(
                     "expected_resource_version",
                     &request.expected_resource_version,
-                )?,
-                now_unix_ms: now,
-            })
-            .await
-            .map_err(map_lifecycle_mutation_error)?;
+                ),
+            )
+            .await?;
+        let outcome = self
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .create_retention_hold_idempotent(DomainCreateRetentionHoldRequest {
+                        tenant_id: tenant_id.clone(),
+                        deletion_id: deletion_id.clone(),
+                        retention_hold_id,
+                        reason,
+                        expires_at_unix_ms,
+                        request_id,
+                        request_digest,
+                        expected_resource_version,
+                        now_unix_ms: now,
+                    })
+                    .await
+                    .map_err(map_lifecycle_mutation_error),
+            )
+            .await?;
         let (retention_hold, replayed) = split_outcome(outcome);
         let deletion = self
-            .repository
-            .get_deletion_operation(&tenant_id, &deletion_id)
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("deletion operation"))?;
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .get_deletion_operation(&tenant_id, &deletion_id)
+                    .await
+                    .map_err(map_central_error)
+                    .and_then(|value| {
+                        value.ok_or_else(|| resource_not_found("deletion operation"))
+                    }),
+            )
+            .await?;
+        let previous_task = task.clone();
+        let task = self
+            .operation_result(
+                &previous_task,
+                identity,
+                self.complete_operation_task(task, identity).await,
+            )
+            .await?;
         Ok(CreateRetentionHoldResponse {
             deletion: deletion_operation_view(&deletion),
             retention_hold: retention_hold_view(&retention_hold),
-            replayed: replayed || task_replayed,
-            task: self.complete_operation_task(task, identity).await?,
+            request_replayed: (replayed || task_replayed)
+                && !task.as_ref().is_some_and(|value| value.execution_reused),
+            execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
+            task,
         })
     }
 
@@ -2845,7 +3637,7 @@ impl CatalogService {
         let request_id = parse_request_id(request.request_id)?;
         let (task, task_replayed) = self
             .begin_operation_task(
-                TaskKind::CatalogLifecycle,
+                TaskIntent::ProjectDelete,
                 TaskScope::new(tenant_id.clone()),
                 request_id.clone(),
                 &task_request,
@@ -2854,48 +3646,87 @@ impl CatalogService {
                 Some(retention_hold_id.as_str()),
             )
             .await?;
-        self.link_operation_resource(
+        self.operation_result(
             &task,
-            TaskResourceKind::RetentionHold,
-            retention_hold_id.to_string(),
-            TaskResourceRole::Primary,
+            identity,
+            self.link_operation_resource(
+                &task,
+                TaskResourceKind::RetentionHold,
+                retention_hold_id.to_string(),
+                TaskResourceRole::Primary,
+            )
+            .await,
         )
         .await?;
-        self.link_operation_resource(
+        self.operation_result(
             &task,
-            TaskResourceKind::Deletion,
-            deletion_id.to_string(),
-            TaskResourceRole::Related,
+            identity,
+            self.link_operation_resource(
+                &task,
+                TaskResourceKind::Deletion,
+                deletion_id.to_string(),
+                TaskResourceRole::Related,
+            )
+            .await,
         )
         .await?;
-        let outcome = self
-            .repository
-            .release_retention_hold_idempotent(DomainReleaseRetentionHoldRequest {
-                tenant_id: tenant_id.clone(),
-                deletion_id: deletion_id.clone(),
-                retention_hold_id,
-                request_id,
-                request_digest,
-                expected_resource_version: parse_lifecycle_resource_version(
+        let expected_resource_version = self
+            .operation_result(
+                &task,
+                identity,
+                parse_lifecycle_resource_version(
                     "expected_resource_version",
                     &request.expected_resource_version,
-                )?,
-                now_unix_ms: self.clock.now(),
-            })
-            .await
-            .map_err(map_lifecycle_mutation_error)?;
+                ),
+            )
+            .await?;
+        let outcome = self
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .release_retention_hold_idempotent(DomainReleaseRetentionHoldRequest {
+                        tenant_id: tenant_id.clone(),
+                        deletion_id: deletion_id.clone(),
+                        retention_hold_id,
+                        request_id,
+                        request_digest,
+                        expected_resource_version,
+                        now_unix_ms: self.clock.now(),
+                    })
+                    .await
+                    .map_err(map_lifecycle_mutation_error),
+            )
+            .await?;
         let (retention_hold, replayed) = split_outcome(outcome);
         let deletion = self
-            .repository
-            .get_deletion_operation(&tenant_id, &deletion_id)
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("deletion operation"))?;
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .get_deletion_operation(&tenant_id, &deletion_id)
+                    .await
+                    .map_err(map_central_error)
+                    .and_then(|value| {
+                        value.ok_or_else(|| resource_not_found("deletion operation"))
+                    }),
+            )
+            .await?;
+        let previous_task = task.clone();
+        let task = self
+            .operation_result(
+                &previous_task,
+                identity,
+                self.complete_operation_task(task, identity).await,
+            )
+            .await?;
         Ok(ReleaseRetentionHoldResponse {
             deletion: deletion_operation_view(&deletion),
             retention_hold: retention_hold_view(&retention_hold),
-            replayed: replayed || task_replayed,
-            task: self.complete_operation_task(task, identity).await?,
+            request_replayed: (replayed || task_replayed)
+                && !task.as_ref().is_some_and(|value| value.execution_reused),
+            execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
+            task,
         })
     }
 
@@ -2984,14 +3815,15 @@ impl CatalogService {
             s3_credential_id_for_request(&request_access_point_id, &request_id)?;
         let (task, task_replayed) = self
             .begin_operation_task(
-                TaskKind::S3Lifecycle,
+                TaskIntent::S3AccessPointCreate,
                 TaskScope {
                     tenant_id: tenant_id.clone(),
                     project_id: None,
                     artifact_id: None,
                     object_namespace_id: None,
                     commit_id: None,
-                    playground_id: None,
+                    workspace_id: None,
+
                     snapshot_id: Some(snapshot_id.clone()),
                     storage_volume_id: None,
                 },
@@ -3002,154 +3834,297 @@ impl CatalogService {
                 Some(request_access_point_id.as_str()),
             )
             .await?;
-        self.link_operation_resource(
+        self.operation_result(
             &task,
-            TaskResourceKind::S3AccessPoint,
-            request_access_point_id.to_string(),
-            TaskResourceRole::Primary,
+            identity,
+            self.link_operation_resource(
+                &task,
+                TaskResourceKind::S3AccessPoint,
+                request_access_point_id.to_string(),
+                TaskResourceRole::Primary,
+            )
+            .await,
         )
         .await?;
-        if let Some(existing_mutation) = self
-            .repository
-            .get_s3_mutation(&tenant_id, &request_id)
-            .await
-            .map_err(map_central_error)?
-        {
-            ensure_s3_mutation_identity(&existing_mutation, &mutation)?;
+        let existing_mutation = self
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .get_s3_mutation(&tenant_id, &request_id)
+                    .await
+                    .map_err(map_central_error),
+            )
+            .await?;
+        if let Some(existing_mutation) = existing_mutation {
+            self.operation_result(
+                &task,
+                identity,
+                ensure_s3_mutation_identity(&existing_mutation, &mutation),
+            )
+            .await?;
             let access_point = self
-                .repository
-                .get_s3_access_point(&tenant_id, &request_access_point_id)
-                .await
-                .map_err(map_central_error)?
-                .ok_or_else(internal_catalog_error)?;
-            self.ensure_s3_access_point_snapshot_delivery_ready(&access_point)
+                .operation_result(
+                    &task,
+                    identity,
+                    self.repository
+                        .get_s3_access_point(&tenant_id, &request_access_point_id)
+                        .await
+                        .map_err(map_central_error)
+                        .and_then(|value| value.ok_or_else(internal_catalog_error)),
+                )
                 .await?;
+            self.operation_result(
+                &task,
+                identity,
+                self.ensure_s3_access_point_snapshot_delivery_ready(&access_point)
+                    .await,
+            )
+            .await?;
             let credential = self
-                .repository
-                .list_s3_credentials(&request_access_point_id)
-                .await
-                .map_err(map_central_error)?
+                .operation_result(
+                    &task,
+                    identity,
+                    self.repository
+                        .list_s3_credentials(&request_access_point_id)
+                        .await
+                        .map_err(map_central_error),
+                )
+                .await?
                 .into_iter()
                 .find(|credential| credential.credential_id == request_credential_id)
-                .ok_or_else(internal_catalog_error)?;
-            let task = self.complete_operation_task(task, identity).await?;
+                .ok_or_else(internal_catalog_error);
+            let credential = self.operation_result(&task, identity, credential).await?;
+            let previous_task = task.clone();
+            let task = self
+                .operation_result(
+                    &previous_task,
+                    identity,
+                    self.complete_operation_task(task, identity).await,
+                )
+                .await?;
+            let access_point_view = self
+                .operation_result(
+                    &task,
+                    identity,
+                    self.s3_access_point_view(&access_point).await,
+                )
+                .await?;
             return Ok(CreateS3AccessPointResponse {
-                access_point: self.s3_access_point_view(&access_point).await?,
+                access_point: access_point_view,
                 access_key_id: credential.access_key_id,
                 secret_access_key: String::new(),
                 credential_expires_at_unix_ms: credential.expires_at_unix_ms.to_string(),
-                replayed: true,
+                request_replayed: !task.as_ref().is_some_and(|value| value.execution_reused),
+                execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
                 task,
             });
         }
         let snapshot = self
-            .repository
-            .get_snapshot(&tenant_id, &snapshot_id)
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("snapshot"))?;
-        require_active_for_mutation(&snapshot.lifecycle, "Snapshot")?;
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .get_snapshot(&tenant_id, &snapshot_id)
+                    .await
+                    .map_err(map_central_error)
+                    .and_then(|value| value.ok_or_else(|| resource_not_found("snapshot"))),
+            )
+            .await?;
+        self.operation_result(
+            &task,
+            identity,
+            require_active_for_mutation(&snapshot.lifecycle, "Snapshot"),
+        )
+        .await?;
         if snapshot.state != SnapshotState::Ready {
-            return Err(catalog_conflict(
+            let error = catalog_conflict(
                 "snapshot_not_ready",
                 "SNAPSHOT_NOT_READY",
                 "S3 access can only be enabled for a Ready Snapshot",
-            ));
+            );
+            self.fail_operation_task(&task, identity, &error).await;
+            return Err(error);
         }
         // Access Point creation must be fenced by the Snapshot's bound Delivery even when an
         // older Access Point record already exists for this Snapshot.  Otherwise a new request
         // could rotate/bootstrap credentials while the physical read view is unavailable.
-        self.ensure_snapshot_delivery_ready(&snapshot).await?;
+        self.operation_result(
+            &task,
+            identity,
+            self.ensure_snapshot_delivery_ready(&snapshot).await,
+        )
+        .await?;
         if let Some(existing) = self
-            .repository
-            .get_s3_access_point_by_snapshot(&tenant_id, &snapshot_id)
-            .await
-            .map_err(map_central_error)?
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .get_s3_access_point_by_snapshot(&tenant_id, &snapshot_id)
+                    .await
+                    .map_err(map_central_error),
+            )
+            .await?
         {
             if existing.bucket_name != bucket_name {
-                return Err(catalog_conflict(
+                let error = catalog_conflict(
                     "snapshot_s3_access_point_exists",
                     "SNAPSHOT_S3_ACCESS_POINT_EXISTS",
                     "Snapshot already has a different S3 bucket",
-                ));
+                );
+                self.fail_operation_task(&task, identity, &error).await;
+                return Err(error);
             }
             if existing.access_point_id != request_access_point_id {
-                return Err(catalog_conflict(
+                let error = catalog_conflict(
                     "snapshot_s3_access_point_exists",
                     "SNAPSHOT_S3_ACCESS_POINT_EXISTS",
                     "Snapshot already has an S3 Access Point; use the credential API to rotate access keys",
-                ));
+                );
+                self.fail_operation_task(&task, identity, &error).await;
+                return Err(error);
             }
             let existing_credential = self
-                .repository
-                .list_s3_credentials(&existing.access_point_id)
-                .await
-                .map_err(map_central_error)?
+                .operation_result(
+                    &task,
+                    identity,
+                    self.repository
+                        .list_s3_credentials(&existing.access_point_id)
+                        .await
+                        .map_err(map_central_error),
+                )
+                .await?
                 .into_iter()
                 .find(|credential| credential.credential_id == request_credential_id);
             let (credential, secret) = match existing_credential {
                 Some(credential) => (credential, String::new()),
                 None if existing.state == S3AccessPointState::Active => {
-                    self.build_s3_credential_record(
-                        &existing,
-                        None,
-                        &request_id,
-                        mutation.created_at_unix_ms,
+                    self.operation_result(
+                        &task,
+                        identity,
+                        self.build_s3_credential_record(
+                            &existing,
+                            None,
+                            &request_id,
+                            mutation.created_at_unix_ms,
+                        )
+                        .await,
                     )
                     .await?
                 }
-                None => return Err(internal_catalog_error()),
+                None if existing.state == S3AccessPointState::Deleted => {
+                    let error = catalog_conflict(
+                        "s3_access_point_deleted",
+                        "S3_ACCESS_POINT_DELETED",
+                        "deleted S3 Access Points cannot be enabled again",
+                    );
+                    self.fail_operation_task(&task, identity, &error).await;
+                    return Err(error);
+                }
+                None => {
+                    let error = internal_catalog_error();
+                    self.fail_operation_task(&task, identity, &error).await;
+                    return Err(error);
+                }
             };
             let outcome = self
-                .repository
-                .create_s3_access_point_idempotent(mutation, existing, credential)
-                .await
-                .map_err(map_s3_mutation_error)?;
+                .operation_result(
+                    &task,
+                    identity,
+                    self.repository
+                        .create_s3_access_point_idempotent(mutation, existing, credential)
+                        .await
+                        .map_err(map_s3_mutation_error),
+                )
+                .await?;
             let result = match outcome {
                 CatalogInsertOutcome::Inserted(result) | CatalogInsertOutcome::Existing(result) => {
                     result
                 }
             };
-            let task = self.complete_operation_task(task, identity).await?;
+            let previous_task = task.clone();
+            let task = self
+                .operation_result(
+                    &previous_task,
+                    identity,
+                    self.complete_operation_task(task, identity).await,
+                )
+                .await?;
+            let access_point_view = self
+                .operation_result(
+                    &task,
+                    identity,
+                    self.s3_access_point_view(&result.access_point).await,
+                )
+                .await?;
             return Ok(CreateS3AccessPointResponse {
-                access_point: self.s3_access_point_view(&result.access_point).await?,
+                access_point: access_point_view,
                 access_key_id: result.credential.access_key_id,
                 secret_access_key: secret,
                 credential_expires_at_unix_ms: result.credential.expires_at_unix_ms.to_string(),
-                replayed: true,
+                request_replayed: !task.as_ref().is_some_and(|value| value.execution_reused),
+                execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
                 task,
             });
         }
         let artifact = self
-            .repository
-            .get_artifact(&tenant_id, &snapshot.project_id, &snapshot.artifact_id)
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("artifact"))?;
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .get_artifact(&tenant_id, &snapshot.project_id, &snapshot.artifact_id)
+                    .await
+                    .map_err(map_central_error)
+                    .and_then(|value| value.ok_or_else(|| resource_not_found("artifact"))),
+            )
+            .await?;
         let commit = self
-            .load_published_commit(&artifact, CommitId::from_digest(snapshot.commit_id))
+            .operation_result(
+                &task,
+                identity,
+                self.load_published_commit(&artifact, CommitId::from_digest(snapshot.commit_id))
+                    .await,
+            )
             .await?;
         // An Access Point is a physical read view, so it must be bound to the Snapshot's one
         // Ready Delivery.  Never select an unrelated complete Volume for the same Commit.
-        let delivery = self.ensure_snapshot_delivery_ready(&snapshot).await?;
+        let delivery = self
+            .operation_result(
+                &task,
+                identity,
+                self.ensure_snapshot_delivery_ready(&snapshot).await,
+            )
+            .await?;
         let volume = self
-            .repository
-            .get_storage_volume(&tenant_id, &snapshot.storage_volume_id)
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(s3_snapshot_unavailable)?;
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .get_storage_volume(&tenant_id, &snapshot.storage_volume_id)
+                    .await
+                    .map_err(map_central_error)
+                    .and_then(|value| value.ok_or_else(s3_snapshot_unavailable)),
+            )
+            .await?;
         if volume.edge_cluster_id != snapshot.edge_cluster_id
             || !volume.lifecycle.is_active()
             || volume.state != StorageVolumeState::Ready
         {
-            return Err(s3_snapshot_unavailable());
+            let error = s3_snapshot_unavailable();
+            self.fail_operation_task(&task, identity, &error).await;
+            return Err(error);
         }
         let (_, _, _, _pool) = self
-            .resolve_s3_route_for_volume(
-                &tenant_id,
-                &commit,
-                &snapshot.storage_volume_id,
-                self.clock.now(),
+            .operation_result(
+                &task,
+                identity,
+                self.resolve_s3_route_for_volume(
+                    &tenant_id,
+                    &commit,
+                    &snapshot.storage_volume_id,
+                    self.clock.now(),
+                )
+                .await,
             )
             .await?;
         let now = mutation.created_at_unix_ms;
@@ -3170,24 +4145,50 @@ impl CatalogService {
             updated_at_unix_ms: now,
         };
         let (credential, secret) = self
-            .build_s3_credential_record(&record, None, &request_id, now)
+            .operation_result(
+                &task,
+                identity,
+                self.build_s3_credential_record(&record, None, &request_id, now)
+                    .await,
+            )
             .await?;
         let outcome = self
-            .repository
-            .create_s3_access_point_idempotent(mutation, record, credential)
-            .await
-            .map_err(map_s3_mutation_error)?;
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .create_s3_access_point_idempotent(mutation, record, credential)
+                    .await
+                    .map_err(map_s3_mutation_error),
+            )
+            .await?;
         let (result, replayed) = match outcome {
             CatalogInsertOutcome::Inserted(result) => (result, false),
             CatalogInsertOutcome::Existing(result) => (result, true),
         };
-        let task = self.complete_operation_task(task, identity).await?;
+        let previous_task = task.clone();
+        let task = self
+            .operation_result(
+                &previous_task,
+                identity,
+                self.complete_operation_task(task, identity).await,
+            )
+            .await?;
+        let access_point_view = self
+            .operation_result(
+                &task,
+                identity,
+                self.s3_access_point_view(&result.access_point).await,
+            )
+            .await?;
         Ok(CreateS3AccessPointResponse {
-            access_point: self.s3_access_point_view(&result.access_point).await?,
+            access_point: access_point_view,
             access_key_id: result.credential.access_key_id,
             secret_access_key: if replayed { String::new() } else { secret },
             credential_expires_at_unix_ms: result.credential.expires_at_unix_ms.to_string(),
-            replayed: replayed || task_replayed,
+            request_replayed: (replayed || task_replayed)
+                && !task.as_ref().is_some_and(|value| value.execution_reused),
+            execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
             task,
         })
     }
@@ -3210,6 +4211,117 @@ impl CatalogService {
             .await
     }
 
+    /// Tombstones an S3 Access Point while retaining its metadata for audit and deletion
+    /// queries. Associated credentials are revoked atomically by the repository.
+    pub async fn delete_s3_access_point(
+        &self,
+        identity: &AuthenticatedIdentity,
+        request: UpdateS3AccessPointRequest,
+    ) -> Result<UpdateS3AccessPointResponse, Error> {
+        let task_request = request.clone();
+        let tenant_id = parse_tenant(request.tenant_id.clone())?;
+        self.require_tenant(identity, Permission::S3AccessManage, &tenant_id)
+            .await?;
+        let request_id = RequestId::new(request.request_id.clone())
+            .map_err(|error| invalid_request(format!("request_id: {error}")))?;
+        let access_point_id = parse_s3_access_point_id(request.access_point_id)?;
+        let (task, task_replayed) = self
+            .begin_operation_task(
+                TaskIntent::S3AccessPointDelete,
+                TaskScope::new(tenant_id.clone()),
+                request_id.clone(),
+                &task_request,
+                identity,
+                Some("s3_access_point"),
+                Some(access_point_id.as_str()),
+            )
+            .await?;
+        self.operation_result(
+            &task,
+            identity,
+            self.link_operation_resource(
+                &task,
+                TaskResourceKind::S3AccessPoint,
+                access_point_id.to_string(),
+                TaskResourceRole::Primary,
+            )
+            .await,
+        )
+        .await?;
+        let mutation = self
+            .operation_result(
+                &task,
+                identity,
+                s3_mutation_record(
+                    &tenant_id,
+                    &request_id,
+                    S3MutationKind::AccessPointDelete,
+                    &serde_json::json!({
+                        "tenant_id": tenant_id.as_str(),
+                        "access_point_id": access_point_id.as_str(),
+                    }),
+                    self.clock.now(),
+                ),
+            )
+            .await?;
+        let outcome = self
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .delete_s3_access_point_idempotent(mutation, &access_point_id, self.clock.now())
+                    .await
+                    .map_err(map_s3_mutation_error),
+            )
+            .await?;
+        let (deleted, replayed) = match outcome {
+            CatalogInsertOutcome::Inserted(record) => (record, false),
+            CatalogInsertOutcome::Existing(record) => (record, true),
+        };
+        match self
+            .repository
+            .get_snapshot(&tenant_id, &deleted.snapshot_id)
+            .await
+        {
+            Ok(Some(snapshot)) => {
+                self.publish_access_point_s3_read_revocation(
+                    &deleted,
+                    snapshot.lifecycle.generation,
+                    "S3 Access Point deleted",
+                )
+                .await;
+            }
+            Ok(None) => tracing::error!(
+                access_point_id = %deleted.access_point_id,
+                snapshot_id = %deleted.snapshot_id,
+                "cannot publish S3 read revocation for a missing Snapshot"
+            ),
+            Err(error) => tracing::error!(
+                access_point_id = %deleted.access_point_id,
+                %error,
+                "cannot load Snapshot for S3 read revocation"
+            ),
+        }
+        let previous_task = task.clone();
+        let task = self
+            .operation_result(
+                &previous_task,
+                identity,
+                self.complete_operation_task(task, identity).await,
+            )
+            .await?;
+        let access_point_view = self
+            .operation_result(&task, identity, self.s3_access_point_view(&deleted).await)
+            .await?;
+        Ok(UpdateS3AccessPointResponse {
+            access_point: access_point_view,
+            request_replayed: (replayed || task_replayed)
+                && !task.as_ref().is_some_and(|value| value.execution_reused),
+            execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
+            task,
+        })
+    }
+
     async fn update_s3_access_point(
         &self,
         identity: &AuthenticatedIdentity,
@@ -3225,7 +4337,11 @@ impl CatalogService {
         let access_point_id = parse_s3_access_point_id(request.access_point_id)?;
         let (task, task_replayed) = self
             .begin_operation_task(
-                TaskKind::S3Lifecycle,
+                if state == S3AccessPointState::Active {
+                    TaskIntent::S3AccessPointEnable
+                } else {
+                    TaskIntent::S3AccessPointDisable
+                },
                 TaskScope::new(tenant_id.clone()),
                 request_id.clone(),
                 &task_request,
@@ -3234,55 +4350,99 @@ impl CatalogService {
                 Some(access_point_id.as_str()),
             )
             .await?;
-        self.link_operation_resource(
+        self.operation_result(
             &task,
-            TaskResourceKind::S3AccessPoint,
-            access_point_id.to_string(),
-            TaskResourceRole::Primary,
+            identity,
+            self.link_operation_resource(
+                &task,
+                TaskResourceKind::S3AccessPoint,
+                access_point_id.to_string(),
+                TaskResourceRole::Primary,
+            )
+            .await,
         )
         .await?;
         if state == S3AccessPointState::Active {
             let access_point = self
-                .repository
-                .get_s3_access_point(&tenant_id, &access_point_id)
-                .await
-                .map_err(map_central_error)?
-                .ok_or_else(|| resource_not_found("S3 access point"))?;
-            let snapshot = self
-                .repository
-                .get_snapshot(&tenant_id, &access_point.snapshot_id)
-                .await
-                .map_err(map_central_error)?
-                .ok_or_else(|| resource_not_found("snapshot"))?;
-            require_active_for_mutation(&snapshot.lifecycle, "Snapshot")?;
-            self.ensure_s3_access_point_snapshot_delivery_ready(&access_point)
+                .operation_result(
+                    &task,
+                    identity,
+                    self.repository
+                        .get_s3_access_point(&tenant_id, &access_point_id)
+                        .await
+                        .map_err(map_central_error)
+                        .and_then(|value| {
+                            value.ok_or_else(|| resource_not_found("S3 access point"))
+                        }),
+                )
                 .await?;
+            let snapshot = self
+                .operation_result(
+                    &task,
+                    identity,
+                    self.repository
+                        .get_snapshot(&tenant_id, &access_point.snapshot_id)
+                        .await
+                        .map_err(map_central_error)
+                        .and_then(|value| value.ok_or_else(|| resource_not_found("snapshot"))),
+                )
+                .await?;
+            self.operation_result(
+                &task,
+                identity,
+                require_active_for_mutation(&snapshot.lifecycle, "Snapshot"),
+            )
+            .await?;
+            self.operation_result(
+                &task,
+                identity,
+                self.ensure_s3_access_point_snapshot_delivery_ready(&access_point)
+                    .await,
+            )
+            .await?;
         }
         let operation = match state {
             S3AccessPointState::Active => S3MutationKind::AccessPointEnable,
             S3AccessPointState::Disabled => S3MutationKind::AccessPointDisable,
+            S3AccessPointState::Deleted => {
+                let error =
+                    invalid_request("Deleted is not a valid enable/disable Access Point state");
+                self.fail_operation_task(&task, identity, &error).await;
+                return Err(error);
+            }
         };
-        let mutation = s3_mutation_record(
-            &tenant_id,
-            &request_id,
-            operation,
-            &serde_json::json!({
-                "tenant_id": tenant_id.as_str(),
-                "access_point_id": access_point_id.as_str(),
-                "state": s3_access_point_state_name(state),
-            }),
-            self.clock.now(),
-        )?;
-        let outcome = self
-            .repository
-            .update_s3_access_point_state_idempotent(
-                mutation,
-                &access_point_id,
-                state,
-                self.clock.now(),
+        let mutation = self
+            .operation_result(
+                &task,
+                identity,
+                s3_mutation_record(
+                    &tenant_id,
+                    &request_id,
+                    operation,
+                    &serde_json::json!({
+                        "tenant_id": tenant_id.as_str(),
+                        "access_point_id": access_point_id.as_str(),
+                        "state": s3_access_point_state_name(state),
+                    }),
+                    self.clock.now(),
+                ),
             )
-            .await
-            .map_err(map_s3_mutation_error)?;
+            .await?;
+        let outcome = self
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .update_s3_access_point_state_idempotent(
+                        mutation,
+                        &access_point_id,
+                        state,
+                        self.clock.now(),
+                    )
+                    .await
+                    .map_err(map_s3_mutation_error),
+            )
+            .await?;
         let (updated, replayed) = match outcome {
             CatalogInsertOutcome::Inserted(updated) => (updated, false),
             CatalogInsertOutcome::Existing(updated) => (updated, true),
@@ -3311,10 +4471,22 @@ impl CatalogService {
                 "cannot load Snapshot for S3 read revocation"
             ),
         }
-        let task = self.complete_operation_task(task, identity).await?;
+        let previous_task = task.clone();
+        let task = self
+            .operation_result(
+                &previous_task,
+                identity,
+                self.complete_operation_task(task, identity).await,
+            )
+            .await?;
+        let access_point_view = self
+            .operation_result(&task, identity, self.s3_access_point_view(&updated).await)
+            .await?;
         Ok(UpdateS3AccessPointResponse {
-            access_point: self.s3_access_point_view(&updated).await?,
-            replayed: replayed || task_replayed,
+            access_point: access_point_view,
+            request_replayed: (replayed || task_replayed)
+                && !task.as_ref().is_some_and(|value| value.execution_reused),
+            execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
             task,
         })
     }
@@ -3466,7 +4638,7 @@ impl CatalogService {
         let credential_id = s3_credential_id_for_request(&access_point_id, &request_id)?;
         let (task, task_replayed) = self
             .begin_operation_task(
-                TaskKind::S3Lifecycle,
+                TaskIntent::S3CredentialCreate,
                 TaskScope::new(tenant_id.clone()),
                 request_id.clone(),
                 &task_request,
@@ -3475,96 +4647,186 @@ impl CatalogService {
                 Some(credential_id.as_str()),
             )
             .await?;
-        self.link_operation_resource(
+        self.operation_result(
             &task,
-            TaskResourceKind::S3AccessPoint,
-            access_point_id.to_string(),
-            TaskResourceRole::Related,
+            identity,
+            self.link_operation_resource(
+                &task,
+                TaskResourceKind::S3AccessPoint,
+                access_point_id.to_string(),
+                TaskResourceRole::Related,
+            )
+            .await,
         )
         .await?;
-        self.link_operation_resource(
+        self.operation_result(
             &task,
-            TaskResourceKind::S3Credential,
-            credential_id.to_string(),
-            TaskResourceRole::Primary,
+            identity,
+            self.link_operation_resource(
+                &task,
+                TaskResourceKind::S3Credential,
+                credential_id.to_string(),
+                TaskResourceRole::Primary,
+            )
+            .await,
         )
         .await?;
-        if let Some(existing_mutation) = self
-            .repository
-            .get_s3_mutation(&tenant_id, &request_id)
-            .await
-            .map_err(map_central_error)?
-        {
-            ensure_s3_mutation_identity(&existing_mutation, &mutation)?;
+        let existing_mutation = self
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .get_s3_mutation(&tenant_id, &request_id)
+                    .await
+                    .map_err(map_central_error),
+            )
+            .await?;
+        if let Some(existing_mutation) = existing_mutation {
+            self.operation_result(
+                &task,
+                identity,
+                ensure_s3_mutation_identity(&existing_mutation, &mutation),
+            )
+            .await?;
             let access_point = self
-                .repository
-                .get_s3_access_point(&tenant_id, &access_point_id)
-                .await
-                .map_err(map_central_error)?
-                .ok_or_else(internal_catalog_error)?;
-            self.ensure_s3_access_point_snapshot_delivery_ready(&access_point)
+                .operation_result(
+                    &task,
+                    identity,
+                    self.repository
+                        .get_s3_access_point(&tenant_id, &access_point_id)
+                        .await
+                        .map_err(map_central_error)
+                        .and_then(|value| value.ok_or_else(internal_catalog_error)),
+                )
                 .await?;
+            self.operation_result(
+                &task,
+                identity,
+                self.ensure_s3_access_point_snapshot_delivery_ready(&access_point)
+                    .await,
+            )
+            .await?;
             let credential = self
-                .repository
-                .list_s3_credentials(&access_point_id)
-                .await
-                .map_err(map_central_error)?
+                .operation_result(
+                    &task,
+                    identity,
+                    self.repository
+                        .list_s3_credentials(&access_point_id)
+                        .await
+                        .map_err(map_central_error),
+                )
+                .await?
                 .into_iter()
                 .find(|credential| credential.credential_id == credential_id)
-                .ok_or_else(internal_catalog_error)?;
-            let task = self.complete_operation_task(task, identity).await?;
+                .ok_or_else(internal_catalog_error);
+            let credential = self.operation_result(&task, identity, credential).await?;
+            let previous_task = task.clone();
+            let task = self
+                .operation_result(
+                    &previous_task,
+                    identity,
+                    self.complete_operation_task(task, identity).await,
+                )
+                .await?;
             return Ok(CreateS3CredentialResponse {
                 credential: s3_credential_view(&credential),
                 secret_access_key: String::new(),
-                replayed: true,
+                request_replayed: !task.as_ref().is_some_and(|value| value.execution_reused),
+                execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
                 task,
             });
         }
         let access_point = self
-            .repository
-            .get_s3_access_point(&tenant_id, &access_point_id)
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("S3 access point"))?;
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .get_s3_access_point(&tenant_id, &access_point_id)
+                    .await
+                    .map_err(map_central_error)
+                    .and_then(|value| value.ok_or_else(|| resource_not_found("S3 access point"))),
+            )
+            .await?;
         if access_point.state != S3AccessPointState::Active {
-            return Err(catalog_conflict(
+            let error = catalog_conflict(
                 "s3_access_point_disabled",
                 "S3_ACCESS_POINT_DISABLED",
                 "credentials cannot be created for a disabled Access Point",
-            ));
+            );
+            self.fail_operation_task(&task, identity, &error).await;
+            return Err(error);
         }
         let snapshot = self
-            .repository
-            .get_snapshot(&tenant_id, &access_point.snapshot_id)
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("snapshot"))?;
-        require_active_for_mutation(&snapshot.lifecycle, "Snapshot")?;
-        self.ensure_s3_access_point_snapshot_delivery_ready(&access_point)
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .get_snapshot(&tenant_id, &access_point.snapshot_id)
+                    .await
+                    .map_err(map_central_error)
+                    .and_then(|value| value.ok_or_else(|| resource_not_found("snapshot"))),
+            )
             .await?;
-        self.expire_s3_credentials(&access_point_id).await?;
+        self.operation_result(
+            &task,
+            identity,
+            require_active_for_mutation(&snapshot.lifecycle, "Snapshot"),
+        )
+        .await?;
+        self.operation_result(
+            &task,
+            identity,
+            self.ensure_s3_access_point_snapshot_delivery_ready(&access_point)
+                .await,
+        )
+        .await?;
+        self.operation_result(
+            &task,
+            identity,
+            self.expire_s3_credentials(&access_point_id).await,
+        )
+        .await?;
         let (credential, secret) = self
-            .build_s3_credential_record(
-                &access_point,
-                expires_at,
-                &request_id,
-                mutation.created_at_unix_ms,
+            .operation_result(
+                &task,
+                identity,
+                self.build_s3_credential_record(
+                    &access_point,
+                    expires_at,
+                    &request_id,
+                    mutation.created_at_unix_ms,
+                )
+                .await,
             )
             .await?;
         let outcome = self
-            .repository
-            .create_s3_credential_idempotent(mutation, credential)
-            .await
-            .map_err(map_s3_credential_mutation_error)?;
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .create_s3_credential_idempotent(mutation, credential)
+                    .await
+                    .map_err(map_s3_credential_mutation_error),
+            )
+            .await?;
         let (credential, replayed) = match outcome {
             CatalogInsertOutcome::Inserted(credential) => (credential, false),
             CatalogInsertOutcome::Existing(credential) => (credential, true),
         };
-        let task = self.complete_operation_task(task, identity).await?;
+        let previous_task = task.clone();
+        let task = self
+            .operation_result(
+                &previous_task,
+                identity,
+                self.complete_operation_task(task, identity).await,
+            )
+            .await?;
         Ok(CreateS3CredentialResponse {
             credential: s3_credential_view(&credential),
             secret_access_key: if replayed { String::new() } else { secret },
-            replayed: replayed || task_replayed,
+            request_replayed: (replayed || task_replayed)
+                && !task.as_ref().is_some_and(|value| value.execution_reused),
+            execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
             task,
         })
     }
@@ -4221,7 +5483,7 @@ impl CatalogService {
         let credential_id = parse_s3_credential_id(request.credential_id)?;
         let (task, _task_replayed) = self
             .begin_operation_task(
-                TaskKind::S3Lifecycle,
+                TaskIntent::S3CredentialRevoke,
                 TaskScope::new(tenant_id.clone()),
                 request_id.clone(),
                 &task_request,
@@ -4230,49 +5492,55 @@ impl CatalogService {
                 Some(credential_id.as_str()),
             )
             .await?;
-        self.link_operation_resource(
-            &task,
-            TaskResourceKind::S3AccessPoint,
-            access_point_id.to_string(),
-            TaskResourceRole::Related,
-        )
-        .await?;
-        self.link_operation_resource(
-            &task,
-            TaskResourceKind::S3Credential,
-            credential_id.to_string(),
-            TaskResourceRole::Primary,
-        )
-        .await?;
-        let mutation = s3_mutation_record(
-            &tenant_id,
-            &request_id,
-            S3MutationKind::CredentialRevoke,
-            &serde_json::json!({
-                "tenant_id": tenant_id.as_str(),
-                "access_point_id": access_point_id.as_str(),
-                "credential_id": credential_id.as_str(),
-            }),
-            self.clock.now(),
-        )?;
-        let outcome = self
-            .repository
-            .revoke_s3_credential_idempotent(mutation, &access_point_id, &credential_id)
+        let task_for_failure = task.clone();
+        let result = async {
+            self.link_operation_resource(
+                &task,
+                TaskResourceKind::S3AccessPoint,
+                access_point_id.to_string(),
+                TaskResourceRole::Related,
+            )
+            .await?;
+            self.link_operation_resource(
+                &task,
+                TaskResourceKind::S3Credential,
+                credential_id.to_string(),
+                TaskResourceRole::Primary,
+            )
+            .await?;
+            let mutation = s3_mutation_record(
+                &tenant_id,
+                &request_id,
+                S3MutationKind::CredentialRevoke,
+                &serde_json::json!({
+                    "tenant_id": tenant_id.as_str(),
+                    "access_point_id": access_point_id.as_str(),
+                    "credential_id": credential_id.as_str(),
+                }),
+                self.clock.now(),
+            )?;
+            let outcome = self
+                .repository
+                .revoke_s3_credential_idempotent(mutation, &access_point_id, &credential_id)
+                .await
+                .map_err(map_s3_mutation_error)?;
+            if matches!(outcome, CatalogInsertOutcome::Inserted(_)) {
+                self.expire_s3_credentials(&access_point_id).await?;
+            }
+            let items = self
+                .repository
+                .list_s3_credentials(&access_point_id)
+                .await
+                .map_err(map_central_error)?
+                .iter()
+                .map(s3_credential_view)
+                .collect();
+            let task = self.complete_operation_task(task, identity).await?;
+            Ok(QueryS3CredentialListResponse { items, task })
+        };
+        let result = result.await;
+        self.operation_result(&task_for_failure, identity, result)
             .await
-            .map_err(map_s3_mutation_error)?;
-        if matches!(outcome, CatalogInsertOutcome::Inserted(_)) {
-            self.expire_s3_credentials(&access_point_id).await?;
-        }
-        let items = self
-            .repository
-            .list_s3_credentials(&access_point_id)
-            .await
-            .map_err(map_central_error)?
-            .iter()
-            .map(s3_credential_view)
-            .collect();
-        let task = self.complete_operation_task(task, identity).await?;
-        Ok(QueryS3CredentialListResponse { items, task })
     }
 
     async fn build_s3_credential_record(
@@ -5042,42 +6310,56 @@ impl CatalogService {
             })
     }
 
-    async fn ensure_workspace_materialization(&self, playground: &PlaygroundRecord) {
-        if playground.state != PlaygroundState::Creating {
+    async fn ensure_workspace_materialization(&self, workspace: &WorkspaceRecord) {
+        if workspace.state != WorkspaceState::Creating {
             return;
         }
         let Some(coordinator) = &self.coordinator else {
             return;
         };
         if let Err(error) = coordinator
-            .ensure_workspace_materialization(playground)
+            .ensure_workspace_materialization(workspace)
             .await
         {
             tracing::warn!(
-                tenant_id = %playground.tenant_id,
-                project_id = %playground.project_id,
-                artifact_id = %playground.artifact_id,
-                playground_id = %playground.playground_id,
+                tenant_id = %workspace.tenant_id,
+                project_id = %workspace.project_id,
+                artifact_id = %workspace.artifact_id,
+                workspace_id = %workspace.workspace_id,
                 %error,
-                "immediate Playground materialization dispatch failed; recovery will retry"
+                "immediate Workspace materialization dispatch failed; recovery will retry"
             );
         }
     }
 
-    pub async fn start_playground_precommit(
+    pub fn start_workspace_precommit<'a>(
+        &'a self,
+        identity: &'a AuthenticatedIdentity,
+        request: StartPreCommitRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<StartPreCommitResponse, Error>> + Send + 'a>> {
+        // Pre-commit validation performs several repository reads and may immediately dispatch
+        // an Agent-backed Job. Keep its large state machine heap-backed on the HTTP worker stack,
+        // matching the protection used by Workspace creation.
+        Box::pin(async move {
+            self.start_workspace_precommit_inner(identity, request)
+                .await
+        })
+    }
+
+    async fn start_workspace_precommit_inner(
         &self,
         identity: &AuthenticatedIdentity,
         request: StartPreCommitRequest,
     ) -> Result<StartPreCommitResponse, Error> {
         let task_request = request.clone();
         let tenant_id = parse_tenant(request.tenant_id)?;
-        self.require_tenant(identity, Permission::PlaygroundCreate, &tenant_id)
+        self.require_tenant(identity, Permission::WorkspaceCreate, &tenant_id)
             .await?;
         self.require_tenant(identity, Permission::CreateAddJob, &tenant_id)
             .await?;
         let project_id = parse_project_id(request.project_id)?;
         let artifact_id = parse_artifact_id(request.artifact_id)?;
-        let playground_id = parse_playground_id(request.playground_id)?;
+        let workspace_id = parse_workspace_id(request.workspace_id)?;
         self.require_storage_availability_configured()?;
         let precommit_request_id = RequestId::new(request.precommit_request_id.clone())
             .map_err(|error| invalid_request(format!("precommit_request_id: {error}")))?;
@@ -5090,14 +6372,14 @@ impl CatalogService {
         let key = PreCommitKey::new(tenant_id.clone(), precommit_id.clone());
         let (mut task, _task_replayed) = self
             .begin_operation_task(
-                TaskKind::PrecommitCheck,
+                TaskIntent::CommitValidate,
                 TaskScope {
                     tenant_id: tenant_id.clone(),
                     project_id: Some(project_id.clone()),
                     artifact_id: Some(artifact_id.clone()),
                     object_namespace_id: Some(ObjectNamespaceId::from_artifact(&artifact_id)),
                     commit_id: None,
-                    playground_id: Some(playground_id.clone()),
+                    workspace_id: Some(workspace_id.clone()),
                     snapshot_id: None,
                     storage_volume_id: None,
                 },
@@ -5108,153 +6390,135 @@ impl CatalogService {
                 Some(precommit_id.as_str()),
             )
             .await?;
-        self.link_operation_resource(
-            &task,
-            TaskResourceKind::Precommit,
-            precommit_id.to_string(),
-            TaskResourceRole::Primary,
-        )
-        .await?;
-        let (precommits, coordinator) = self.precommit_execution()?;
-        let now = self.clock.now();
+        let task_for_failure = task.clone();
+        let result = async {
+            self.link_operation_resource(
+                &task,
+                TaskResourceKind::Precommit,
+                precommit_id.to_string(),
+                TaskResourceRole::Primary,
+            )
+            .await?;
+            let (precommits, coordinator) = self.precommit_execution()?;
+            let now = self.clock.now();
 
-        // The proposed ID is derived from the idempotency key. Resolve a persisted replay before
-        // consulting mutable Playground/Index state, which may already have advanced.
-        if let Some(existing) = precommits.get(&key).await.map_err(map_central_error)? {
+            // The proposed ID is derived from the idempotency key. Resolve a persisted replay before
+            // consulting mutable Workspace/Index state, which may already have advanced.
+            if let Some(existing) = precommits.get(&key).await.map_err(map_central_error)? {
+                let outcome = precommits
+                    .start(DomainPreCommitStartRequest {
+                        tenant_id,
+                        project_id,
+                        artifact_id,
+                        workspace_id,
+                        precommit_id,
+                        precommit_request_id,
+                        source_index_version,
+                        data_layout,
+                        frozen_head_commit_id: existing.frozen_head_commit_id,
+                        job_id: existing.job_id.clone(),
+                        created_at_unix_ms: now,
+                    })
+                    .await
+                    .map_err(precommit_mutation_error)?;
+                if outcome.precommit.state == PreCommitState::Running {
+                    Box::pin(coordinator.ensure_precommit_job(&outcome.precommit))
+                        .await
+                        .map_err(map_central_error)?;
+                }
+                let workspace = self
+                    .load_precommit_workspace(
+                        identity,
+                        &outcome.precommit,
+                        Permission::WorkspaceRead,
+                    )
+                    .await?;
+                task = self
+                    .synchronize_precommit_task(&outcome.precommit, task, identity)
+                    .await?;
+                return Ok(StartPreCommitResponse {
+                    precommit: precommit_view(&outcome.precommit),
+                    workspace: self.workspace_view(&workspace).await?,
+                    request_replayed: outcome.replayed
+                        && !task.as_ref().is_some_and(|value| value.execution_reused),
+                    execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
+                    task,
+                });
+            }
+
+            let workspace = self
+                .load_workspace(&tenant_id, &project_id, &artifact_id, &workspace_id)
+                .await?;
+            self.require_live_storage_ready(
+                &workspace.tenant_id,
+                &workspace.storage_volume_id,
+                "Pre-commit start",
+            )
+            .await?;
+            self.validate_precommit_source(&workspace, &source_index_version)
+                .await?;
+            self.repository
+                .get_artifact(&tenant_id, &project_id, &artifact_id)
+                .await
+                .map_err(map_central_error)?
+                .ok_or_else(|| resource_not_found("artifact"))?;
+            let job_id = deterministic_precommit_job_id(&tenant_id, &precommit_id, 1)?;
             let outcome = precommits
                 .start(DomainPreCommitStartRequest {
                     tenant_id,
                     project_id,
                     artifact_id,
-                    playground_id,
+                    workspace_id,
                     precommit_id,
                     precommit_request_id,
                     source_index_version,
                     data_layout,
-                    frozen_head_commit_id: existing.frozen_head_commit_id,
-                    job_id: existing.job_id.clone(),
+                    // A Workspace is an independent line of development. Freeze its own Head as
+                    // the Commit parent; the Artifact Head is only the convenient current pointer.
+                    frozen_head_commit_id: workspace.head_commit_id.map(Into::into),
+                    job_id,
                     created_at_unix_ms: now,
                 })
                 .await
                 .map_err(precommit_mutation_error)?;
-            if outcome.precommit.state == PreCommitState::Running {
-                coordinator
-                    .ensure_precommit_job(&outcome.precommit)
-                    .await
-                    .map_err(map_central_error)?;
-            }
-            let playground = self
-                .load_precommit_playground(identity, &outcome.precommit, Permission::PlaygroundRead)
+            Box::pin(coordinator.ensure_precommit_job(&outcome.precommit))
+                .await
+                .map_err(map_central_error)?;
+            // The Add scan is carried by commit.validate.scan_changes, so it remains on the root
+            // validation task instead of creating a synthetic commit.create child.
+            let add_task = task.clone();
+            self.link_operation_resource(
+                &add_task,
+                TaskResourceKind::ControlJob,
+                outcome.precommit.job_id.to_string(),
+                TaskResourceRole::Primary,
+            )
+            .await?;
+            let _ = add_task;
+            task = self
+                .synchronize_precommit_task(&outcome.precommit, task, identity)
                 .await?;
-            return Ok(StartPreCommitResponse {
+            Ok(StartPreCommitResponse {
                 precommit: precommit_view(&outcome.precommit),
-                playground: self.playground_view(&playground).await?,
-                replayed: outcome.replayed,
+                workspace: self.workspace_view(&workspace).await?,
+                request_replayed: outcome.replayed
+                    && !task.as_ref().is_some_and(|value| value.execution_reused),
+                execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
                 task,
-            });
-        }
-
-        let playground = self
-            .load_playground(&tenant_id, &project_id, &artifact_id, &playground_id)
-            .await?;
-        self.require_live_storage_ready(
-            &playground.tenant_id,
-            &playground.storage_volume_id,
-            "Pre-commit start",
-        )
-        .await?;
-        self.validate_precommit_source(&playground, &source_index_version)
-            .await?;
-        self.repository
-            .get_artifact(&tenant_id, &project_id, &artifact_id)
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("artifact"))?;
-        let job_id = deterministic_precommit_job_id(&tenant_id, &precommit_id, 1)?;
-        let outcome = precommits
-            .start(DomainPreCommitStartRequest {
-                tenant_id,
-                project_id,
-                artifact_id,
-                playground_id,
-                precommit_id,
-                precommit_request_id,
-                source_index_version,
-                data_layout,
-                // A Playground is an independent line of development. Freeze its own Head as
-                // the Commit parent; the Artifact Head is only the convenient current pointer.
-                frozen_head_commit_id: playground.head_commit_id.map(Into::into),
-                job_id,
-                created_at_unix_ms: now,
             })
+        };
+        let result = result.await;
+        self.operation_result(&task_for_failure, identity, result)
             .await
-            .map_err(precommit_mutation_error)?;
-        coordinator
-            .ensure_precommit_job(&outcome.precommit)
-            .await
-            .map_err(map_central_error)?;
-        let add_task = self
-            .begin_child_operation_task(
-                &task,
-                TaskKind::AddScan,
-                TaskScope {
-                    tenant_id: outcome.precommit.tenant_id.clone(),
-                    project_id: Some(outcome.precommit.project_id.clone()),
-                    artifact_id: Some(outcome.precommit.artifact_id.clone()),
-                    object_namespace_id: Some(ObjectNamespaceId::from_artifact(
-                        &outcome.precommit.artifact_id,
-                    )),
-                    commit_id: None,
-                    playground_id: Some(outcome.precommit.playground_id.clone()),
-                    snapshot_id: None,
-                    storage_volume_id: Some(playground.storage_volume_id.clone()),
-                },
-                RequestId::new(format!("{}-add", outcome.precommit.precommit_request_id))
-                    .map_err(|error| invalid_request(format!("task request_id: {error}")))?,
-                &task_request,
-                identity,
-                Some("control_job"),
-                Some(outcome.precommit.job_id.as_str()),
-            )
-            .await?;
-        self.link_operation_resource(
-            &add_task,
-            TaskResourceKind::ControlJob,
-            outcome.precommit.job_id.to_string(),
-            TaskResourceRole::Primary,
-        )
-        .await?;
-        let _ = self
-            .transition_operation_task(
-                add_task,
-                TaskState::Running,
-                identity,
-                Some("add scan scheduled".to_owned()),
-            )
-            .await?;
-        task = self
-            .transition_operation_task(
-                task,
-                TaskState::Running,
-                identity,
-                Some("pre-commit scan scheduled".to_owned()),
-            )
-            .await?;
-        Ok(StartPreCommitResponse {
-            precommit: precommit_view(&outcome.precommit),
-            playground: self.playground_view(&playground).await?,
-            replayed: outcome.replayed,
-            task,
-        })
     }
 
-    pub async fn query_playground_precommit(
+    pub async fn query_workspace_precommit(
         &self,
         identity: &AuthenticatedIdentity,
         request: QueryPreCommitRequest,
     ) -> Result<QueryPreCommitResponse, Error> {
         let tenant_id = parse_tenant(request.tenant_id)?;
-        self.require_tenant(identity, Permission::PlaygroundRead, &tenant_id)
+        self.require_tenant(identity, Permission::WorkspaceRead, &tenant_id)
             .await?;
         let precommit_id = PreCommitId::new(request.precommit_id)
             .map_err(|error| invalid_request(format!("precommit_id: {error}")))?;
@@ -5264,7 +6528,7 @@ impl CatalogService {
             .await
             .map_err(map_central_error)?
             .ok_or_else(|| resource_not_found("precommit"))?;
-        self.load_precommit_playground(identity, &stored, Permission::PlaygroundRead)
+        self.load_precommit_workspace(identity, &stored, Permission::WorkspaceRead)
             .await?;
         let synchronized = match &self.coordinator {
             Some(coordinator) => coordinator
@@ -5273,19 +6537,35 @@ impl CatalogService {
                 .map_err(map_central_error)?,
             None => stored,
         };
+        let _ = self
+            .synchronize_precommit_task(&synchronized, None, identity)
+            .await?;
         Ok(QueryPreCommitResponse {
             precommit: precommit_view(&synchronized),
         })
     }
 
-    pub async fn restart_playground_precommit(
+    pub fn restart_workspace_precommit<'a>(
+        &'a self,
+        identity: &'a AuthenticatedIdentity,
+        request: RestartPreCommitRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<RestartPreCommitResponse, Error>> + Send + 'a>> {
+        // Restart follows the same repository and Job dispatch chain as initial validation.
+        // Keep the request future heap-backed so retries cannot exhaust the HTTP worker stack.
+        Box::pin(async move {
+            self.restart_workspace_precommit_inner(identity, request)
+                .await
+        })
+    }
+
+    async fn restart_workspace_precommit_inner(
         &self,
         identity: &AuthenticatedIdentity,
         request: RestartPreCommitRequest,
     ) -> Result<RestartPreCommitResponse, Error> {
         let task_request = request.clone();
         let tenant_id = parse_tenant(request.tenant_id)?;
-        self.require_tenant(identity, Permission::PlaygroundCreate, &tenant_id)
+        self.require_tenant(identity, Permission::WorkspaceCreate, &tenant_id)
             .await?;
         self.require_tenant(identity, Permission::CreateAddJob, &tenant_id)
             .await?;
@@ -5304,7 +6584,7 @@ impl CatalogService {
             .ok_or_else(|| resource_not_found("precommit"))?;
         let (task, task_replayed) = self
             .begin_operation_task(
-                TaskKind::PrecommitCheck,
+                TaskIntent::CommitValidate,
                 TaskScope {
                     tenant_id: tenant_id.clone(),
                     project_id: Some(stored_for_task.project_id.clone()),
@@ -5313,8 +6593,10 @@ impl CatalogService {
                         &stored_for_task.artifact_id,
                     )),
                     commit_id: None,
-                    playground_id: Some(stored_for_task.playground_id.clone()),
+                    workspace_id: Some(stored_for_task.workspace_id.clone()),
                     snapshot_id: None,
+                    // Pre-commit records are scoped to a Workspace; the current StorageVolume
+                    // is resolved from that Workspace by the execution coordinator.
                     storage_volume_id: None,
                 },
                 restart_request_id.clone(),
@@ -5324,138 +6606,112 @@ impl CatalogService {
                 Some(precommit_id.as_str()),
             )
             .await?;
-        self.link_operation_resource(
-            &task,
-            TaskResourceKind::Precommit,
-            precommit_id.to_string(),
-            TaskResourceRole::Primary,
-        )
-        .await?;
-        if let Some(replayed) = precommits
-            .find_restart_result(&tenant_id, &restart_request_id)
-            .await
-            .map_err(map_central_error)?
-        {
-            if replayed.precommit_id != precommit_id
-                || !same_index_version(&replayed.source_index_version, &source_index_version)
-            {
-                return Err(precommit_conflict(
-                    "restart_request_id is already bound to another request",
-                ));
-            }
-            let playground = self
-                .load_precommit_playground(identity, &replayed, Permission::PlaygroundRead)
-                .await?;
-            let task = match replayed.state {
-                PreCommitState::Running => {
-                    self.transition_operation_task(
-                        task,
-                        TaskState::Running,
-                        identity,
-                        Some("Pre-commit restart scheduled".to_owned()),
-                    )
-                    .await?
-                }
-                PreCommitState::Ready | PreCommitState::Committed => {
-                    self.complete_operation_task(task, identity).await?
-                }
-                PreCommitState::Abnormal => {
-                    self.transition_operation_task(
-                        task,
-                        TaskState::Failed,
-                        identity,
-                        Some("Pre-commit restart failed".to_owned()),
-                    )
-                    .await?
-                }
-                PreCommitState::Cancelled => {
-                    self.transition_operation_task(
-                        task,
-                        TaskState::Cancelled,
-                        identity,
-                        Some("Pre-commit restart cancelled".to_owned()),
-                    )
-                    .await?
-                }
-            };
-            return Ok(RestartPreCommitResponse {
-                precommit: precommit_view(&replayed),
-                playground: self.playground_view(&playground).await?,
-                replayed: true,
-                task,
-            });
-        }
-        let stored = precommits
-            .get(&key)
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("precommit"))?;
-        let playground = self
-            .load_precommit_playground(identity, &stored, Permission::PlaygroundCreate)
+        let task_for_failure = task.clone();
+        let result = async {
+            self.link_operation_resource(
+                &task,
+                TaskResourceKind::Precommit,
+                precommit_id.to_string(),
+                TaskResourceRole::Primary,
+            )
             .await?;
-        self.require_live_storage_ready(
-            &playground.tenant_id,
-            &playground.storage_volume_id,
-            "Pre-commit restart",
-        )
-        .await?;
-        if matches!(
-            stored.state,
-            PreCommitState::Abnormal | PreCommitState::Cancelled
-        ) {
-            self.validate_precommit_source(&playground, &source_index_version)
-                .await?;
-        }
-        self.repository
-            .get_artifact(&stored.tenant_id, &stored.project_id, &stored.artifact_id)
-            .await
-            .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("artifact"))?;
-        let next_attempt = stored
-            .attempt
-            .checked_add(1)
-            .ok_or_else(|| precommit_conflict("Pre-commit attempt is exhausted"))?;
-        let restart = DomainPreCommitRestartRequest {
-            key,
-            restart_request_id,
-            source_index_version,
-            frozen_head_commit_id: playground.head_commit_id.map(Into::into),
-            job_id: deterministic_precommit_job_id(&tenant_id, &precommit_id, next_attempt)?,
-            restarted_at_unix_ms: self.clock.now(),
-        };
-        let outcome = precommits
-            .restart(restart)
-            .await
-            .map_err(precommit_mutation_error)?;
-        if outcome.precommit.state == PreCommitState::Running {
-            coordinator
-                .ensure_precommit_job(&outcome.precommit)
+            if let Some(replayed) = precommits
+                .find_restart_result(&tenant_id, &restart_request_id)
                 .await
-                .map_err(map_central_error)?;
-        }
-        Ok(RestartPreCommitResponse {
-            precommit: precommit_view(&outcome.precommit),
-            playground: self.playground_view(&playground).await?,
-            replayed: outcome.replayed || task_replayed,
-            task: self
-                .transition_operation_task(
+                .map_err(map_central_error)?
+            {
+                if replayed.precommit_id != precommit_id
+                    || !same_index_version(&replayed.source_index_version, &source_index_version)
+                {
+                    return Err(precommit_conflict(
+                        "restart_request_id is already bound to another request",
+                    ));
+                }
+                let workspace = self
+                    .load_precommit_workspace(identity, &replayed, Permission::WorkspaceRead)
+                    .await?;
+                let task = self
+                    .synchronize_precommit_task(&replayed, task, identity)
+                    .await?;
+                return Ok(RestartPreCommitResponse {
+                    precommit: precommit_view(&replayed),
+                    workspace: self.workspace_view(&workspace).await?,
+                    request_replayed: !task.as_ref().is_some_and(|value| value.execution_reused),
+                    execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
                     task,
-                    TaskState::Running,
-                    identity,
-                    Some("Pre-commit restart scheduled".to_owned()),
-                )
-                .await?,
-        })
+                });
+            }
+            let stored = precommits
+                .get(&key)
+                .await
+                .map_err(map_central_error)?
+                .ok_or_else(|| resource_not_found("precommit"))?;
+            let workspace = self
+                .load_precommit_workspace(identity, &stored, Permission::WorkspaceCreate)
+                .await?;
+            self.require_live_storage_ready(
+                &workspace.tenant_id,
+                &workspace.storage_volume_id,
+                "Pre-commit restart",
+            )
+            .await?;
+            if matches!(
+                stored.state,
+                PreCommitState::Abnormal | PreCommitState::Cancelled
+            ) {
+                self.validate_precommit_source(&workspace, &source_index_version)
+                    .await?;
+            }
+            self.repository
+                .get_artifact(&stored.tenant_id, &stored.project_id, &stored.artifact_id)
+                .await
+                .map_err(map_central_error)?
+                .ok_or_else(|| resource_not_found("artifact"))?;
+            let next_attempt = stored
+                .attempt
+                .checked_add(1)
+                .ok_or_else(|| precommit_conflict("Pre-commit attempt is exhausted"))?;
+            let restart = DomainPreCommitRestartRequest {
+                key,
+                restart_request_id,
+                source_index_version,
+                frozen_head_commit_id: workspace.head_commit_id.map(Into::into),
+                job_id: deterministic_precommit_job_id(&tenant_id, &precommit_id, next_attempt)?,
+                restarted_at_unix_ms: self.clock.now(),
+            };
+            let outcome = precommits
+                .restart(restart)
+                .await
+                .map_err(precommit_mutation_error)?;
+            if outcome.precommit.state == PreCommitState::Running {
+                Box::pin(coordinator.ensure_precommit_job(&outcome.precommit))
+                    .await
+                    .map_err(map_central_error)?;
+            }
+            let task = self
+                .synchronize_precommit_task(&outcome.precommit, task, identity)
+                .await?;
+            Ok(RestartPreCommitResponse {
+                precommit: precommit_view(&outcome.precommit),
+                workspace: self.workspace_view(&workspace).await?,
+                request_replayed: outcome.replayed || task_replayed,
+                execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
+                task,
+            })
+        };
+        let result = result.await;
+        self.operation_result(&task_for_failure, identity, result)
+            .await
     }
 
-    pub async fn cancel_playground_precommit(
+    pub async fn cancel_workspace_precommit(
         &self,
         identity: &AuthenticatedIdentity,
         request: CancelPreCommitRequest,
     ) -> Result<CancelPreCommitResponse, Error> {
         let task_request = request.clone();
         let tenant_id = parse_tenant(request.tenant_id)?;
-        self.require_tenant(identity, Permission::PlaygroundCreate, &tenant_id)
+        self.require_tenant(identity, Permission::WorkspaceCreate, &tenant_id)
             .await?;
         let precommit_id = PreCommitId::new(request.precommit_id)
             .map_err(|error| invalid_request(format!("precommit_id: {error}")))?;
@@ -5468,12 +6724,12 @@ impl CatalogService {
             .await
             .map_err(map_central_error)?
             .ok_or_else(|| resource_not_found("precommit"))?;
-        let playground = self
-            .load_precommit_playground(identity, &stored, Permission::PlaygroundCreate)
+        let workspace = self
+            .load_precommit_workspace(identity, &stored, Permission::WorkspaceCreate)
             .await?;
         let (task, task_replayed) = self
             .begin_operation_task(
-                TaskKind::PrecommitCheck,
+                TaskIntent::CommitValidate,
                 TaskScope {
                     tenant_id: tenant_id.clone(),
                     project_id: Some(stored.project_id.clone()),
@@ -5482,9 +6738,10 @@ impl CatalogService {
                         &stored.artifact_id,
                     )),
                     commit_id: None,
-                    playground_id: Some(stored.playground_id.clone()),
+                    workspace_id: Some(workspace.workspace_id.clone()),
+
                     snapshot_id: None,
-                    storage_volume_id: Some(playground.storage_volume_id.clone()),
+                    storage_volume_id: Some(workspace.storage_volume_id.clone()),
                 },
                 cancel_request_id.clone(),
                 &task_request,
@@ -5493,110 +6750,267 @@ impl CatalogService {
                 Some(precommit_id.as_str()),
             )
             .await?;
-        self.link_operation_resource(
-            &task,
-            TaskResourceKind::Precommit,
-            precommit_id.to_string(),
-            TaskResourceRole::Primary,
-        )
-        .await?;
-        let outcome = precommits
-            .cancel(DomainPreCommitCancelRequest {
-                key,
-                cancel_request_id,
-                cancelled_at_unix_ms: self.clock.now(),
+        let task_for_failure = task.clone();
+        let result = async {
+            self.link_operation_resource(
+                &task,
+                TaskResourceKind::Precommit,
+                precommit_id.to_string(),
+                TaskResourceRole::Primary,
+            )
+            .await?;
+            let outcome = precommits
+                .cancel(DomainPreCommitCancelRequest {
+                    key,
+                    cancel_request_id,
+                    cancelled_at_unix_ms: self.clock.now(),
+                })
+                .await
+                .map_err(precommit_mutation_error)?;
+            let task = self
+                .synchronize_precommit_task(&outcome.precommit, task, identity)
+                .await?;
+            Ok(CancelPreCommitResponse {
+                precommit: precommit_view(&outcome.precommit),
+                workspace: self.workspace_view(&workspace).await?,
+                request_replayed: outcome.replayed || task_replayed,
+                execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
+                task,
             })
+        };
+        let result = result.await;
+        self.operation_result(&task_for_failure, identity, result)
             .await
-            .map_err(precommit_mutation_error)?;
-        Ok(CancelPreCommitResponse {
-            precommit: precommit_view(&outcome.precommit),
-            playground: self.playground_view(&playground).await?,
-            replayed: outcome.replayed || task_replayed,
-            task: self.complete_operation_task(task, identity).await?,
-        })
     }
 
-    pub async fn commit_playground(
+    pub async fn commit_workspace(
         &self,
         identity: &AuthenticatedIdentity,
-        request: CommitPlaygroundRequest,
-    ) -> Result<CommitPlaygroundResponse, Error> {
+        request: CommitWorkspaceRequest,
+    ) -> Result<CommitWorkspaceResponse, Error> {
         let task_request = request.clone();
         let tenant_id = parse_tenant(request.tenant_id.clone())?;
         let project_id = parse_project_id(request.project_id.clone())?;
         let artifact_id = parse_artifact_id(request.artifact_id.clone())?;
-        let playground_id = parse_playground_id(request.playground_id.clone())?;
+        let workspace_id = parse_workspace_id(request.workspace_id.clone())?;
         let precommit_id = PreCommitId::new(request.precommit_id.clone())
             .map_err(|error| invalid_request(format!("precommit_id: {error}")))?;
         let commit_request_id = RequestId::new(request.commit_request_id.clone())
             .map_err(|error| invalid_request(format!("commit_request_id: {error}")))?;
-        self.require_tenant(identity, Permission::PlaygroundCreate, &tenant_id)
+        let expected_index_version =
+            parse_index_version(request.expected_candidate_index_version.clone())?;
+        self.require_tenant(identity, Permission::WorkspaceCreate, &tenant_id)
             .await?;
-        let (task, _task_replayed) = self
+        let precommit = self
+            .precommit_repository()?
+            .get(&PreCommitKey::new(tenant_id.clone(), precommit_id.clone()))
+            .await
+            .map_err(map_central_error)?
+            .ok_or_else(|| resource_not_found("precommit"))?;
+        let (task, task_replayed) = self
             .begin_operation_task(
-                TaskKind::CommitCreate,
+                TaskIntent::CommitCreate,
                 TaskScope {
                     tenant_id: tenant_id.clone(),
                     project_id: Some(project_id),
                     artifact_id: Some(artifact_id),
                     object_namespace_id: None,
                     commit_id: None,
-                    playground_id: Some(playground_id),
+                    workspace_id: Some(workspace_id.clone()),
                     snapshot_id: None,
                     storage_volume_id: None,
                 },
                 commit_request_id,
                 &task_request,
                 identity,
-                Some("commit"),
-                Some(precommit_id.as_str()),
+                // The Commit does not have an ID until the domain transaction succeeds. The
+                // Workspace is therefore the stable primary target; the PreCommit is linked
+                // below as the causal input rather than being misidentified as a Commit.
+                None,
+                None,
             )
             .await?;
-        self.link_operation_resource(
-            &task,
-            TaskResourceKind::Precommit,
-            precommit_id.to_string(),
-            TaskResourceRole::Related,
-        )
-        .await?;
-        let service = self.workspace_commits.as_ref().ok_or_else(|| {
-            application_error(
-                ErrorCategory::Unavailable,
-                "workspace_commit_unavailable",
-                "WORKSPACE_COMMIT_UNAVAILABLE",
-                "Workspace Commit authority is unavailable",
-                true,
+        let task_for_failure = task.clone();
+        let result = async {
+            self.link_operation_resource(
+                &task,
+                TaskResourceKind::Precommit,
+                precommit_id.to_string(),
+                TaskResourceRole::Related,
             )
-        })?;
-        let result = service.commit_playground(identity, request).await?;
-        let task = self.complete_operation_task(task, identity).await?;
-        Ok(CommitPlaygroundResponse {
-            commit: CommitNodeView {
-                commit_id: result.commit.commit_id.to_string(),
-                parent_commit_id: result.commit.parent_commit_id.map(|id| id.to_string()),
-                message: result.commit.message,
-                description: result.commit.description,
-                tag_names: result.commit.tag_names,
-                created_at_unix_ms: result.commit.created_at_unix_ms.to_string(),
-                data_layout: match result.commit.data_layout {
-                    CommitDataLayout::FastCdc => crate::dto::DataLayout::FastCdc,
-                    CommitDataLayout::WholeFile => crate::dto::DataLayout::WholeFile,
+            .await?;
+            // A completed validation is an explicit causal input to Commit creation. Reuse only when
+            // the candidate version is exactly the one requested; otherwise Commit creation performs
+            // its own scan stage and remains a single root task.
+            if matches!(
+                precommit.state,
+                PreCommitState::Ready | PreCommitState::Committed
+            ) && precommit.blockers.is_empty()
+                && precommit
+                    .candidate_index_version
+                    .as_ref()
+                    .is_some_and(|candidate| same_index_version(candidate, &expected_index_version))
+            {
+                if let Some(coordinator) = &self.task_coordinator {
+                    if let Some(validation_task) = coordinator
+                        .repository()
+                        .get_by_request_id(&tenant_id, &precommit.precommit_request_id)
+                        .await
+                        .map_err(map_central_error)?
+                        .filter(|candidate| {
+                            candidate.intent_kind == TaskIntent::CommitValidate
+                                && candidate.state == TaskState::Succeeded
+                        })
+                    {
+                        let create_task_id = task
+                            .as_ref()
+                            .and_then(|view| TaskId::new(view.task_id.clone()).ok());
+                        if let Some(create_task_id) = create_task_id {
+                            coordinator
+                                .repository()
+                                .add_relation(crate::TaskRelationRecord {
+                                    tenant_id: tenant_id.clone(),
+                                    relation: TaskRelation {
+                                        task_id: create_task_id.clone(),
+                                        related_task_id: validation_task.task_id.clone(),
+                                        relation: TaskRelationKind::CausedBy,
+                                    },
+                                })
+                                .await
+                                .map_err(map_central_error)?;
+                            // The reused validation result satisfies the scan stage, but the
+                            // commit.create DAG still requires its own validate and workspace-freeze
+                            // fences to be observed before that stage can be adopted.
+                            for stage_key in ["validate", "freeze_workspace"] {
+                                let current = coordinator
+                                    .repository()
+                                    .stages(&tenant_id, &create_task_id)
+                                    .await
+                                    .map_err(map_central_error)?
+                                    .into_iter()
+                                    .find(|stage| stage.stage_key == stage_key);
+                                if let Some(current) = current {
+                                    if !current.state.is_success() {
+                                        if current.state == StageState::Pending {
+                                            coordinator
+                                                .transition_stage(
+                                                    &create_task_id,
+                                                    &tenant_id,
+                                                    stage_key,
+                                                    StageState::Ready,
+                                                    None,
+                                                )
+                                                .await
+                                                .map_err(map_central_error)?;
+                                        }
+                                        let current = coordinator
+                                            .repository()
+                                            .stages(&tenant_id, &create_task_id)
+                                            .await
+                                            .map_err(map_central_error)?
+                                            .into_iter()
+                                            .find(|stage| stage.stage_key == stage_key);
+                                        if let Some(current) = current {
+                                            if matches!(
+                                                current.state,
+                                                StageState::Ready
+                                                    | StageState::Waiting
+                                                    | StageState::Verifying
+                                                    | StageState::Stalled
+                                            ) {
+                                                coordinator
+                                                    .transition_stage(
+                                                        &create_task_id,
+                                                        &tenant_id,
+                                                        stage_key,
+                                                        StageState::Running,
+                                                        None,
+                                                    )
+                                                    .await
+                                                    .map_err(map_central_error)?;
+                                            }
+                                        }
+                                        coordinator
+                                            .transition_stage(
+                                                &create_task_id,
+                                                &tenant_id,
+                                                stage_key,
+                                                StageState::Succeeded,
+                                                None,
+                                            )
+                                            .await
+                                            .map_err(map_central_error)?;
+                                    }
+                                }
+                            }
+                            let scan = coordinator
+                                .repository()
+                                .stages(&tenant_id, &create_task_id)
+                                .await
+                                .map_err(map_central_error)?
+                                .into_iter()
+                                .find(|stage| stage.stage_key == "scan_changes");
+                            if scan.is_some_and(|stage| !stage.state.is_success()) {
+                                coordinator
+                                    .reuse_stage(&create_task_id, &tenant_id, "scan_changes")
+                                    .await
+                                    .map_err(map_central_error)?;
+                            }
+                        }
+                    }
+                }
+            }
+            let service = self.workspace_commits.as_ref().ok_or_else(|| {
+                application_error(
+                    ErrorCategory::Unavailable,
+                    "workspace_commit_unavailable",
+                    "WORKSPACE_COMMIT_UNAVAILABLE",
+                    "Workspace Commit authority is unavailable",
+                    true,
+                )
+            })?;
+            let result = service.commit_workspace(identity, request).await?;
+            self.link_operation_resource(
+                &task,
+                TaskResourceKind::Commit,
+                result.commit.commit_id.to_string(),
+                TaskResourceRole::Target,
+            )
+            .await?;
+            let task = self.complete_operation_task(task, identity).await?;
+            Ok(CommitWorkspaceResponse {
+                commit: CommitNodeView {
+                    commit_id: result.commit.commit_id.to_string(),
+                    parent_commit_id: result.commit.parent_commit_id.map(|id| id.to_string()),
+                    message: result.commit.message,
+                    description: result.commit.description,
+                    tag_names: result.commit.tag_names,
+                    created_at_unix_ms: result.commit.created_at_unix_ms.to_string(),
+                    data_layout: match result.commit.data_layout {
+                        CommitDataLayout::FastCdc => crate::dto::DataLayout::FastCdc,
+                        CommitDataLayout::WholeFile => crate::dto::DataLayout::WholeFile,
+                    },
                 },
-            },
-            playground: self.playground_view(&result.playground).await?,
-            consumed_precommit: precommit_view(&result.consumed_precommit),
-            replayed: result.replayed,
-            task,
-        })
+                workspace: self.workspace_view(&result.workspace).await?,
+                consumed_precommit: precommit_view(&result.consumed_precommit),
+                request_replayed: (result.replayed || task_replayed)
+                    && !task.as_ref().is_some_and(|value| value.execution_reused),
+                execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
+                task,
+            })
+        };
+        let result = result.await;
+        self.operation_result(&task_for_failure, identity, result)
+            .await
     }
 
-    /// Lists the logical contents of the authoritative Playground Index. No Agent or mount
+    /// Lists the logical contents of the authoritative Workspace Index. No Agent or mount
     /// locator participates in this read path.
-    pub async fn query_playground_file_list(
+    pub async fn query_workspace_file_list(
         &self,
         identity: &AuthenticatedIdentity,
-        request: QueryPlaygroundFileListRequest,
-    ) -> Result<QueryPlaygroundFileListResponse, Error> {
+        request: QueryWorkspaceFileListRequest,
+    ) -> Result<QueryWorkspaceFileListResponse, Error> {
         let path_prefix = request
             .path_prefix
             .map(|value| parse_logical_path("path_prefix", value))
@@ -5609,7 +7023,7 @@ impl CatalogService {
                 request.tenant_id,
                 request.project_id,
                 request.artifact_id,
-                request.playground_id,
+                request.workspace_id,
             )
             .await?;
         let scope = BrowseCursorScope {
@@ -5632,7 +7046,7 @@ impl CatalogService {
             entries.retain(|entry| entry.path > after);
         }
         let (items, next_cursor) = take_browse_page(entries, page_size, &scope)?;
-        Ok(QueryPlaygroundFileListResponse {
+        Ok(QueryWorkspaceFileListResponse {
             index_version: index_version_body(&index.version),
             items,
             next_cursor,
@@ -5640,11 +7054,11 @@ impl CatalogService {
     }
 
     /// Returns the public, logical metadata available in the central Index for one file.
-    pub async fn query_playground_file_metadata(
+    pub async fn query_workspace_file_metadata(
         &self,
         identity: &AuthenticatedIdentity,
-        request: QueryPlaygroundFileMetadataRequest,
-    ) -> Result<QueryPlaygroundFileMetadataResponse, Error> {
+        request: QueryWorkspaceFileMetadataRequest,
+    ) -> Result<QueryWorkspaceFileMetadataResponse, Error> {
         let path = parse_logical_path("path", request.path)?;
         let (_, index) = self
             .load_browse_index(
@@ -5652,16 +7066,16 @@ impl CatalogService {
                 request.tenant_id,
                 request.project_id,
                 request.artifact_id,
-                request.playground_id,
+                request.workspace_id,
             )
             .await?;
         let record = index
             .records
             .iter()
             .find(|record| record.path == path)
-            .ok_or_else(|| resource_not_found("playground file"))?;
+            .ok_or_else(|| resource_not_found("workspace file"))?;
         let format = file_format(record.path.as_str());
-        Ok(QueryPlaygroundFileMetadataResponse {
+        Ok(QueryWorkspaceFileMetadataResponse {
             index_version: index_version_body(&index.version),
             metadata: FileMetadataView {
                 path: record.path.to_string(),
@@ -5675,18 +7089,18 @@ impl CatalogService {
 
     /// Computes a minimal Dataset Profile from public Index attributes. Rich schema and quality
     /// fields remain absent until an Agent publishes a dedicated, validated profile batch.
-    pub async fn query_playground_dataset_profile(
+    pub async fn query_workspace_dataset_profile(
         &self,
         identity: &AuthenticatedIdentity,
-        request: QueryPlaygroundDatasetProfileRequest,
-    ) -> Result<QueryPlaygroundDatasetProfileResponse, Error> {
+        request: QueryWorkspaceDatasetProfileRequest,
+    ) -> Result<QueryWorkspaceDatasetProfileResponse, Error> {
         let (_, index) = self
             .load_browse_index(
                 identity,
                 request.tenant_id,
                 request.project_id,
                 request.artifact_id,
-                request.playground_id,
+                request.workspace_id,
             )
             .await?;
         let logical_size_bytes = index.records.iter().try_fold(0_u64, |total, record| {
@@ -5706,7 +7120,7 @@ impl CatalogService {
             .map(|record| file_format(record.path.as_str()))
             .collect::<BTreeSet<_>>()
             .len();
-        Ok(QueryPlaygroundDatasetProfileResponse {
+        Ok(QueryWorkspaceDatasetProfileResponse {
             index_version: index_version_body(&index.version),
             profile: DatasetProfileView {
                 state: "ready".to_owned(),
@@ -5723,16 +7137,16 @@ impl CatalogService {
 
     /// Lists the current workspace delta against its Head Commit, or a frozen Pre-commit delta
     /// against the Head captured by that exact attempt.
-    pub async fn query_playground_change_list(
+    pub async fn query_workspace_change_list(
         &self,
         identity: &AuthenticatedIdentity,
-        request: QueryPlaygroundChangeListRequest,
-    ) -> Result<QueryPlaygroundChangeListResponse, Error> {
-        let QueryPlaygroundChangeListRequest {
+        request: QueryWorkspaceChangeListRequest,
+    ) -> Result<QueryWorkspaceChangeListResponse, Error> {
+        let QueryWorkspaceChangeListRequest {
             tenant_id,
             project_id,
             artifact_id,
-            playground_id,
+            workspace_id,
             precommit_id,
             change_type,
             path_prefix,
@@ -5749,13 +7163,13 @@ impl CatalogService {
             let tenant_id = parse_tenant(tenant_id)?;
             if !self
                 .policy
-                .is_allowed(identity.principal(), Permission::PlaygroundRead, &tenant_id)
+                .is_allowed(identity.principal(), Permission::WorkspaceRead, &tenant_id)
             {
                 return Err(resource_not_found("precommit"));
             }
             let project_id = parse_project_id(project_id)?;
             let artifact_id = parse_artifact_id(artifact_id)?;
-            let playground_id = parse_playground_id(playground_id)?;
+            let workspace_id = parse_workspace_id(workspace_id)?;
             let precommit_id = PreCommitId::new(precommit_id)
                 .map_err(|error| invalid_request(format!("precommit_id: {error}")))?;
             let precommits = self.precommit_repository()?;
@@ -5766,7 +7180,7 @@ impl CatalogService {
                 .filter(|record| {
                     record.project_id == project_id
                         && record.artifact_id == artifact_id
-                        && record.playground_id == playground_id
+                        && record.workspace_id == workspace_id
                 })
                 .ok_or_else(|| resource_not_found("precommit"))?;
             let synchronized = match &self.coordinator {
@@ -5776,6 +7190,9 @@ impl CatalogService {
                     .map_err(map_central_error)?,
                 None => stored,
             };
+            let _ = self
+                .synchronize_precommit_task(&synchronized, None, identity)
+                .await?;
             let version = synchronized
                 .candidate_index_version
                 .as_ref()
@@ -5816,15 +7233,15 @@ impl CatalogService {
             );
         }
 
-        let (playground, index) = self
-            .load_browse_index(identity, tenant_id, project_id, artifact_id, playground_id)
+        let (workspace, index) = self
+            .load_browse_index(identity, tenant_id, project_id, artifact_id, workspace_id)
             .await?;
-        let baseline_commit_id = playground.head_commit_id.map(Into::into);
+        let baseline_commit_id = workspace.head_commit_id.map(Into::into);
         let base_records = self
             .load_commit_records(
-                &playground.tenant_id,
-                &playground.project_id,
-                &playground.artifact_id,
+                &workspace.tenant_id,
+                &workspace.project_id,
+                &workspace.artifact_id,
                 baseline_commit_id,
             )
             .await?;
@@ -5848,30 +7265,30 @@ impl CatalogService {
         tenant_id: String,
         project_id: String,
         artifact_id: String,
-        playground_id: String,
-    ) -> Result<(PlaygroundRecord, crate::PublishedIndex), Error> {
+        workspace_id: String,
+    ) -> Result<(WorkspaceRecord, crate::PublishedIndex), Error> {
         let tenant_id = parse_tenant(tenant_id)?;
         if !self
             .policy
-            .is_allowed(identity.principal(), Permission::PlaygroundRead, &tenant_id)
+            .is_allowed(identity.principal(), Permission::WorkspaceRead, &tenant_id)
         {
-            return Err(resource_not_found("playground"));
+            return Err(resource_not_found("workspace"));
         }
         let project_id = parse_project_id(project_id)?;
         let artifact_id = parse_artifact_id(artifact_id)?;
-        let playground_id = parse_playground_id(playground_id)?;
-        let playground = self
+        let workspace_id = parse_workspace_id(workspace_id)?;
+        let workspace = self
             .repository
-            .get_playground(&tenant_id, &project_id, &artifact_id, &playground_id)
+            .get_workspace(&tenant_id, &project_id, &artifact_id, &workspace_id)
             .await
             .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("playground"))?;
-        require_active_for_read(&playground.lifecycle, "playground")?;
-        if playground.state != PlaygroundState::Ready {
+            .ok_or_else(|| resource_not_found("workspace"))?;
+        require_active_for_read(&workspace.lifecycle, "workspace")?;
+        if workspace.state != WorkspaceState::Ready {
             return Err(catalog_conflict(
-                "playground_not_ready",
-                "PLAYGROUND_NOT_READY",
-                "the Playground is not ready for browsing",
+                "workspace_not_ready",
+                "WORKSPACE_NOT_READY",
+                "the Workspace is not ready for browsing",
             ));
         }
         let index = self
@@ -5880,11 +7297,11 @@ impl CatalogService {
                 tenant_id,
                 project_id,
                 artifact_id,
-                playground_id,
+                workspace_id,
             })
             .await
             .map_err(map_central_error)?;
-        Ok((playground, index))
+        Ok((workspace, index))
     }
 
     fn precommit_repository(&self) -> Result<Arc<dyn PreCommitRepository>, Error> {
@@ -5933,7 +7350,7 @@ impl CatalogService {
                 catalog_conflict(
                     "workspace_base_diff_unavailable",
                     "WORKSPACE_BASE_DIFF_UNAVAILABLE",
-                    "the Head Commit Index is unavailable for this Playground",
+                    "the Head Commit Index is unavailable for this Workspace",
                 )
             })
     }
@@ -5954,40 +7371,40 @@ impl CatalogService {
         Ok((precommits, coordinator))
     }
 
-    async fn load_playground(
+    async fn load_workspace(
         &self,
         tenant_id: &TenantId,
         project_id: &ProjectId,
         artifact_id: &ArtifactId,
-        playground_id: &PlaygroundId,
-    ) -> Result<PlaygroundRecord, Error> {
-        let playground = self
+        workspace_id: &WorkspaceId,
+    ) -> Result<WorkspaceRecord, Error> {
+        let workspace = self
             .repository
-            .get_playground(tenant_id, project_id, artifact_id, playground_id)
+            .get_workspace(tenant_id, project_id, artifact_id, workspace_id)
             .await
             .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("playground"))?;
-        require_active_for_mutation(&playground.lifecycle, "Playground")?;
-        Ok(playground)
+            .ok_or_else(|| resource_not_found("workspace"))?;
+        require_active_for_mutation(&workspace.lifecycle, "Workspace")?;
+        Ok(workspace)
     }
 
-    async fn load_precommit_playground(
+    async fn load_precommit_workspace(
         &self,
         identity: &AuthenticatedIdentity,
         precommit: &PreCommitRecord,
         permission: Permission,
-    ) -> Result<PlaygroundRecord, Error> {
+    ) -> Result<WorkspaceRecord, Error> {
         if !self
             .policy
             .is_allowed(identity.principal(), permission, &precommit.tenant_id)
         {
             return Err(resource_not_found("precommit"));
         }
-        self.load_playground(
+        self.load_workspace(
             &precommit.tenant_id,
             &precommit.project_id,
             &precommit.artifact_id,
-            &precommit.playground_id,
+            &precommit.workspace_id,
         )
         .await
         .map_err(|_| resource_not_found("precommit"))
@@ -5995,23 +7412,23 @@ impl CatalogService {
 
     async fn validate_precommit_source(
         &self,
-        playground: &PlaygroundRecord,
+        workspace: &WorkspaceRecord,
         expected: &WireIndexVersion,
     ) -> Result<(), Error> {
-        if playground.state != PlaygroundState::Ready {
+        if workspace.state != WorkspaceState::Ready {
             return Err(catalog_conflict(
-                "playground_not_ready",
-                "PLAYGROUND_NOT_READY",
-                "only a Ready Playground can start Pre-commit",
+                "workspace_not_ready",
+                "WORKSPACE_NOT_READY",
+                "only a Ready Workspace can start Pre-commit",
             ));
         }
         let current = self
             .indexes
             .current_version(&IndexKey {
-                tenant_id: playground.tenant_id.clone(),
-                project_id: playground.project_id.clone(),
-                artifact_id: playground.artifact_id.clone(),
-                playground_id: playground.playground_id.clone(),
+                tenant_id: workspace.tenant_id.clone(),
+                project_id: workspace.project_id.clone(),
+                artifact_id: workspace.artifact_id.clone(),
+                workspace_id: workspace.workspace_id.clone(),
             })
             .await
             .map_err(map_central_error)?;
@@ -6019,7 +7436,7 @@ impl CatalogService {
             return Err(catalog_conflict(
                 "index_version_conflict",
                 "INDEX_VERSION_CONFLICT",
-                "expected_index_version no longer matches the Playground",
+                "expected_index_version no longer matches the Workspace",
             ));
         }
         Ok(())
@@ -6088,7 +7505,7 @@ impl CatalogService {
         })
     }
 
-    /// Projects the same live Agent-derived state used by Playground views onto the public
+    /// Projects the same live Agent-derived state used by Workspace views onto the public
     /// StorageVolume view. The catalog row is retained as the fallback for compositions that do
     /// not have an Agent registry (for example, metadata-only tests and bootstrap tooling).
     async fn storage_volume_view_with_live_state(
@@ -6125,14 +7542,14 @@ impl CatalogService {
         }
     }
 
-    async fn playground_view(&self, record: &PlaygroundRecord) -> Result<PlaygroundView, Error> {
+    async fn workspace_view(&self, record: &WorkspaceRecord) -> Result<WorkspaceView, Error> {
         let index_version = self
             .indexes
             .current_version(&IndexKey {
                 tenant_id: record.tenant_id.clone(),
                 project_id: record.project_id.clone(),
                 artifact_id: record.artifact_id.clone(),
-                playground_id: record.playground_id.clone(),
+                workspace_id: record.workspace_id.clone(),
             })
             .await
             .map_err(map_central_error)?;
@@ -6142,7 +7559,7 @@ impl CatalogService {
                     &record.tenant_id,
                     &record.project_id,
                     &record.artifact_id,
-                    &record.playground_id,
+                    &record.workspace_id,
                 )
                 .await
                 .map_err(map_central_error)?,
@@ -6160,7 +7577,7 @@ impl CatalogService {
             },
             None => "unknown",
         };
-        Ok(playground_view(
+        Ok(workspace_view(
             record,
             &index_version,
             active.as_ref(),
@@ -6385,6 +7802,7 @@ fn project_view(record: &ProjectRecord) -> ProjectView {
         display_name: record.display_name.clone(),
         description: record.description.clone(),
         resource_version: record.resource_version.to_string(),
+        lifecycle: resource_lifecycle_view(&record.lifecycle),
         created_at_unix_ms: record.created_at_unix_ms.to_string(),
         updated_at_unix_ms: record.updated_at_unix_ms.to_string(),
     }
@@ -6438,17 +7856,17 @@ fn build_commit_diff_view(
     })
 }
 
-fn playground_view(
-    record: &PlaygroundRecord,
+fn workspace_view(
+    record: &WorkspaceRecord,
     index_version: &WireIndexVersion,
     active_precommit: Option<&PreCommitRecord>,
     storage_availability: &str,
-) -> PlaygroundView {
-    PlaygroundView {
+) -> WorkspaceView {
+    WorkspaceView {
         tenant_id: record.tenant_id.to_string(),
         project_id: record.project_id.to_string(),
         artifact_id: record.artifact_id.to_string(),
-        playground_id: record.playground_id.to_string(),
+        workspace_id: record.workspace_id.to_string(),
         storage_volume_id: record.storage_volume_id.to_string(),
         region: record.region.clone(),
         display_name: record.display_name.clone(),
@@ -6458,7 +7876,7 @@ fn playground_view(
             revision: index_version.revision.to_string(),
             digest: index_version.digest.to_string(),
         },
-        state: playground_state_name(record.state).to_owned(),
+        state: workspace_state_name(record.state).to_owned(),
         storage_availability: storage_availability.to_owned(),
         active_precommit_id: active_precommit.map(|record| record.precommit_id.to_string()),
         issue: None,
@@ -6474,7 +7892,7 @@ pub(crate) fn precommit_view(record: &PreCommitRecord) -> PreCommitView {
         tenant_id: record.tenant_id.to_string(),
         project_id: record.project_id.to_string(),
         artifact_id: record.artifact_id.to_string(),
-        playground_id: record.playground_id.to_string(),
+        workspace_id: record.workspace_id.to_string(),
         precommit_id: record.precommit_id.to_string(),
         precommit_request_id: record.precommit_request_id.to_string(),
         attempt: record.attempt,
@@ -6656,7 +8074,7 @@ enum CursorScope {
         graph_version: String,
         head_commit_id: Option<String>,
     },
-    Playground {
+    Workspace {
         tenant_id: String,
         project_id: Option<String>,
         artifact_id: Option<String>,
@@ -6796,9 +8214,9 @@ fn decode_commit_cursor(encoded: &str, scope: &CursorScope) -> Result<CommitGrap
     })
 }
 
-fn encode_playground_cursor(
+fn encode_workspace_cursor(
     scope: &CursorScope,
-    cursor: &PlaygroundListCursor,
+    cursor: &WorkspaceListCursor,
 ) -> Result<String, Error> {
     encode_cursor(
         scope,
@@ -6806,21 +8224,21 @@ fn encode_playground_cursor(
         vec![
             cursor.project_id.to_string(),
             cursor.artifact_id.to_string(),
-            cursor.playground_id.to_string(),
+            cursor.workspace_id.to_string(),
         ],
     )
 }
 
-fn decode_playground_cursor(
+fn decode_workspace_cursor(
     encoded: &str,
     scope: &CursorScope,
-) -> Result<PlaygroundListCursor, Error> {
+) -> Result<WorkspaceListCursor, Error> {
     let cursor = decode_cursor(encoded, scope, 3)?;
-    Ok(PlaygroundListCursor {
+    Ok(WorkspaceListCursor {
         created_at_unix_ms: cursor.created_at_unix_ms,
         project_id: ProjectId::new(cursor.keys[0].clone()).map_err(|_| cursor_conflict())?,
         artifact_id: ArtifactId::new(cursor.keys[1].clone()).map_err(|_| cursor_conflict())?,
-        playground_id: PlaygroundId::new(cursor.keys[2].clone()).map_err(|_| cursor_conflict())?,
+        workspace_id: WorkspaceId::new(cursor.keys[2].clone()).map_err(|_| cursor_conflict())?,
     })
 }
 
@@ -7124,6 +8542,9 @@ fn parse_retention_hold_id(value: String) -> Result<RetentionHoldId, Error> {
 
 fn parse_resource_ref(value: ResourceRefBody) -> Result<ResourceRef, Error> {
     match value {
+        ResourceRefBody::Project { project_id } => Ok(ResourceRef::Project {
+            project_id: parse_project_id(project_id)?,
+        }),
         ResourceRefBody::StorageVolume { storage_volume_id } => Ok(ResourceRef::StorageVolume {
             storage_volume_id: parse_volume_id(storage_volume_id)?,
         }),
@@ -7134,14 +8555,14 @@ fn parse_resource_ref(value: ResourceRefBody) -> Result<ResourceRef, Error> {
             project_id: parse_project_id(project_id)?,
             artifact_id: parse_artifact_id(artifact_id)?,
         }),
-        ResourceRefBody::Playground {
+        ResourceRefBody::Workspace {
             project_id,
             artifact_id,
-            playground_id,
-        } => Ok(ResourceRef::Playground {
+            workspace_id,
+        } => Ok(ResourceRef::Workspace {
             project_id: parse_project_id(project_id)?,
             artifact_id: parse_artifact_id(artifact_id)?,
-            playground_id: parse_playground_id(playground_id)?,
+            workspace_id: parse_workspace_id(workspace_id)?,
         }),
         ResourceRefBody::Snapshot { snapshot_id } => Ok(ResourceRef::Snapshot {
             snapshot_id: parse_snapshot_id(snapshot_id)?,
@@ -7152,6 +8573,9 @@ fn parse_resource_ref(value: ResourceRefBody) -> Result<ResourceRef, Error> {
 fn task_scope_for_resource(tenant_id: TenantId, resource: &ResourceRef) -> TaskScope {
     let mut scope = TaskScope::new(tenant_id);
     match resource {
+        ResourceRef::Project { project_id } => {
+            scope.project_id = Some(project_id.clone());
+        }
         ResourceRef::StorageVolume { storage_volume_id } => {
             scope.storage_volume_id = Some(storage_volume_id.clone());
         }
@@ -7162,14 +8586,14 @@ fn task_scope_for_resource(tenant_id: TenantId, resource: &ResourceRef) -> TaskS
             scope.project_id = Some(project_id.clone());
             scope.artifact_id = Some(artifact_id.clone());
         }
-        ResourceRef::Playground {
+        ResourceRef::Workspace {
             project_id,
             artifact_id,
-            playground_id,
+            workspace_id,
         } => {
             scope.project_id = Some(project_id.clone());
             scope.artifact_id = Some(artifact_id.clone());
-            scope.playground_id = Some(playground_id.clone());
+            scope.workspace_id = Some(workspace_id.clone());
         }
         ResourceRef::Snapshot { snapshot_id } => {
             scope.snapshot_id = Some(snapshot_id.clone());
@@ -7178,8 +8602,31 @@ fn task_scope_for_resource(tenant_id: TenantId, resource: &ResourceRef) -> TaskS
     scope
 }
 
+fn delete_intent_for_resource(resource: &ResourceRef) -> TaskIntent {
+    match resource {
+        ResourceRef::Project { .. } => TaskIntent::ProjectDelete,
+        ResourceRef::StorageVolume { .. } => TaskIntent::StorageVolumeDelete,
+        ResourceRef::Artifact { .. } => TaskIntent::ArtifactDelete,
+        ResourceRef::Workspace { .. } => TaskIntent::WorkspaceDelete,
+        ResourceRef::Snapshot { .. } => TaskIntent::SnapshotDelete,
+    }
+}
+
+fn restore_intent_for_resource(resource: &ResourceRef) -> TaskIntent {
+    match resource {
+        ResourceRef::Project { .. } => TaskIntent::ProjectRestore,
+        ResourceRef::StorageVolume { .. } => TaskIntent::StorageVolumeRestore,
+        ResourceRef::Artifact { .. } => TaskIntent::ArtifactRestore,
+        ResourceRef::Workspace { .. } => TaskIntent::WorkspaceRestore,
+        ResourceRef::Snapshot { .. } => TaskIntent::SnapshotRestore,
+    }
+}
+
 fn resource_ref_body(value: &ResourceRef) -> ResourceRefBody {
     match value {
+        ResourceRef::Project { project_id } => ResourceRefBody::Project {
+            project_id: project_id.to_string(),
+        },
         ResourceRef::StorageVolume { storage_volume_id } => ResourceRefBody::StorageVolume {
             storage_volume_id: storage_volume_id.to_string(),
         },
@@ -7190,14 +8637,14 @@ fn resource_ref_body(value: &ResourceRef) -> ResourceRefBody {
             project_id: project_id.to_string(),
             artifact_id: artifact_id.to_string(),
         },
-        ResourceRef::Playground {
+        ResourceRef::Workspace {
             project_id,
             artifact_id,
-            playground_id,
-        } => ResourceRefBody::Playground {
+            workspace_id,
+        } => ResourceRefBody::Workspace {
             project_id: project_id.to_string(),
             artifact_id: artifact_id.to_string(),
-            playground_id: playground_id.to_string(),
+            workspace_id: workspace_id.to_string(),
         },
         ResourceRef::Snapshot { snapshot_id } => ResourceRefBody::Snapshot {
             snapshot_id: snapshot_id.to_string(),
@@ -7437,8 +8884,8 @@ fn parse_commit_id(value: String) -> Result<CommitId, Error> {
         .map_err(|error| invalid_request(format!("commit_id: {error}")))
 }
 
-fn parse_playground_id(value: String) -> Result<PlaygroundId, Error> {
-    PlaygroundId::new(value).map_err(|error| invalid_request(format!("playground_id: {error}")))
+fn parse_workspace_id(value: String) -> Result<WorkspaceId, Error> {
+    WorkspaceId::new(value).map_err(|error| invalid_request(format!("workspace_id: {error}")))
 }
 
 fn parse_snapshot_id(value: String) -> Result<SnapshotId, Error> {
@@ -7491,11 +8938,11 @@ fn parse_hardlink_policy_body(value: Option<String>) -> Result<HardlinkPolicy, E
     }
 }
 
-fn parse_playground_state(value: &str) -> Result<PlaygroundState, Error> {
+fn parse_workspace_state(value: &str) -> Result<WorkspaceState, Error> {
     match value {
-        "creating" => Ok(PlaygroundState::Creating),
-        "ready" => Ok(PlaygroundState::Ready),
-        "abnormal" => Ok(PlaygroundState::Abnormal),
+        "creating" => Ok(WorkspaceState::Creating),
+        "ready" => Ok(WorkspaceState::Ready),
+        "abnormal" => Ok(WorkspaceState::Abnormal),
         _ => Err(invalid_request(
             "state must be creating, ready, or abnormal",
         )),
@@ -7536,11 +8983,11 @@ fn volume_state_name(value: StorageVolumeState) -> &'static str {
     }
 }
 
-fn playground_state_name(value: PlaygroundState) -> &'static str {
+fn workspace_state_name(value: WorkspaceState) -> &'static str {
     match value {
-        PlaygroundState::Creating => "creating",
-        PlaygroundState::Ready => "ready",
-        PlaygroundState::Abnormal => "abnormal",
+        WorkspaceState::Creating => "creating",
+        WorkspaceState::Ready => "ready",
+        WorkspaceState::Abnormal => "abnormal",
     }
 }
 
@@ -7641,7 +9088,7 @@ fn build_change_list_response(
     path_prefix: Option<LogicalPath>,
     cursor: Option<&str>,
     page_size: u16,
-) -> Result<QueryPlaygroundChangeListResponse, Error> {
+) -> Result<QueryWorkspaceChangeListResponse, Error> {
     let scope = BrowseCursorScope {
         kind: if source == "precommit" {
             "precommit_changes"
@@ -7673,7 +9120,7 @@ fn build_change_list_response(
                 .as_deref()
                 .is_none_or(|requested| requested == index_change_kind_name(change.kind))
         })
-        .map(|change| PlaygroundChangeEntry {
+        .map(|change| WorkspaceChangeEntry {
             change_type: index_change_kind_name(change.kind).to_owned(),
             format: Some(file_format(change.path.as_str())),
             path: change.path.to_string(),
@@ -7686,11 +9133,11 @@ fn build_change_list_response(
         entries.retain(|entry| entry.path > after);
     }
     let (items, next_cursor) = take_change_page(entries, page_size, &scope)?;
-    Ok(QueryPlaygroundChangeListResponse {
+    Ok(QueryWorkspaceChangeListResponse {
         source: source.to_owned(),
         precommit_id,
         index_version: index_version_body(version),
-        summary: PlaygroundChangeSummary {
+        summary: WorkspaceChangeSummary {
             files_added: summary.files_added.to_string(),
             files_modified: summary.files_modified.to_string(),
             files_deleted: summary.files_deleted.to_string(),
@@ -7777,10 +9224,10 @@ fn take_browse_page(
 }
 
 fn take_change_page(
-    mut entries: Vec<PlaygroundChangeEntry>,
+    mut entries: Vec<WorkspaceChangeEntry>,
     page_size: u16,
     scope: &BrowseCursorScope,
-) -> Result<(Vec<PlaygroundChangeEntry>, Option<String>), Error> {
+) -> Result<(Vec<WorkspaceChangeEntry>, Option<String>), Error> {
     let limit = usize::from(page_size);
     let next = entries.len() > limit;
     if next {
@@ -7942,6 +9389,17 @@ fn catalog_conflict(code: &'static str, neo_code: &'static str, message: &'stati
     application_error(ErrorCategory::Conflict, code, neo_code, message, false)
 }
 
+fn bounded_task_text(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    value[..end].to_owned()
+}
+
 fn catalog_mutation_error(error: crate::CentralError, reused_code: &'static str) -> Error {
     match error.code() {
         crate::CentralErrorCode::InvalidState => catalog_conflict(
@@ -7950,7 +9408,7 @@ fn catalog_mutation_error(error: crate::CentralError, reused_code: &'static str)
                 "tenant_id_reused" => "TENANT_ID_REUSED",
                 "artifact_id_reused" => "ARTIFACT_ID_REUSED",
                 "storage_volume_id_reused" => "STORAGE_VOLUME_ID_REUSED",
-                "playground_id_reused" => "PLAYGROUND_ID_REUSED",
+                "workspace_id_reused" => "WORKSPACE_ID_REUSED",
                 _ => "MUTATION_CONFLICT",
             },
             "resource ID is already bound to another create request",
@@ -7964,7 +9422,7 @@ fn catalog_mutation_error(error: crate::CentralError, reused_code: &'static str)
     }
 }
 
-fn playground_mutation_error(error: crate::CentralError) -> Error {
+fn workspace_mutation_error(error: crate::CentralError) -> Error {
     match error.code() {
         crate::CentralErrorCode::ArtifactNotFound => resource_not_found("artifact"),
         crate::CentralErrorCode::StorageVolumeNotFound => resource_not_found("storage volume"),
@@ -7972,13 +9430,13 @@ fn playground_mutation_error(error: crate::CentralError) -> Error {
             ErrorCategory::Conflict,
             "artifact_head_changed",
             "ARTIFACT_HEAD_MISMATCH",
-            "the Artifact Head changed before Playground creation; retry the request",
+            "the Artifact Head changed before Workspace creation; retry the request",
             true,
         ),
         crate::CentralErrorCode::ArtifactHeadMismatch => catalog_conflict(
             "artifact_base_commit_mismatch",
             "ARTIFACT_BASE_COMMIT_MISMATCH",
-            "the Playground base Commit must match its initial head Commit",
+            "the Workspace base Commit must match its initial head Commit",
         ),
         crate::CentralErrorCode::StorageVolumeNotReady => catalog_conflict(
             "storage_volume_not_ready",
@@ -7990,7 +9448,7 @@ fn playground_mutation_error(error: crate::CentralError) -> Error {
             "STORAGE_VOLUME_REGION_MISMATCH",
             "the selected StorageVolume region changed before placement",
         ),
-        _ => catalog_mutation_error(error, "playground_id_reused"),
+        _ => catalog_mutation_error(error, "workspace_id_reused"),
     }
 }
 
@@ -8264,6 +9722,7 @@ fn s3_mutation_record<T: Serialize>(
 fn s3_mutation_kind_name(value: S3MutationKind) -> &'static str {
     match value {
         S3MutationKind::AccessPointCreate => "access_point_create",
+        S3MutationKind::AccessPointDelete => "access_point_delete",
         S3MutationKind::AccessPointEnable => "access_point_enable",
         S3MutationKind::AccessPointDisable => "access_point_disable",
         S3MutationKind::CredentialCreate => "credential_create",
@@ -8354,6 +9813,7 @@ fn s3_access_point_state_name(value: S3AccessPointState) -> &'static str {
     match value {
         S3AccessPointState::Active => "active",
         S3AccessPointState::Disabled => "disabled",
+        S3AccessPointState::Deleted => "deleted",
     }
 }
 
@@ -8892,7 +10352,7 @@ mod s3_cursor_tests {
             tenant_id: tenant_id.clone(),
             project_id,
             artifact_id,
-            source_playground_id: PlaygroundId::new("playground-s3-coverage").unwrap(),
+            source_workspace_id: WorkspaceId::new("workspace-s3-coverage").unwrap(),
             source_precommit_id: PreCommitId::new("precommit-s3-coverage").unwrap(),
             commit_request_id: RequestId::new("request-s3-coverage").unwrap(),
             commit_id,

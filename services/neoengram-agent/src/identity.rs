@@ -132,7 +132,8 @@ pub(crate) fn public_key_spki_der(signing_key: &Ed25519KeyPair) -> AgentDaemonRe
 mod tests {
     use crate::{AgentReport, ApprovedAgentIdentity};
     use neoengram_domain::protocol::{
-        AssignmentGeneration, AssignmentId, Extensions, JobAccepted, JobId, UnixMillis,
+        AssignmentGeneration, AssignmentId, Extensions, Generation, JobAccepted, JobId,
+        TaskExecutionFence, TaskId, UnixMillis,
     };
 
     use super::*;
@@ -196,6 +197,13 @@ mod tests {
             .enqueue(
                 AgentReport::Accepted(JobAccepted {
                     job_id: JobId::new("job-a").unwrap(),
+                    task_fence: TaskExecutionFence::new(
+                        TaskId::new("task-job-a").unwrap(),
+                        Generation::new(1),
+                        "scan_changes",
+                        Generation::new(1),
+                        Generation::new(1),
+                    ),
                     assignment_id: AssignmentId::new("assignment-a").unwrap(),
                     assignment_generation: AssignmentGeneration::new(1),
                     accepted_at_unix_ms: UnixMillis::new(100),

@@ -16,14 +16,14 @@ impl MetadataBatchStager for SqliteAuthorityStore {
         let payload = encode(&descriptor)?;
         let result = sqlx::query(
             "INSERT OR IGNORE INTO metadata_batch_descriptors \
-             (tenant_id, batch_id, job_id, artifact_id, playground_id, payload) \
+             (tenant_id, batch_id, job_id, artifact_id, workspace_id, payload) \
              VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(descriptor.scope.tenant_id.as_str())
         .bind(descriptor.batch_id.as_str())
         .bind(descriptor.scope.job_id.as_str())
         .bind(descriptor.scope.artifact_id.as_str())
-        .bind(descriptor.scope.playground_id.as_str())
+        .bind(descriptor.scope.workspace_id.as_str())
         .bind(payload)
         .execute(&self.pool)
         .await
@@ -130,7 +130,7 @@ impl MetadataBatchStager for SqliteAuthorityStore {
         batch_id: &MetadataBatchId,
     ) -> CentralResult<Option<StagedMetadataBatch>> {
         let descriptor_row = sqlx::query(
-            "SELECT job_id, artifact_id, playground_id, payload \
+            "SELECT job_id, artifact_id, workspace_id, payload \
              FROM metadata_batch_descriptors WHERE tenant_id = ? AND batch_id = ?",
         )
         .bind(tenant_id.as_str())
@@ -152,9 +152,9 @@ impl MetadataBatchStager for SqliteAuthorityStore {
                 .map_err(storage_error)?
                 != descriptor.scope.artifact_id.as_str()
             || row
-                .try_get::<String, _>("playground_id")
+                .try_get::<String, _>("workspace_id")
                 .map_err(storage_error)?
-                != descriptor.scope.playground_id.as_str()
+                != descriptor.scope.workspace_id.as_str()
         {
             return Err(storage_corruption(
                 "metadata descriptor relational identity differs from payload",

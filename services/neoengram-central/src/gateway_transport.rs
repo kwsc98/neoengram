@@ -2626,8 +2626,8 @@ mod tests {
         EdgeClusterId, ErrorCode, Extensions, GatewayDrain, GatewayOpaqueBytes,
         GatewayReplicaHeartbeat, GatewayS3ReadRevocation, Generation, JobDecision, JobId, JobState,
         LifecycleGeneration, MessageId, PrincipalId, PrincipalKind, PrincipalRef, PublishDecision,
-        RequestId, ResourceVersion, RouteGeneration, SessionGeneration, SnapshotId, TenantId,
-        TraceId, CURRENT_WIRE_VERSION,
+        RequestId, ResourceVersion, RouteGeneration, SessionGeneration, SnapshotId,
+        TaskExecutionFence, TaskId, TenantId, TraceId, CURRENT_WIRE_VERSION,
     };
 
     use super::*;
@@ -5613,6 +5613,13 @@ mod tests {
                 central_signature: None,
                 message: AgentChannelDownstreamMessage::Decision(JobDecision {
                     job_id: JobId::new("forwarded-job-a").unwrap(),
+                    task_fence: TaskExecutionFence::new(
+                        TaskId::new("task-forwarded-job-a").unwrap(),
+                        Generation::new(1),
+                        "materialize",
+                        Generation::new(1),
+                        Generation::new(1),
+                    ),
                     assignment_id: AssignmentId::new("forwarded-assignment-a").unwrap(),
                     assignment_generation: AssignmentGeneration::new(1),
                     decision_generation: DecisionGeneration::new(1),

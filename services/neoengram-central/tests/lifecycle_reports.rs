@@ -12,16 +12,27 @@ use neoengram_domain::protocol::{
     AgentEnrollmentTokenCreateRequest, AgentEnrollmentTokenId, AgentId, AgentInstallationId,
     AgentMountId, AgentMountIdentityDigest, AgentResourceLifecycleAssignment,
     AgentResourceLifecycleScope, DecimalU64, DeletionId, Ed25519PublicKeySpki, Ed25519Signature,
-    EdgeClusterId, Extensions, LifecycleAssignmentId, MountAccessMode, MountGeneration,
+    EdgeClusterId, Extensions, Generation, LifecycleAssignmentId, MountAccessMode, MountGeneration,
     OwnerGeneration, PrincipalId, PrincipalKind, PrincipalRef, PvcIdentityDigest, RequestId,
     ResourceHealth, ResourceLifecycle, ResourceLifecycleAction, ResourceLifecycleAssignment,
     ResourceLifecycleEvidence, ResourceLifecycleReport, ResourceLifecycleReportState, ResourceRef,
-    SessionGeneration, StorageVolumeId, TenantId, UnixMillis, VolumeMarkerId, CURRENT_WIRE_VERSION,
+    SessionGeneration, StorageVolumeId, TaskExecutionFence, TaskId, TenantId, UnixMillis,
+    VolumeMarkerId, CURRENT_WIRE_VERSION,
 };
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
 const INITIAL_TOKEN: &str = "lifecycle-initial-bootstrap-token-0001";
 const REPLACEMENT_TOKEN: &str = "lifecycle-replacement-bootstrap-token-0002";
+
+fn task_fence(deletion_id: &DeletionId, stage_key: &str) -> TaskExecutionFence {
+    TaskExecutionFence::new(
+        TaskId::new(format!("task-{deletion_id}")).unwrap(),
+        Generation::new(1),
+        stage_key,
+        Generation::new(1),
+        Generation::new(1),
+    )
+}
 
 #[derive(Debug, Clone, Copy)]
 enum AgentKind {
@@ -362,13 +373,14 @@ async fn lifecycle_fixture() -> LifecycleFixture {
         assignment: ResourceLifecycleAssignment {
             assignment_id: LifecycleAssignmentId::new("lifecycle-report-assignment").unwrap(),
             tenant_id: tenant_id(),
-            deletion_id: operation.deletion_id,
+            deletion_id: operation.deletion_id.clone(),
             resource: root,
             action: ResourceLifecycleAction::Purge,
             lifecycle_generation,
             request_digest,
             deadline_unix_ms: UnixMillis::new(10_000),
         },
+        task_fence: task_fence(&operation.deletion_id, "purge"),
         resource_scope: AgentResourceLifecycleScope::StorageVolume {
             storage_volume_id: storage_volume_id(),
         },

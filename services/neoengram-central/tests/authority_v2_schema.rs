@@ -7,7 +7,7 @@ use sqlx::{sqlite::SqliteConnectOptions, Connection, SqliteConnection};
 use tempfile::TempDir;
 
 const SQLITE_APPLICATION_ID: i64 = 0x4e45_4155;
-const SQLITE_SCHEMA_VERSION: i64 = 20;
+const SQLITE_SCHEMA_VERSION: i64 = 21;
 
 #[tokio::test]
 async fn fresh_authority_advertises_v2_identity_and_materialization_tables() {
@@ -40,8 +40,12 @@ async fn fresh_authority_advertises_v2_identity_and_materialization_tables() {
         "staging_leases",
         "materialization_receipts",
         "operation_tasks",
+        "task_request_identities",
         "task_attempts",
         "task_events",
+        "task_stages",
+        "task_stage_history",
+        "task_stage_dependencies",
         "task_resource_links",
         "task_relations",
     ] {

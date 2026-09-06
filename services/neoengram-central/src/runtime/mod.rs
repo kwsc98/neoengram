@@ -33,13 +33,13 @@ use crate::{
     agent_transport::RegistryAgentApiHandler,
     controller::{
         ArtifactApiServer, ArtifactController, GatewayRegistryApiServer, GatewayRegistryController,
-        PlacementApiServer, PlacementController, PlaygroundApiServer, PlaygroundController,
-        ProjectApiServer, ProjectController, ResourceLifecycleApiServer,
-        ResourceLifecycleController, S3ApiServer, S3AuthorizationApiServer,
-        S3AuthorizationController, S3Controller, SnapshotApiServer, SnapshotController,
-        StorageEnrollmentApiServer, StorageEnrollmentController, StorageVolumeApiServer,
-        StorageVolumeController, SystemApiServer, SystemController, TaskApiServer, TaskController,
-        TenantApiServer, TenantController,
+        PlacementApiServer, PlacementController, ProjectApiServer, ProjectController,
+        ResourceLifecycleApiServer, ResourceLifecycleController, S3ApiServer,
+        S3AuthorizationApiServer, S3AuthorizationController, S3Controller, SnapshotApiServer,
+        SnapshotController, StorageEnrollmentApiServer, StorageEnrollmentController,
+        StorageVolumeApiServer, StorageVolumeController, SystemApiServer, SystemController,
+        TaskApiServer, TaskController, TenantApiServer, TenantController, WorkspaceApiServer,
+        WorkspaceController,
     },
     error::{application_error, map_central_error, NeoEngramProblemEncoder},
     gateway_activation_transport::{GatewayBootstrapTransport, GatewayReplicaActivationClient},
@@ -82,8 +82,8 @@ const DEFAULT_DEVELOPMENT_PERMISSIONS: [Permission; 29] = [
     Permission::ArtifactCommitReplicate,
     Permission::ProjectRead,
     Permission::ProjectCreate,
-    Permission::PlaygroundRead,
-    Permission::PlaygroundCreate,
+    Permission::WorkspaceRead,
+    Permission::WorkspaceCreate,
     Permission::SnapshotRead,
     Permission::SnapshotCreate,
     Permission::S3AccessRead,
@@ -793,7 +793,7 @@ impl AppState {
             .interface(ArtifactApiServer::new(ArtifactController::new(
                 self.catalog.clone(),
             )))
-            .interface(PlaygroundApiServer::new(PlaygroundController::new(
+            .interface(WorkspaceApiServer::new(WorkspaceController::new(
                 self.catalog.clone(),
             )))
             .interface(SnapshotApiServer::new(SnapshotController::new(

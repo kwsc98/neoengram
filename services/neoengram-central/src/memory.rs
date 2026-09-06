@@ -8,7 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use neoengram_domain::core::{
-    CommitId, FileRecord, IndexVersion, LogicalPath, Manifest, ManifestId, ObjectId,
+    CommitId, ContentDigest, FileRecord, IndexVersion, LogicalPath, Manifest, ManifestId, ObjectId,
 };
 use neoengram_domain::protocol::materialization::{
     MaterializationBatch, MaterializationJob, MaterializationJobKey, MaterializationJobState,
@@ -22,7 +22,8 @@ use neoengram_domain::protocol::{
     MetadataBatchPage, ObjectReceiptId, OperationTask, PlacementGeneration, ReplicationId,
     ReplicationState, RequestId, ResourceRef, ResourceVersion, SequenceNumber, StorageVolumeId,
     TaskActor, TaskAttempt, TaskAttemptId, TaskEvent, TaskEventId, TaskEventKind, TaskId,
-    TaskRelation, TaskResourceLink, TaskState, TenantId, UnixMillis, WireIndexVersion, WorkspaceId,
+    TaskRelation, TaskResourceLink, TaskStage, TaskState, TenantId, UnixMillis, WireIndexVersion,
+    WorkspaceId,
 };
 
 use crate::{
@@ -53,9 +54,9 @@ use crate::{
     CommitAvailabilityRecord, FinalizeReplicationRequest, FinalizeReplicationResult,
     MaterializationBatchCasRequest, MaterializationObjectCasRequest, MaterializationPlan,
     MaterializationPlanInsertOutcome, MaterializationPlanReplacement,
-    MaterializationReceiptRequest, PlacementRepository, RefreshReplicationRoutesRequest,
-    ReplicationRecord, ReplicationRouteBinding, ReplicationStateTransitionRequest,
-    RetryReplicationRequest, RetryReplicationResult, WorkspaceRecord,
+    MaterializationReceiptRequest, PlacementRepository, PlacementWorkspaceRecord,
+    RefreshReplicationRoutesRequest, ReplicationRecord, ReplicationRouteBinding,
+    ReplicationStateTransitionRequest, RetryReplicationRequest, RetryReplicationResult,
 };
 
 #[derive(Debug, Default)]
@@ -194,10 +195,17 @@ const MAX_TASK_PAGE_SIZE: usize = 500;
 #[derive(Debug, Default)]
 struct InMemoryTaskState {
     tasks: BTreeMap<TaskMapKey, OperationTask>,
+    /// Every accepted request identity points at the canonical execution task.  The canonical
+    /// task row stores only its first request; keeping aliases separately lets a later retry of a
+    /// semantically reused request be reported as `request_replayed` instead of being mistaken
+    /// for a fresh `execution_reused` discovery.
+    task_request_identities: BTreeMap<(TenantId, RequestId), (ContentDigest, TaskId)>,
     attempts: BTreeMap<TaskMapKey, Vec<TaskAttempt>>,
     events: BTreeMap<TaskMapKey, Vec<TaskEvent>>,
     links: BTreeMap<(TenantId, TaskId), Vec<TaskResourceLink>>,
     relations: BTreeMap<(TenantId, TaskId), Vec<TaskRelation>>,
+    stages: BTreeMap<(TenantId, TaskId), Vec<TaskStage>>,
+    stage_history: BTreeMap<(TenantId, TaskId), Vec<TaskStage>>,
 }
 
 /// In-memory implementation of the unified operation-task authority. A single mutex protects
@@ -210,7 +218,18 @@ pub struct InMemoryTaskRepository {
 
 impl InMemoryTaskRepository {
     pub fn all(&self) -> CentralResult<Vec<OperationTask>> {
-        Ok(lock(&self.state)?.tasks.values().cloned().collect())
+        let state = lock(&self.state)?;
+        Ok(state
+            .tasks
+            .values()
+            .map(|stored| {
+                let key = Self::task_key(&stored.tenant_id, &stored.task_id);
+                let mut task = stored.clone();
+                task.stages = state.stages.get(&key).cloned().unwrap_or_default();
+                task.resource_links = state.links.get(&key).cloned().unwrap_or_default();
+                task
+            })
+            .collect())
     }
 
     fn task_key(tenant_id: &TenantId, task_id: &TaskId) -> TaskMapKey {
@@ -241,10 +260,25 @@ impl TaskRepository for InMemoryTaskRepository {
         tenant_id: &TenantId,
         task_id: &TaskId,
     ) -> CentralResult<Option<OperationTask>> {
-        Ok(lock(&self.state)?
+        let state = lock(&self.state)?;
+        let Some(mut task) = state
             .tasks
             .get(&Self::task_key(tenant_id, task_id))
-            .cloned())
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        task.stages = state
+            .stages
+            .get(&Self::task_key(tenant_id, task_id))
+            .cloned()
+            .unwrap_or_default();
+        task.resource_links = state
+            .links
+            .get(&Self::task_key(tenant_id, task_id))
+            .cloned()
+            .unwrap_or_default();
+        Ok(Some(task))
     }
 
     async fn get_by_request_id(
@@ -252,11 +286,45 @@ impl TaskRepository for InMemoryTaskRepository {
         tenant_id: &TenantId,
         request_id: &RequestId,
     ) -> CentralResult<Option<OperationTask>> {
-        Ok(lock(&self.state)?
+        let state = lock(&self.state)?;
+        let Some((_, task_id)) = state
+            .task_request_identities
+            .get(&(tenant_id.clone(), request_id.clone()))
+            .cloned()
+            .or_else(|| {
+                state
+                    .tasks
+                    .values()
+                    .find(|task| &task.tenant_id == tenant_id && &task.request_id == request_id)
+                    .map(|task| (task.request_digest, task.task_id.clone()))
+            })
+        else {
+            return Ok(None);
+        };
+        let Some(mut task) = state
             .tasks
-            .values()
-            .find(|task| &task.tenant_id == tenant_id && &task.request_id == request_id)
-            .cloned())
+            .get(&Self::task_key(tenant_id, &task_id))
+            .cloned()
+        else {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "task request identity points to a missing canonical task",
+            ));
+        };
+        // An alias points at a canonical task whose original request ID may differ. Preserve that
+        // distinction for callers that resolve the alias directly (for example a causal lookup).
+        task.execution_reused = task.request_id != *request_id;
+        task.stages = state
+            .stages
+            .get(&Self::task_key(tenant_id, &task.task_id))
+            .cloned()
+            .unwrap_or_default();
+        task.resource_links = state
+            .links
+            .get(&Self::task_key(tenant_id, &task.task_id))
+            .cloned()
+            .unwrap_or_default();
+        Ok(Some(task))
     }
 
     async fn list(&self, request: &TaskListRequest) -> CentralResult<TaskListPage> {
@@ -280,7 +348,20 @@ impl TaskRepository for InMemoryTaskRepository {
             .filter(|task| task_matches_request(task, request))
             .filter(|task| task.task_id.as_str() > cursor)
             .take(request.page_size.saturating_add(1))
-            .cloned()
+            .map(|task| {
+                let mut task = task.clone();
+                task.stages = state
+                    .stages
+                    .get(&Self::task_key(&request.tenant_id, &task.task_id))
+                    .cloned()
+                    .unwrap_or_default();
+                task.resource_links = state
+                    .links
+                    .get(&Self::task_key(&request.tenant_id, &task.task_id))
+                    .cloned()
+                    .unwrap_or_default();
+                task
+            })
             .collect::<Vec<_>>();
         let next_cursor = if items.len() > request.page_size {
             items.pop().map(|task| task.task_id.to_string())
@@ -339,6 +420,98 @@ impl TaskRepository for InMemoryTaskRepository {
         Ok(summary)
     }
 
+    async fn stages(
+        &self,
+        tenant_id: &TenantId,
+        task_id: &TaskId,
+    ) -> CentralResult<Vec<TaskStage>> {
+        let state = lock(&self.state)?;
+        Self::task_or_not_found(&state, tenant_id, task_id)?;
+        Ok(state
+            .stages
+            .get(&Self::task_key(tenant_id, task_id))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn stage_history(
+        &self,
+        tenant_id: &TenantId,
+        task_id: &TaskId,
+    ) -> CentralResult<Vec<TaskStage>> {
+        let state = lock(&self.state)?;
+        Self::task_or_not_found(&state, tenant_id, task_id)?;
+        Ok(state
+            .stage_history
+            .get(&Self::task_key(tenant_id, task_id))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn insert_stage(
+        &self,
+        tenant_id: &TenantId,
+        stage: TaskStage,
+    ) -> CentralResult<TaskStage> {
+        stage.validate().map_err(CentralError::from)?;
+        let mut state = lock(&self.state)?;
+        let key = Self::task_key(tenant_id, &stage.task_id);
+        Self::task_or_not_found(&state, tenant_id, &stage.task_id)?;
+        let stages = state.stages.entry(key).or_default();
+        if let Some(existing) = stages.iter().find(|item| item.stage_key == stage.stage_key) {
+            if existing == &stage {
+                return Ok(existing.clone());
+            }
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "task stage identity was reused",
+            ));
+        }
+        stages.push(stage.clone());
+        stages.sort_by_key(|item| (item.ordinal, item.stage_key.clone()));
+        Ok(stage)
+    }
+
+    async fn replace_stage(
+        &self,
+        tenant_id: &TenantId,
+        expected_resource_version: ResourceVersion,
+        stage: TaskStage,
+    ) -> CentralResult<TaskStage> {
+        stage.validate().map_err(CentralError::from)?;
+        let mut state = lock(&self.state)?;
+        let key = Self::task_key(tenant_id, &stage.task_id);
+        let current = state
+            .stages
+            .get(&key)
+            .and_then(|stages| stages.iter().find(|item| item.stage_key == stage.stage_key))
+            .cloned()
+            .ok_or_else(|| invalid(CentralErrorCode::ResourceNotFound, "task stage not found"))?;
+        if current.resource_version != expected_resource_version
+            || stage.resource_version.get() != expected_resource_version.get().saturating_add(1)
+        {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "task stage resource version changed",
+            ));
+        }
+        state
+            .stage_history
+            .entry(key.clone())
+            .or_default()
+            .push(current);
+        let stages = state
+            .stages
+            .get_mut(&key)
+            .ok_or_else(|| invalid(CentralErrorCode::ResourceNotFound, "task stage not found"))?;
+        let current = stages
+            .iter_mut()
+            .find(|item| item.stage_key == stage.stage_key)
+            .ok_or_else(|| invalid(CentralErrorCode::ResourceNotFound, "task stage not found"))?;
+        *current = stage.clone();
+        Ok(stage)
+    }
+
     async fn insert(&self, task: OperationTask) -> CentralResult<TaskInsertOutcome> {
         self.insert_with_history(task, None, None).await
     }
@@ -370,17 +543,74 @@ impl TaskRepository for InMemoryTaskRepository {
         }
         let mut state = lock(&self.state)?;
         let key = Self::task_key(&task.tenant_id, &task.task_id);
+        let request_key = (task.tenant_id.clone(), task.request_id.clone());
+        if let Some((stored_digest, canonical_task_id)) =
+            state.task_request_identities.get(&request_key).cloned()
+        {
+            if stored_digest != task.request_digest {
+                return Err(invalid(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "request ID is already bound to a different request payload",
+                ));
+            }
+            let mut existing = state
+                .tasks
+                .get(&Self::task_key(&task.tenant_id, &canonical_task_id))
+                .cloned()
+                .ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::InvalidState,
+                        "task request identity points to a missing canonical task",
+                    )
+                })?;
+            // A request id is transport-scoped, but its digest deliberately excludes the
+            // execution identity. Do not let an identical payload submitted to another action
+            // resolve to the first action's canonical task.
+            if existing.intent_kind != task.intent_kind
+                || existing.purpose != task.purpose
+                || existing.primary_resource != task.primary_resource
+                || existing.execution_id != task.execution_id
+                || existing.execution_key_digest != task.execution_key_digest
+            {
+                return Err(invalid(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "request ID is already bound to a different operation identity",
+                ));
+            }
+            existing.request_replayed = true;
+            existing.execution_reused = existing.request_id != task.request_id;
+            return Ok(TaskInsertOutcome::Existing(existing));
+        }
         if let Some(existing) = state.tasks.get(&key) {
             if existing.request_digest != task.request_digest
                 || existing.request_id != task.request_id
-                || existing.task_kind != task.task_kind
+                || existing.intent_kind != task.intent_kind
             {
                 return Err(invalid(
                     CentralErrorCode::ConcurrentUpdate,
                     "operation task identity is already bound to a different request",
                 ));
             }
-            return Ok(TaskInsertOutcome::Existing(existing.clone()));
+            let mut existing = existing.clone();
+            existing.request_replayed = true;
+            return Ok(TaskInsertOutcome::Existing(existing));
+        }
+        if let Some(existing) = state.tasks.values().find(|existing| {
+            existing.tenant_id == task.tenant_id
+                && existing.execution_id == task.execution_id
+                && existing.intent_kind == task.intent_kind
+                && existing.purpose == task.purpose
+                && existing.primary_resource == task.primary_resource
+                && existing.execution_key_digest == task.execution_key_digest
+        }) {
+            let mut reused = existing.clone();
+            reused.execution_reused = true;
+            reused.request_replayed = false;
+            let canonical_task_id = existing.task_id.clone();
+            state
+                .task_request_identities
+                .insert(request_key, (task.request_digest, canonical_task_id));
+            return Ok(TaskInsertOutcome::Existing(reused));
         }
         if state.tasks.values().any(|existing| {
             existing.tenant_id == task.tenant_id && existing.request_id == task.request_id
@@ -390,17 +620,6 @@ impl TaskRepository for InMemoryTaskRepository {
                 "request ID is already bound to another operation task",
             ));
         }
-        if let Some(parent) = &task.parent_task_id {
-            if !state
-                .tasks
-                .contains_key(&(task.tenant_id.clone(), parent.clone()))
-            {
-                return Err(invalid(
-                    CentralErrorCode::ResourceNotFound,
-                    "parent operation task does not exist",
-                ));
-            }
-        }
         if let Some(event) = &event {
             if event.sequence.get() != 1 {
                 return Err(invalid(
@@ -409,22 +628,167 @@ impl TaskRepository for InMemoryTaskRepository {
                 ));
             }
         }
-        state.tasks.insert(key.clone(), task.clone());
-        if let Some(parent_task_id) = &task.parent_task_id {
-            state.relations.insert(
-                key.clone(),
-                vec![TaskRelation {
-                    task_id: task.task_id.clone(),
-                    related_task_id: parent_task_id.clone(),
-                    relation: neoengram_domain::protocol::TaskRelationKind::Parent,
-                }],
-            );
+        let stages = if task.stages.is_empty() {
+            TaskStage::plan_for_intent(
+                task.task_id.clone(),
+                task.intent_kind,
+                task.created_at_unix_ms,
+            )
+        } else {
+            task.stages.clone()
+        };
+        neoengram_domain::protocol::validate_task_stages(&stages).map_err(CentralError::from)?;
+        let mut stored_task = task.clone();
+        stored_task.stages = stages.clone();
+        state.tasks.insert(key.clone(), stored_task);
+        state
+            .task_request_identities
+            .insert(request_key, (task.request_digest, task.task_id.clone()));
+        state.stages.insert(key.clone(), stages);
+        if !task.resource_links.is_empty() {
+            state.links.insert(key.clone(), task.resource_links.clone());
         }
         if let Some(attempt) = attempt {
             state.attempts.insert(key.clone(), vec![attempt]);
         }
         if let Some(event) = event {
             state.events.insert(key, vec![event]);
+        }
+        Ok(TaskInsertOutcome::Inserted(task))
+    }
+
+    /// Inserts a task and a caller-supplied execution DAG while holding the same in-memory lock.
+    /// This mirrors the SQLite transaction boundary and prevents a scheduler from observing a
+    /// task before all of its stages have been installed.
+    async fn insert_with_history_and_stages(
+        &self,
+        task: OperationTask,
+        attempt: Option<TaskAttempt>,
+        event: Option<TaskEvent>,
+        stages: Vec<TaskStage>,
+    ) -> CentralResult<TaskInsertOutcome> {
+        task.validate().map_err(CentralError::from)?;
+        neoengram_domain::protocol::validate_task_stages(&stages).map_err(CentralError::from)?;
+        if stages.iter().any(|stage| stage.task_id != task.task_id) {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "initial task stages do not match task identity",
+            ));
+        }
+        if let Some(value) = &attempt {
+            value.validate().map_err(CentralError::from)?;
+            if value.task_id != task.task_id || value.attempt != task.attempt {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "initial task attempt does not match task identity",
+                ));
+            }
+        }
+        if let Some(value) = &event {
+            value.validate().map_err(CentralError::from)?;
+            if value.task_id != task.task_id
+                || value.attempt != task.attempt
+                || value.sequence.get() != 1
+            {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "initial task event does not match task identity",
+                ));
+            }
+        }
+        let mut state = lock(&self.state)?;
+        let key = Self::task_key(&task.tenant_id, &task.task_id);
+        let request_key = (task.tenant_id.clone(), task.request_id.clone());
+        if let Some((stored_digest, canonical_task_id)) =
+            state.task_request_identities.get(&request_key).cloned()
+        {
+            if stored_digest != task.request_digest {
+                return Err(invalid(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "request ID is already bound to a different request payload",
+                ));
+            }
+            let mut existing = state
+                .tasks
+                .get(&Self::task_key(&task.tenant_id, &canonical_task_id))
+                .cloned()
+                .ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::InvalidState,
+                        "task request identity points to a missing canonical task",
+                    )
+                })?;
+            // Keep request replay distinct from execution reuse: the alias may only replay the
+            // same intent, purpose, target, and execution digest that created it.
+            if existing.intent_kind != task.intent_kind
+                || existing.purpose != task.purpose
+                || existing.primary_resource != task.primary_resource
+                || existing.execution_id != task.execution_id
+                || existing.execution_key_digest != task.execution_key_digest
+            {
+                return Err(invalid(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "request ID is already bound to a different operation identity",
+                ));
+            }
+            existing.request_replayed = true;
+            existing.execution_reused = existing.request_id != task.request_id;
+            return Ok(TaskInsertOutcome::Existing(existing));
+        }
+        if let Some(existing) = state.tasks.get(&key) {
+            if existing.request_digest != task.request_digest
+                || existing.request_id != task.request_id
+                || existing.intent_kind != task.intent_kind
+            {
+                return Err(invalid(
+                    CentralErrorCode::ConcurrentUpdate,
+                    "operation task identity is already bound to a different request",
+                ));
+            }
+            let mut existing = existing.clone();
+            existing.request_replayed = true;
+            return Ok(TaskInsertOutcome::Existing(existing));
+        }
+        if let Some(existing) = state.tasks.values().find(|existing| {
+            existing.tenant_id == task.tenant_id
+                && existing.execution_id == task.execution_id
+                && existing.intent_kind == task.intent_kind
+                && existing.purpose == task.purpose
+                && existing.primary_resource == task.primary_resource
+                && existing.execution_key_digest == task.execution_key_digest
+        }) {
+            let mut reused = existing.clone();
+            reused.execution_reused = true;
+            reused.request_replayed = false;
+            let canonical_task_id = existing.task_id.clone();
+            state
+                .task_request_identities
+                .insert(request_key, (task.request_digest, canonical_task_id));
+            return Ok(TaskInsertOutcome::Existing(reused));
+        }
+        if state.tasks.values().any(|existing| {
+            existing.tenant_id == task.tenant_id && existing.request_id == task.request_id
+        }) {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "request ID is already bound to another operation task",
+            ));
+        }
+        let mut stored_task = task.clone();
+        stored_task.stages = stages.clone();
+        state.tasks.insert(key.clone(), stored_task);
+        state
+            .task_request_identities
+            .insert(request_key, (task.request_digest, task.task_id.clone()));
+        state.stages.insert(key.clone(), stages);
+        if !task.resource_links.is_empty() {
+            state.links.insert(key.clone(), task.resource_links.clone());
+        }
+        if let Some(value) = attempt {
+            state.attempts.insert(key.clone(), vec![value]);
+        }
+        if let Some(value) = event {
+            state.events.insert(key, vec![value]);
         }
         Ok(TaskInsertOutcome::Inserted(task))
     }
@@ -437,7 +801,7 @@ impl TaskRepository for InMemoryTaskRepository {
         task.validate().map_err(CentralError::from)?;
         let mut state = lock(&self.state)?;
         let key = Self::task_key(&task.tenant_id, &task.task_id);
-        let current = state.tasks.get(&key).ok_or_else(|| {
+        let current = state.tasks.get(&key).cloned().ok_or_else(|| {
             invalid(
                 CentralErrorCode::ResourceNotFound,
                 "operation task not found",
@@ -486,10 +850,62 @@ impl TaskRepository for InMemoryTaskRepository {
                 "operation task resource version changed",
             ));
         }
+        if next == TaskState::Succeeded {
+            let stages = state.stages.get(&key).ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::InvalidState,
+                    "operation task has no stage plan",
+                )
+            })?;
+            if stages.is_empty() || stages.iter().any(|stage| !stage.state.is_success()) {
+                return Err(invalid(
+                    CentralErrorCode::InvalidState,
+                    "operation task cannot succeed before all required stages complete",
+                ));
+            }
+        }
         if current.state == next {
+            if current.issue == issue {
+                return Ok(TaskMutationOutcome {
+                    task: current,
+                    replayed: true,
+                });
+            }
+            // Repeated stall/failure observations may refine the diagnosis without changing the
+            // coarse state. Keep the current Attempt in lockstep with the root task while using
+            // the same optimistic resource-version fence as a normal transition.
+            let mut task = current.clone();
+            task.issue = issue;
+            task.updated_at_unix_ms = UnixMillis::new(now.get().max(task.updated_at_unix_ms.get()));
+            task.resource_version =
+                ResourceVersion::new(task.resource_version.get().saturating_add(1));
+            task.stages = state.stages.get(&key).cloned().unwrap_or_default();
+            let attempts = state.attempts.get_mut(&key).ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::InvalidState,
+                    "operation task has no current attempt",
+                )
+            })?;
+            let attempt = attempts
+                .iter_mut()
+                .find(|attempt| attempt.attempt == task.attempt)
+                .ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::InvalidState,
+                        "operation task current attempt is missing",
+                    )
+                })?;
+            attempt.issue = task.issue.clone();
+            attempt.updated_at_unix_ms =
+                UnixMillis::new(now.get().max(attempt.updated_at_unix_ms.get()));
+            attempt.resource_version =
+                ResourceVersion::new(attempt.resource_version.get().saturating_add(1));
+            task.validate().map_err(CentralError::from)?;
+            attempt.validate().map_err(CentralError::from)?;
+            state.tasks.insert(key, task.clone());
             return Ok(TaskMutationOutcome {
-                task: current,
-                replayed: true,
+                task,
+                replayed: false,
             });
         }
 
@@ -498,6 +914,10 @@ impl TaskRepository for InMemoryTaskRepository {
             task.issue = Some(issue);
         }
         task.transition_to(next, now).map_err(CentralError::from)?;
+        // `OperationTask.stages` is a non-wire read projection. Keep it synchronized with the
+        // authoritative stage map before validating a terminal root task; otherwise a successful
+        // stage transition can be hidden by the initial pending projection retained in `tasks`.
+        task.stages = state.stages.get(&key).cloned().unwrap_or_default();
         let attempts = state.attempts.get(&key).ok_or_else(|| {
             invalid(
                 CentralErrorCode::InvalidState,
@@ -537,7 +957,7 @@ impl TaskRepository for InMemoryTaskRepository {
         );
         event.message = message;
         event.issue = task.issue.clone();
-        event.progress = Some(task.progress_summary);
+        event.progress = Some(task.progress);
         task.validate().map_err(CentralError::from)?;
         attempt.validate().map_err(CentralError::from)?;
         event.validate().map_err(CentralError::from)?;
@@ -755,7 +1175,7 @@ impl TaskRepository for InMemoryTaskRepository {
                 .to_ascii_lowercase(),
             ),
             issue: task.issue,
-            progress: Some(task.progress_summary),
+            progress: Some(task.progress),
             occurred_at_unix_ms: task.updated_at_unix_ms,
             resource_version: task.resource_version,
         };
@@ -841,7 +1261,7 @@ impl TaskRepository for InMemoryTaskRepository {
     ) -> CentralResult<TaskMutationOutcome> {
         let mut state = lock(&self.state)?;
         let key = Self::task_key(tenant_id, task_id);
-        let current = state.tasks.get(&key).ok_or_else(|| {
+        let current = state.tasks.get(&key).cloned().ok_or_else(|| {
             invalid(
                 CentralErrorCode::ResourceNotFound,
                 "operation task not found",
@@ -855,6 +1275,23 @@ impl TaskRepository for InMemoryTaskRepository {
         }
         let mut task = current.clone();
         task.retry(now).map_err(CentralError::from)?;
+        let mut previous_stages = Vec::new();
+        let stages = state.stages.get_mut(&key).ok_or_else(|| {
+            invalid(
+                CentralErrorCode::InvalidState,
+                "operation task has no stage plan",
+            )
+        })?;
+        for stage in stages.iter_mut() {
+            previous_stages.push(stage.clone());
+            stage.reset_for_retry(now).map_err(CentralError::from)?;
+        }
+        task.stages = stages.clone();
+        state
+            .stage_history
+            .entry(key.clone())
+            .or_default()
+            .extend(previous_stages);
         let attempt_id = TaskAttemptId::new(format!("{}-attempt-{}", task.task_id, task.attempt))
             .map_err(CentralError::from)?;
         let new_attempt = TaskAttempt::new(task.task_id.clone(), attempt_id, task.attempt, now);
@@ -876,7 +1313,7 @@ impl TaskRepository for InMemoryTaskRepository {
             actor,
             message: None,
             issue: None,
-            progress: Some(task.progress_summary),
+            progress: Some(task.progress),
             occurred_at_unix_ms: now,
             resource_version: task.resource_version,
         };
@@ -905,7 +1342,7 @@ impl TaskRepository for InMemoryTaskRepository {
     ) -> CentralResult<TaskMutationOutcome> {
         let mut state = lock(&self.state)?;
         let key = Self::task_key(tenant_id, task_id);
-        let current = state.tasks.get(&key).ok_or_else(|| {
+        let current = state.tasks.get(&key).cloned().ok_or_else(|| {
             invalid(
                 CentralErrorCode::ResourceNotFound,
                 "operation task not found",
@@ -919,14 +1356,31 @@ impl TaskRepository for InMemoryTaskRepository {
                 ));
             }
         }
-        if current.state == TaskState::Cancelled {
+        if matches!(current.state, TaskState::Cancelling | TaskState::Cancelled) {
             return Ok(TaskMutationOutcome {
-                task: current.clone(),
+                task: current,
                 replayed: true,
             });
         }
         let mut task = current.clone();
         task.cancel(now).map_err(CentralError::from)?;
+        let mut previous_stages = Vec::new();
+        if let Some(stages) = state.stages.get_mut(&key) {
+            for stage in stages.iter_mut() {
+                if !stage.state.is_terminal() {
+                    previous_stages.push(stage.clone());
+                    stage
+                        .transition_to(neoengram_domain::protocol::StageState::Cancelling, now)
+                        .map_err(CentralError::from)?;
+                }
+            }
+            task.stages = stages.clone();
+        }
+        state
+            .stage_history
+            .entry(key.clone())
+            .or_default()
+            .extend(previous_stages);
         let attempts = state.attempts.get(&key).ok_or_else(|| {
             invalid(
                 CentralErrorCode::InvalidState,
@@ -943,8 +1397,10 @@ impl TaskRepository for InMemoryTaskRepository {
                 )
             })?;
         let mut attempt = attempts[attempt_index].clone();
+        // Cancellation is a two-step convergence protocol. The current attempt remains fenced
+        // as cancelling until Agent leases and in-flight disk work have drained.
         attempt
-            .transition_to(TaskState::Cancelled, now)
+            .transition_to(TaskState::Cancelling, now)
             .map_err(CentralError::from)?;
         let sequence = state
             .events
@@ -957,20 +1413,145 @@ impl TaskRepository for InMemoryTaskRepository {
             task_id: task.task_id.clone(),
             sequence: SequenceNumber::new(sequence),
             attempt: task.attempt,
-            kind: TaskEventKind::Cancelled,
+            kind: TaskEventKind::CancelRequested,
             state: task.state,
             from_state: Some(current.state),
             to_state: Some(task.state),
             actor,
             message: None,
             issue: None,
-            progress: Some(task.progress_summary),
+            progress: Some(task.progress),
             occurred_at_unix_ms: now,
             resource_version: task.resource_version,
         };
         task.validate().map_err(CentralError::from)?;
         attempt.validate().map_err(CentralError::from)?;
         event.validate().map_err(CentralError::from)?;
+        state.tasks.insert(key.clone(), task.clone());
+        state
+            .attempts
+            .get_mut(&key)
+            .expect("attempt collection was validated above")[attempt_index] = attempt;
+        state.events.entry(key).or_default().push(event);
+        Ok(TaskMutationOutcome {
+            task,
+            replayed: false,
+        })
+    }
+
+    async fn complete_cancellation(
+        &self,
+        tenant_id: &TenantId,
+        task_id: &TaskId,
+        expected_resource_version: ResourceVersion,
+        actor: TaskActor,
+        now: UnixMillis,
+    ) -> CentralResult<TaskMutationOutcome> {
+        let mut state = lock(&self.state)?;
+        let key = Self::task_key(tenant_id, task_id);
+        let current = state.tasks.get(&key).cloned().ok_or_else(|| {
+            invalid(
+                CentralErrorCode::ResourceNotFound,
+                "operation task not found",
+            )
+        })?;
+        if current.resource_version != expected_resource_version {
+            return Err(invalid(
+                CentralErrorCode::ConcurrentUpdate,
+                "operation task resource version changed",
+            ));
+        }
+        if current.state != TaskState::Cancelling {
+            return Err(invalid(
+                CentralErrorCode::InvalidState,
+                "operation task must be cancelling before cancellation can complete",
+            ));
+        }
+
+        // The convergence fence is one in-memory critical section: no reader can observe a
+        // cancelled root while one of its stages or the current Attempt is still cancelling.
+        let (stages_snapshot, previous_stages) = {
+            let stages = state.stages.get_mut(&key).ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::InvalidState,
+                    "operation task has no stage plan",
+                )
+            })?;
+            let mut previous_stages = Vec::new();
+            for stage in stages.iter_mut() {
+                if stage.state.is_terminal() {
+                    continue;
+                }
+                previous_stages.push(stage.clone());
+                if stage.state != neoengram_domain::protocol::StageState::Cancelling {
+                    stage
+                        .transition_to(neoengram_domain::protocol::StageState::Cancelling, now)
+                        .map_err(CentralError::from)?;
+                }
+                stage
+                    .transition_to(neoengram_domain::protocol::StageState::Cancelled, now)
+                    .map_err(CentralError::from)?;
+            }
+            (stages.clone(), previous_stages)
+        };
+        state
+            .stage_history
+            .entry(key.clone())
+            .or_default()
+            .extend(previous_stages);
+
+        let (attempt_index, mut attempt) = {
+            let attempts = state.attempts.get(&key).ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::InvalidState,
+                    "operation task has no current attempt",
+                )
+            })?;
+            let attempt_index = attempts
+                .iter()
+                .position(|attempt| attempt.attempt == current.attempt)
+                .ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::InvalidState,
+                        "operation task current attempt is missing",
+                    )
+                })?;
+            (attempt_index, attempts[attempt_index].clone())
+        };
+        attempt
+            .transition_to(TaskState::Cancelled, now)
+            .map_err(CentralError::from)?;
+
+        let mut task = current.clone();
+        task.complete_cancellation(now)
+            .map_err(CentralError::from)?;
+        task.stages = stages_snapshot;
+        let sequence = state
+            .events
+            .get(&key)
+            .and_then(|events| events.last())
+            .map_or(1, |event| event.sequence.get().saturating_add(1));
+        let event = TaskEvent {
+            event_id: TaskEventId::new(format!("{}-event-{sequence}", task.task_id))
+                .map_err(CentralError::from)?,
+            task_id: task.task_id.clone(),
+            sequence: SequenceNumber::new(sequence),
+            attempt: task.attempt,
+            kind: TaskEventKind::Cancelled,
+            state: TaskState::Cancelled,
+            from_state: Some(current.state),
+            to_state: Some(TaskState::Cancelled),
+            actor,
+            message: Some("cancellation convergence completed".to_owned()),
+            issue: None,
+            progress: Some(task.progress),
+            occurred_at_unix_ms: now,
+            resource_version: task.resource_version,
+        };
+        task.validate().map_err(CentralError::from)?;
+        attempt.validate().map_err(CentralError::from)?;
+        event.validate().map_err(CentralError::from)?;
+
         state.tasks.insert(key.clone(), task.clone());
         state
             .attempts
@@ -1002,9 +1583,9 @@ fn task_matches_request(task: &OperationTask, request: &TaskListRequest) -> bool
             .commit_id
             .is_none_or(|value| task.commit_id == Some(value))
         && request
-            .playground_id
+            .workspace_id
             .as_ref()
-            .is_none_or(|value| task.playground_id.as_ref() == Some(value))
+            .is_none_or(|value| task.workspace_id.as_ref() == Some(value))
         && request
             .snapshot_id
             .as_ref()
@@ -1013,12 +1594,11 @@ fn task_matches_request(task: &OperationTask, request: &TaskListRequest) -> bool
             .storage_volume_id
             .as_ref()
             .is_none_or(|value| task.storage_volume_id.as_ref() == Some(value))
-        && (request.task_kinds.is_empty() || request.task_kinds.contains(&task.task_kind))
-        && (request.states.is_empty() || request.states.contains(&task.state))
+        && (request.intent_kinds.is_empty() || request.intent_kinds.contains(&task.intent_kind))
         && request
-            .parent_task_id
-            .as_ref()
-            .is_none_or(|value| task.parent_task_id.as_ref() == Some(value))
+            .purpose
+            .is_none_or(|value| task.purpose == Some(value))
+        && (request.states.is_empty() || request.states.contains(&task.state))
         && request
             .created_after_unix_ms
             .is_none_or(|value| task.created_at_unix_ms >= value)
@@ -1068,7 +1648,7 @@ pub struct InMemoryPlacementRepository {
     replication_requests: Mutex<BTreeMap<(TenantId, RequestId), ReplicationId>>,
     replication_retry_mutations:
         Mutex<BTreeMap<(TenantId, RequestId), (RetryReplicationRequest, ReplicationRecord)>>,
-    workspaces: Mutex<BTreeMap<(TenantId, WorkspaceId), WorkspaceRecord>>,
+    workspaces: Mutex<BTreeMap<(TenantId, WorkspaceId), PlacementWorkspaceRecord>>,
     workspace_requests: Mutex<BTreeMap<(TenantId, RequestId), WorkspaceId>>,
     materialization_placements: Mutex<MaterializationPlacementMap>,
     volume_commit_coverages: Mutex<VolumeCoverageMap>,
@@ -4602,7 +5182,7 @@ impl PlacementRepository for InMemoryPlacementRepository {
         &self,
         tenant_id: &TenantId,
         workspace_id: &WorkspaceId,
-    ) -> CentralResult<Option<WorkspaceRecord>> {
+    ) -> CentralResult<Option<PlacementWorkspaceRecord>> {
         Ok(lock(&self.workspaces)?
             .get(&(tenant_id.clone(), workspace_id.clone()))
             .cloned())
@@ -4612,7 +5192,7 @@ impl PlacementRepository for InMemoryPlacementRepository {
         &self,
         tenant_id: &TenantId,
         request_id: &RequestId,
-    ) -> CentralResult<Option<WorkspaceRecord>> {
+    ) -> CentralResult<Option<PlacementWorkspaceRecord>> {
         let Some(workspace_id) = lock(&self.workspace_requests)?
             .get(&(tenant_id.clone(), request_id.clone()))
             .cloned()
@@ -4622,7 +5202,10 @@ impl PlacementRepository for InMemoryPlacementRepository {
         self.get_workspace(tenant_id, &workspace_id).await
     }
 
-    async fn insert_workspace(&self, record: WorkspaceRecord) -> CentralResult<WorkspaceRecord> {
+    async fn insert_workspace(
+        &self,
+        record: PlacementWorkspaceRecord,
+    ) -> CentralResult<PlacementWorkspaceRecord> {
         let key = (record.tenant_id.clone(), record.workspace_id.clone());
         let request_key = (record.tenant_id.clone(), record.request_id.clone());
         let mut records = lock(&self.workspaces)?;
@@ -4889,21 +5472,21 @@ impl PreCommitRepository for InMemoryPreCommitRepository {
         tenant_id: &TenantId,
         project_id: &neoengram_domain::protocol::ProjectId,
         artifact_id: &ArtifactId,
-        playground_id: &neoengram_domain::protocol::PlaygroundId,
+        workspace_id: &neoengram_domain::protocol::WorkspaceId,
     ) -> CentralResult<Option<PreCommitRecord>> {
         let state = lock(&self.state)?;
         let mut matches = state.precommits.values().filter(|record| {
             &record.tenant_id == tenant_id
                 && &record.project_id == project_id
                 && &record.artifact_id == artifact_id
-                && &record.playground_id == playground_id
+                && &record.workspace_id == workspace_id
                 && precommit_is_active(record)
         });
         let result = matches.next().cloned();
         if matches.next().is_some() {
             return Err(crate::CentralError::new(
                 CentralErrorCode::Internal,
-                "more than one active Pre-commit exists for a Playground",
+                "more than one active Pre-commit exists for a Workspace",
             ));
         }
         Ok(result)
@@ -5233,7 +5816,7 @@ fn ensure_active_available(
             && stored.tenant_id == candidate.tenant_id
             && stored.project_id == candidate.project_id
             && stored.artifact_id == candidate.artifact_id
-            && stored.playground_id == candidate.playground_id
+            && stored.workspace_id == candidate.workspace_id
             && precommit_is_active(stored)
     }) {
         return Err(precommit_request_conflict());
@@ -5752,8 +6335,8 @@ impl IndexPublisher for InMemoryIndexPublisher {
             return Err(invalid(
                 CentralErrorCode::ConcurrentUpdate,
                 format!(
-                    "Index for Playground {} is already initialized with a different snapshot",
-                    request.index_key.playground_id
+                    "Index for Workspace {} is already initialized with a different snapshot",
+                    request.index_key.workspace_id
                 ),
             ));
         }
@@ -6017,6 +6600,7 @@ pub struct InMemoryAuthorityLifecycle {
     objects: Arc<InMemoryObjectCatalog>,
     publisher: Arc<InMemoryIndexPublisher>,
     precommits: Arc<InMemoryPreCommitRepository>,
+    control_catalog: Option<Arc<crate::InMemoryControlCatalog>>,
     records: Mutex<BTreeMap<AuthorityLifecycleKey, AuthorityLifecycleRecord>>,
 }
 
@@ -6037,8 +6621,17 @@ impl InMemoryAuthorityLifecycle {
             objects,
             publisher,
             precommits,
+            control_catalog: None,
             records: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Associates the lifecycle boundary with the catalog used by the in-memory composition.
+    /// Keeping this as a builder preserves the focused constructor used by lower-level tests.
+    #[must_use]
+    pub fn with_control_catalog(mut self, catalog: Arc<crate::InMemoryControlCatalog>) -> Self {
+        self.control_catalog = Some(catalog);
+        self
     }
 
     fn apply(
@@ -6220,12 +6813,59 @@ impl InMemoryAuthorityLifecycle {
                     || !matching_job_ids.contains(&job_key.job_id)
             });
 
+        let project_artifact_ids = match &request.target {
+            ResourceRef::Project { project_id } => self
+                .control_catalog
+                .as_ref()
+                .map(|catalog| catalog.artifact_ids_for_project(&request.tenant_id, project_id))
+                .transpose()?
+                .unwrap_or_default(),
+            _ => BTreeSet::new(),
+        };
+
         match &request.target {
+            ResourceRef::Project { project_id } => {
+                let mut state = lock(&self.precommits.state)?;
+                let removed = state
+                    .precommits
+                    .iter()
+                    .filter(|(_, record)| {
+                        record.tenant_id == request.tenant_id
+                            && &record.project_id == project_id
+                            && record.state != PreCommitState::Committed
+                    })
+                    .map(|(key, _)| key.clone())
+                    .collect::<BTreeSet<_>>();
+                state.precommits.retain(|key, _| !removed.contains(key));
+                state.mutations.retain(|_, mutation| {
+                    !authority_mutation_matches_precommits(mutation, &removed)
+                });
+                state
+                    .commits
+                    .retain(|(tenant_id, commit_project_id, _, _), _| {
+                        tenant_id != &request.tenant_id || commit_project_id != project_id
+                    });
+                let mut publisher = lock(&self.publisher.state)?;
+                publisher.indexes.retain(|key, _| {
+                    key.tenant_id != request.tenant_id || &key.project_id != project_id
+                });
+                publisher
+                    .manifests
+                    .retain(|(tenant_id, _, _), _| tenant_id != &request.tenant_id);
+                publisher.publications.retain(|_, (publication, _)| {
+                    publication.index_key.tenant_id != request.tenant_id
+                        || &publication.index_key.project_id != project_id
+                });
+                lock(&self.objects.placements)?.retain(|_, evidence| {
+                    evidence.receipt.tenant_id != request.tenant_id
+                        || !project_artifact_ids.contains(&evidence.receipt.artifact_id)
+                });
+            }
             ResourceRef::Snapshot { .. } => {}
-            ResourceRef::Playground {
+            ResourceRef::Workspace {
                 project_id,
                 artifact_id,
-                playground_id,
+                workspace_id,
             } => {
                 let mut state = lock(&self.precommits.state)?;
                 let removed = state
@@ -6235,7 +6875,7 @@ impl InMemoryAuthorityLifecycle {
                         record.tenant_id == request.tenant_id
                             && &record.project_id == project_id
                             && &record.artifact_id == artifact_id
-                            && &record.playground_id == playground_id
+                            && &record.workspace_id == workspace_id
                             && record.state != PreCommitState::Committed
                     })
                     .map(|(key, _)| key.clone())
@@ -6248,7 +6888,7 @@ impl InMemoryAuthorityLifecycle {
                     tenant_id: request.tenant_id.clone(),
                     project_id: project_id.clone(),
                     artifact_id: artifact_id.clone(),
-                    playground_id: playground_id.clone(),
+                    workspace_id: workspace_id.clone(),
                 });
             }
             ResourceRef::Artifact {
@@ -6325,6 +6965,15 @@ impl AuthorityLifecycleRepository for InMemoryAuthorityLifecycle {
                     && !job.state.is_terminal()
             })
             .count();
+        let project_artifact_ids = match target {
+            ResourceRef::Project { project_id } => self
+                .control_catalog
+                .as_ref()
+                .map(|catalog| catalog.artifact_ids_for_project(tenant_id, project_id))
+                .transpose()?
+                .unwrap_or_default(),
+            _ => BTreeSet::new(),
+        };
         let placements = lock(&self.objects.placements)?;
         let mut objects = BTreeSet::<Vec<u8>>::new();
         let mut bytes = 0_u64;
@@ -6334,11 +6983,12 @@ impl AuthorityLifecycleRepository for InMemoryAuthorityLifecycle {
                 return false;
             }
             match target {
+                ResourceRef::Project { .. } => project_artifact_ids.contains(&receipt.artifact_id),
                 ResourceRef::StorageVolume { storage_volume_id } => {
                     &receipt.storage_volume_id == storage_volume_id
                 }
                 ResourceRef::Artifact { artifact_id, .. } => &receipt.artifact_id == artifact_id,
-                ResourceRef::Playground { .. } | ResourceRef::Snapshot { .. } => false,
+                ResourceRef::Workspace { .. } | ResourceRef::Snapshot { .. } => false,
             }
         }) {
             if objects.insert(evidence.receipt.object_id.as_bytes().to_vec()) {
@@ -6408,16 +7058,17 @@ fn authority_lifecycle_key(
 
 fn authority_target_id(target: &ResourceRef) -> String {
     match target {
+        ResourceRef::Project { project_id } => project_id.to_string(),
         ResourceRef::StorageVolume { storage_volume_id } => storage_volume_id.to_string(),
         ResourceRef::Artifact {
             project_id,
             artifact_id,
         } => format!("{project_id}/{artifact_id}"),
-        ResourceRef::Playground {
+        ResourceRef::Workspace {
             project_id,
             artifact_id,
-            playground_id,
-        } => format!("{project_id}/{artifact_id}/{playground_id}"),
+            workspace_id,
+        } => format!("{project_id}/{artifact_id}/{workspace_id}"),
         ResourceRef::Snapshot { snapshot_id } => snapshot_id.to_string(),
     }
 }
@@ -6431,23 +7082,24 @@ const fn authority_action_name(action: AuthorityLifecycleAction) -> &'static str
 
 fn authority_job_matches_target(job: &JobRecord, target: &ResourceRef) -> bool {
     match target {
+        ResourceRef::Project { project_id } => &job.spec.project_id == project_id,
         ResourceRef::Artifact {
             project_id,
             artifact_id,
         } => &job.spec.project_id == project_id && &job.spec.artifact_id == artifact_id,
-        ResourceRef::Playground {
+        ResourceRef::Workspace {
             project_id,
             artifact_id,
-            playground_id,
+            workspace_id,
         } => {
             &job.spec.project_id == project_id
                 && &job.spec.artifact_id == artifact_id
                 && match job.operation {
-                    JobOperation::Add => &job.spec.playground_id == playground_id,
+                    JobOperation::Add => &job.spec.workspace_id == workspace_id,
                     JobOperation::WorkspaceMaterialize => job
                         .workspace_spec
                         .as_ref()
-                        .is_some_and(|spec| &spec.playground_id == playground_id),
+                        .is_some_and(|spec| &spec.workspace_id == workspace_id),
                     JobOperation::SnapshotDelivery => false,
                 }
         }
@@ -6473,18 +7125,19 @@ fn authority_job_matches_target(job: &JobRecord, target: &ResourceRef) -> bool {
 
 fn authority_precommit_matches_target(record: &PreCommitRecord, target: &ResourceRef) -> bool {
     match target {
+        ResourceRef::Project { project_id } => &record.project_id == project_id,
         ResourceRef::Artifact {
             project_id,
             artifact_id,
         } => &record.project_id == project_id && &record.artifact_id == artifact_id,
-        ResourceRef::Playground {
+        ResourceRef::Workspace {
             project_id,
             artifact_id,
-            playground_id,
+            workspace_id,
         } => {
             &record.project_id == project_id
                 && &record.artifact_id == artifact_id
-                && &record.playground_id == playground_id
+                && &record.workspace_id == workspace_id
         }
         ResourceRef::StorageVolume { .. } | ResourceRef::Snapshot { .. } => false,
     }
@@ -6665,14 +7318,18 @@ impl InMemoryComponents {
         let objects = Arc::new(InMemoryObjectCatalog::default());
         let publisher = Arc::new(InMemoryIndexPublisher::default());
         let precommits = Arc::new(InMemoryPreCommitRepository::default());
-        let authority_lifecycle = Arc::new(InMemoryAuthorityLifecycle::new(
-            jobs.clone(),
-            outbox.clone(),
-            metadata.clone(),
-            objects.clone(),
-            publisher.clone(),
-            precommits.clone(),
-        ));
+        let control_catalog = Arc::new(crate::InMemoryControlCatalog::default());
+        let authority_lifecycle = Arc::new(
+            InMemoryAuthorityLifecycle::new(
+                jobs.clone(),
+                outbox.clone(),
+                metadata.clone(),
+                objects.clone(),
+                publisher.clone(),
+                precommits.clone(),
+            )
+            .with_control_catalog(control_catalog.clone()),
+        );
         let placement = Arc::new(InMemoryPlacementRepository::default());
         Self {
             authorizer: Arc::new(AllowAllAuthorizer),
@@ -6687,7 +7344,7 @@ impl InMemoryComponents {
             authority_lifecycle,
             agent_registry,
             gateway_registry,
-            control_catalog: Arc::new(crate::InMemoryControlCatalog::default()),
+            control_catalog,
             placement,
             clock: Arc::new(InMemoryClock::new(now_ms)),
         }
@@ -6700,11 +7357,20 @@ impl InMemoryComponents {
             self.authority_store(),
             self.clock.clone(),
         )
-        .with_task_coordinator(Arc::new(crate::service::TaskCoordinator::new(
-            self.tasks.clone(),
-            self.clock.clone(),
-        )))
         .with_placement_repository(self.placement.clone())
+    }
+
+    /// Builds the fully-wired in-memory composition used by tests that exercise the v2 task
+    /// projection and Agent execution fences. The default `control_plane` intentionally remains
+    /// a focused Job-only composition so lower-level data-plane tests can construct a Job without
+    /// also having to publish a user-facing root task.
+    #[must_use]
+    pub fn control_plane_with_tasks(&self) -> ControlPlane {
+        self.control_plane()
+            .with_task_coordinator(Arc::new(crate::service::TaskCoordinator::new(
+                self.tasks.clone(),
+                self.clock.clone(),
+            )))
     }
 
     #[must_use]

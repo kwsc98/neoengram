@@ -16,7 +16,7 @@ use neoengram_domain::protocol::{
     ArtifactId, BackendId, CommitPlacementSet, DecimalU64, EdgeClusterId, GatewayPoolId,
     Generation, MaterializationId, MountGeneration, ObjectNamespaceId, PlacementGeneration,
     PlacementId, PlacementSetId, PlacementState, ProjectId, ReplicationId, ReplicationState,
-    RequestId, RouteGeneration, SessionGeneration, StorageVolumeId, TaskKind, TaskResourceKind,
+    RequestId, RouteGeneration, SessionGeneration, StorageVolumeId, TaskIntent, TaskResourceKind,
     TaskResourceRole, TaskScope, TaskState, TenantId, TransferEndpoint, TransferId,
     TransferRouteId, TransferTicket, UnixMillis, WorkspaceId, WorkspaceLifecycle,
 };
@@ -28,10 +28,11 @@ use crate::{
         CancelCommitReplicationRequest, CancelCommitReplicationResponse, CommitAvailabilityV2View,
         CommitAvailabilityView, CommitPlacementView, CreateCommitMaterializationRequest,
         CreateCommitMaterializationResponse, CreateCommitReplicationRequest,
-        CreateCommitReplicationResponse, CreateWorkspaceRequest, CreateWorkspaceResponse,
-        MaterializationView, MissingObjectView, QueryCommitAvailabilityRequest,
-        QueryCommitAvailabilityResponse, QueryCommitAvailabilityV2Request,
-        QueryCommitAvailabilityV2Response, QueryCommitCoverageRequest, QueryCommitCoverageResponse,
+        CreateCommitReplicationResponse, CreateWorkspacePlacementRequest,
+        CreateWorkspacePlacementResponse, MaterializationView, MissingObjectView,
+        PlacementWorkspaceView, QueryCommitAvailabilityRequest, QueryCommitAvailabilityResponse,
+        QueryCommitAvailabilityV2Request, QueryCommitAvailabilityV2Response,
+        QueryCommitCoverageRequest, QueryCommitCoverageResponse,
         QueryCommitMaterializationListRequest, QueryCommitMaterializationListResponse,
         QueryCommitMaterializationRequest, QueryCommitMaterializationResponse,
         QueryCommitPlacementListRequest, QueryCommitPlacementListResponse,
@@ -40,7 +41,6 @@ use crate::{
         QueryCommitReplicationTicketRequest, QueryCommitReplicationTicketResponse, ReplicationView,
         RetryCommitMaterializationRequest, RetryCommitMaterializationResponse,
         RetryCommitReplicationRequest, RetryCommitReplicationResponse, VolumeCommitCoverageView,
-        WorkspaceView,
     },
     error::{application_error, invalid_request, map_central_error},
     identity::{AuthenticatedIdentity, Permission},
@@ -207,6 +207,7 @@ fn materialization_view(
         object_namespace_id: job.key.object_namespace_id.to_string(),
         commit_id: job.key.commit_id.to_string(),
         target_storage_volume_id: job.key.target_storage_volume_id.to_string(),
+        purpose: job.key.purpose,
         plan_revision: job.plan_revision.to_string(),
         coverage_goal: job.key.coverage_goal,
         state: materialization_state_name(job.state).to_owned(),
@@ -1215,7 +1216,8 @@ impl CatalogService {
                 materialization: self
                     .materialization_view_for_job(repository.as_ref(), &current)
                     .await?,
-                replayed: true,
+                request_replayed: true,
+                execution_reused: false,
             });
         }
         let next_revision = expected_plan_revision
@@ -1240,7 +1242,8 @@ impl CatalogService {
             materialization: self
                 .materialization_view_for_job(repository.as_ref(), &stored)
                 .await?,
-            replayed: false,
+            request_replayed: false,
+            execution_reused: false,
         })
     }
 
@@ -1687,7 +1690,8 @@ impl CatalogService {
             }
             return Ok(CreateCommitReplicationResponse {
                 replication: replication_view(&existing),
-                replayed: true,
+                request_replayed: true,
+                execution_reused: false,
             });
         }
         if placement_repository
@@ -1877,7 +1881,8 @@ impl CatalogService {
         let record = stored;
         Ok(CreateCommitReplicationResponse {
             replication: replication_view(&record),
-            replayed,
+            request_replayed: replayed,
+            execution_reused: false,
         })
     }
 
@@ -2006,7 +2011,8 @@ impl CatalogService {
             .map_err(map_central_error)?;
         Ok(RetryCommitReplicationResponse {
             replication: replication_view(&record.replication),
-            replayed: record.replayed,
+            request_replayed: record.replayed,
+            execution_reused: false,
         })
     }
 
@@ -2082,14 +2088,14 @@ impl CatalogService {
         })
     }
 
-    pub async fn create_workspace(
+    pub async fn create_workspace_placement(
         &self,
         identity: &AuthenticatedIdentity,
-        request: CreateWorkspaceRequest,
-    ) -> Result<CreateWorkspaceResponse, Error> {
+        request: CreateWorkspacePlacementRequest,
+    ) -> Result<CreateWorkspacePlacementResponse, Error> {
         let task_request = request.clone();
         let tenant_id = parse_tenant(request.tenant_id.clone())?;
-        self.require_tenant(identity, Permission::PlaygroundCreate, &tenant_id)
+        self.require_tenant(identity, Permission::WorkspaceCreate, &tenant_id)
             .await?;
         let project_id = ProjectId::new(request.project_id.clone())
             .map_err(|error| invalid_request(format!("project_id: {error}")))?;
@@ -2099,16 +2105,17 @@ impl CatalogService {
         let request_id = RequestId::new(request.request_id.clone())
             .map_err(|error| invalid_request(format!("request_id: {error}")))?;
         let workspace_id = workspace_id(&request.request_id)?;
-        let (mut task, _task_replayed) = self
+        let (mut task, task_replayed) = self
             .begin_operation_task(
-                TaskKind::WorkspaceCreate,
+                TaskIntent::WorkspaceCreate,
                 TaskScope {
                     tenant_id: tenant_id.clone(),
                     project_id: Some(project_id.clone()),
                     artifact_id: Some(artifact_id.clone()),
                     object_namespace_id: Some(ObjectNamespaceId::from_artifact(&artifact_id)),
                     commit_id: None,
-                    playground_id: None,
+                    workspace_id: None,
+
                     snapshot_id: None,
                     storage_volume_id: Some(target.clone()),
                 },
@@ -2121,7 +2128,7 @@ impl CatalogService {
             .await?;
         self.link_operation_resource(
             &task,
-            TaskResourceKind::Playground,
+            TaskResourceKind::Workspace,
             workspace_id.to_string(),
             TaskResourceRole::Primary,
         )
@@ -2152,8 +2159,8 @@ impl CatalogService {
             {
                 return Err(idempotency_conflict("workspace"));
             }
-            return Ok(CreateWorkspaceResponse {
-                workspace: WorkspaceView {
+            return Ok(CreateWorkspacePlacementResponse {
+                workspace: PlacementWorkspaceView {
                     workspace_id: existing.workspace_id.to_string(),
                     tenant_id: existing.tenant_id.to_string(),
                     project_id: existing.project_id.to_string(),
@@ -2162,7 +2169,8 @@ impl CatalogService {
                     target_storage_volume_id: existing.target_storage_volume_id.to_string(),
                     lifecycle: workspace_lifecycle_name(existing.lifecycle).to_owned(),
                 },
-                replayed: true,
+                request_replayed: true,
+                execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
                 task,
             });
         }
@@ -2211,7 +2219,7 @@ impl CatalogService {
             }
         }
         let now = self.clock.now();
-        let workspace = crate::WorkspaceRecord {
+        let workspace = crate::PlacementWorkspaceRecord {
             tenant_id: tenant_id.clone(),
             workspace_id: id,
             project_id: project_id.clone(),
@@ -2229,31 +2237,11 @@ impl CatalogService {
             .map_err(map_central_error)?;
         let replayed = stored != workspace;
         let workspace = stored;
-        let materialize_task = self
-            .begin_child_operation_task(
-                &task,
-                TaskKind::WorkspaceMaterialize,
-                TaskScope {
-                    tenant_id: tenant_id.clone(),
-                    project_id: Some(project_id.clone()),
-                    artifact_id: Some(artifact_id.clone()),
-                    object_namespace_id: Some(ObjectNamespaceId::from_artifact(&artifact_id)),
-                    commit_id: workspace.base_commit_id.map(CommitId::from_digest),
-                    playground_id: None,
-                    snapshot_id: None,
-                    storage_volume_id: Some(workspace.target_storage_volume_id.clone()),
-                },
-                RequestId::new(format!("{}-materialize", request.request_id))
-                    .map_err(|error| invalid_request(format!("task request_id: {error}")))?,
-                &task_request,
-                identity,
-                Some("workspace_materialization"),
-                Some(workspace.workspace_id.as_str()),
-            )
-            .await?;
+        // Workspace materialization is an internal stage of the root workspace.create task.
+        let materialize_task = task.clone();
         self.link_operation_resource(
             &materialize_task,
-            TaskResourceKind::Playground,
+            TaskResourceKind::Workspace,
             workspace.workspace_id.to_string(),
             TaskResourceRole::Target,
         )
@@ -2266,8 +2254,8 @@ impl CatalogService {
                 Some("workspace created; materialization pending".to_owned()),
             )
             .await?;
-        Ok(CreateWorkspaceResponse {
-            workspace: WorkspaceView {
+        Ok(CreateWorkspacePlacementResponse {
+            workspace: PlacementWorkspaceView {
                 workspace_id: workspace.workspace_id.to_string(),
                 tenant_id: workspace.tenant_id.to_string(),
                 project_id: workspace.project_id.to_string(),
@@ -2276,7 +2264,9 @@ impl CatalogService {
                 target_storage_volume_id: workspace.target_storage_volume_id.to_string(),
                 lifecycle: workspace_lifecycle_name(workspace.lifecycle).to_owned(),
             },
-            replayed,
+            request_replayed: (replayed || task_replayed)
+                && !task.as_ref().is_some_and(|value| value.execution_reused),
+            execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
             task,
         })
     }

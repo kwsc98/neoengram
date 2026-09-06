@@ -129,7 +129,7 @@ async function submitCreate(): Promise<void> {
     });
     await queryClient.invalidateQueries({ queryKey: ['projects', tenantId.value] });
     createOpen.value = false;
-    ElMessage.success(result.data.replayed ? '已返回现有 Project' : 'Project 已创建');
+    ElMessage.success(result.data.request_replayed ? '已返回现有 Project' : 'Project 已创建');
   } catch {
     // ApiProblemAlert renders the structured mutation error below.
   }

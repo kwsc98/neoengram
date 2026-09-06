@@ -1,7 +1,7 @@
 use fusen_rs::SensitiveFields;
 use serde::{Deserialize, Serialize};
 
-use super::{DataLayout, IndexVersionBody, PlaygroundView, TaskView};
+use super::{DataLayout, IndexVersionBody, TaskView, WorkspaceView};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
@@ -10,7 +10,8 @@ pub struct StartPreCommitRequest {
     pub tenant_id: String,
     pub project_id: String,
     pub artifact_id: String,
-    pub playground_id: String,
+    #[serde(rename = "workspace_id")]
+    pub workspace_id: String,
     pub precommit_request_id: String,
     pub expected_index_version: IndexVersionBody,
     pub data_layout: DataLayout,
@@ -21,8 +22,10 @@ pub struct StartPreCommitRequest {
 #[sensitive(opaque)]
 pub struct StartPreCommitResponse {
     pub precommit: PreCommitView,
-    pub playground: PlaygroundView,
-    pub replayed: bool,
+    #[serde(rename = "workspace")]
+    pub workspace: WorkspaceView,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }
@@ -57,8 +60,10 @@ pub struct RestartPreCommitRequest {
 #[sensitive(opaque)]
 pub struct RestartPreCommitResponse {
     pub precommit: PreCommitView,
-    pub playground: PlaygroundView,
-    pub replayed: bool,
+    #[serde(rename = "workspace")]
+    pub workspace: WorkspaceView,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }
@@ -77,8 +82,10 @@ pub struct CancelPreCommitRequest {
 #[sensitive(opaque)]
 pub struct CancelPreCommitResponse {
     pub precommit: PreCommitView,
-    pub playground: PlaygroundView,
-    pub replayed: bool,
+    #[serde(rename = "workspace")]
+    pub workspace: WorkspaceView,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }
@@ -90,7 +97,8 @@ pub struct PreCommitView {
     pub tenant_id: String,
     pub project_id: String,
     pub artifact_id: String,
-    pub playground_id: String,
+    #[serde(rename = "workspace_id")]
+    pub workspace_id: String,
     pub precommit_id: String,
     pub precommit_request_id: String,
     pub attempt: u32,

@@ -292,7 +292,7 @@ async function createSnapshotNow(): Promise<void> {
     });
     createOutcome.value = result.data;
     snapshotRequestId.value = undefined;
-    ElMessage.success(result.data.replayed ? '已返回同一创建请求' : 'Snapshot 已开始创建');
+    ElMessage.success(result.data.request_replayed ? '已返回同一创建请求' : 'Snapshot 已开始创建');
   } catch {
     // The same request identity is retained so an uncertain transport result can be retried safely.
   }
@@ -563,7 +563,9 @@ async function openSnapshot(): Promise<void> {
           </div>
         </dl>
         <div class="delivery-flags">
-          <el-tag effect="plain">{{ createOutcome.replayed ? '幂等重放' : '新请求' }}</el-tag>
+          <el-tag effect="plain">{{
+            createOutcome.request_replayed ? '幂等重放' : '新请求'
+          }}</el-tag>
           <el-tag type="success" effect="plain">只读</el-tag>
         </div>
       </section>

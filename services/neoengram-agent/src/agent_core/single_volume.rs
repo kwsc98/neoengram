@@ -289,6 +289,8 @@ fn validate_managed_root(name: &'static str, path: &Path) -> AgentResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use neoengram_domain::protocol::{Generation, TaskExecutionFence, TaskId};
+
     use super::*;
 
     fn config() -> SingleVolumeAgentConfig {
@@ -412,10 +414,10 @@ mod tests {
                     .unwrap(),
                 tenant_id: configured.tenant_id.clone(),
                 deletion_id: neoengram_domain::protocol::DeletionId::new("delete-1").unwrap(),
-                resource: neoengram_domain::protocol::ResourceRef::Playground {
+                resource: neoengram_domain::protocol::ResourceRef::Workspace {
                     project_id: neoengram_domain::protocol::ProjectId::new("project-a").unwrap(),
                     artifact_id: neoengram_domain::protocol::ArtifactId::new("artifact-a").unwrap(),
-                    playground_id: neoengram_domain::protocol::PlaygroundId::new("playground-a")
+                    workspace_id: neoengram_domain::protocol::WorkspaceId::new("workspace-a")
                         .unwrap(),
                 },
                 action: neoengram_domain::protocol::ResourceLifecycleAction::Quarantine,
@@ -423,11 +425,17 @@ mod tests {
                 request_digest: neoengram_domain::core::ContentDigest::from_bytes([0x33; 32]),
                 deadline_unix_ms: UnixMillis::new(2_000),
             },
-            resource_scope: neoengram_domain::protocol::AgentResourceLifecycleScope::Playground {
+            task_fence: TaskExecutionFence::new(
+                TaskId::new("task-delete-1").unwrap(),
+                Generation::new(1),
+                "quarantine",
+                Generation::new(1),
+                Generation::new(1),
+            ),
+            resource_scope: neoengram_domain::protocol::AgentResourceLifecycleScope::Workspace {
                 project_id: neoengram_domain::protocol::ProjectId::new("project-a").unwrap(),
                 artifact_id: neoengram_domain::protocol::ArtifactId::new("artifact-a").unwrap(),
-                playground_id: neoengram_domain::protocol::PlaygroundId::new("playground-a")
-                    .unwrap(),
+                workspace_id: neoengram_domain::protocol::WorkspaceId::new("workspace-a").unwrap(),
                 storage_volume_id: configured.storage_volume_id.clone(),
                 artifact_placement_id: neoengram_domain::protocol::ArtifactPlacementId::new(
                     "placement-a",

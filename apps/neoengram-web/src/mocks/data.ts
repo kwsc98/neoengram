@@ -2,7 +2,7 @@ import type {
   ArtifactView,
   CommitGraphView,
   GatewayPoolView,
-  PlaygroundView,
+  WorkspaceView,
   ProjectView,
   SnapshotView,
   S3AccessPointView,
@@ -52,7 +52,7 @@ export const tenants: TenantView[] = [
       'artifact.commit.replicate',
       'project.read',
       'project.create',
-      'playground.create',
+      'workspace.create',
       'snapshot.create',
       'task.manage',
       's3.access.read',
@@ -126,6 +126,7 @@ export const projects: ProjectView[] = [
     display_name: '视觉数据',
     description: '道路场景和视觉评测数据',
     resource_version: '2',
+    lifecycle: activeLifecycle,
     created_at_unix_ms: created,
     updated_at_unix_ms: updated,
   },
@@ -135,6 +136,7 @@ export const projects: ProjectView[] = [
     display_name: '语言模型数据',
     description: '对话语料和文本评测数据',
     resource_version: '1',
+    lifecycle: activeLifecycle,
     created_at_unix_ms: created,
     updated_at_unix_ms: updated,
   },
@@ -143,6 +145,7 @@ export const projects: ProjectView[] = [
     project_id: 'project-release',
     display_name: '版本交付',
     resource_version: '3',
+    lifecycle: activeLifecycle,
     created_at_unix_ms: created,
     updated_at_unix_ms: updated,
   },
@@ -416,12 +419,12 @@ export const commitGraphs = new Map<string, CommitGraphView>([
   ],
 ]);
 
-export const playgrounds: PlaygroundView[] = [
+export const workspaces: WorkspaceView[] = [
   {
     tenant_id: 'tenant-a',
     project_id: 'project-vision',
     artifact_id: 'road-scenes',
-    playground_id: 'labeling',
+    workspace_id: 'labeling',
     resource_version: '6',
     lifecycle: activeLifecycle,
     storage_volume_id: 'volume-shanghai-vision',
@@ -439,7 +442,7 @@ export const playgrounds: PlaygroundView[] = [
     tenant_id: 'tenant-a',
     project_id: 'project-vision',
     artifact_id: 'quality-reports',
-    playground_id: 'nightly-review',
+    workspace_id: 'nightly-review',
     resource_version: '4',
     lifecycle: activeLifecycle,
     storage_volume_id: 'volume-shanghai-archive',
@@ -458,7 +461,7 @@ export const playgrounds: PlaygroundView[] = [
     tenant_id: 'tenant-a',
     project_id: 'project-language',
     artifact_id: 'dialog-corpus',
-    playground_id: 'safety-review',
+    workspace_id: 'safety-review',
     resource_version: '7',
     lifecycle: activeLifecycle,
     storage_volume_id: 'volume-beijing-language',
@@ -476,7 +479,7 @@ export const playgrounds: PlaygroundView[] = [
     tenant_id: 'tenant-a',
     project_id: 'project-vision',
     artifact_id: 'road-scenes',
-    playground_id: 'occlusion-audit',
+    workspace_id: 'occlusion-audit',
     resource_version: '3',
     lifecycle: activeLifecycle,
     storage_volume_id: 'volume-shanghai-vision',
@@ -494,7 +497,7 @@ export const playgrounds: PlaygroundView[] = [
     tenant_id: 'tenant-a',
     project_id: 'project-vision',
     artifact_id: 'road-scenes',
-    playground_id: 'fog-augmentation',
+    workspace_id: 'fog-augmentation',
     resource_version: '2',
     lifecycle: activeLifecycle,
     storage_volume_id: 'volume-shanghai-vision',
@@ -512,7 +515,7 @@ export const playgrounds: PlaygroundView[] = [
     tenant_id: 'tenant-a',
     project_id: 'project-vision',
     artifact_id: 'quality-reports',
-    playground_id: 'july-regression',
+    workspace_id: 'july-regression',
     resource_version: '5',
     lifecycle: activeLifecycle,
     storage_volume_id: 'volume-shanghai-vision',
@@ -530,7 +533,7 @@ export const playgrounds: PlaygroundView[] = [
     tenant_id: 'tenant-a',
     project_id: 'project-language',
     artifact_id: 'dialog-corpus',
-    playground_id: 'pii-redaction',
+    workspace_id: 'pii-redaction',
     resource_version: '8',
     lifecycle: activeLifecycle,
     storage_volume_id: 'volume-beijing-language',
@@ -548,7 +551,7 @@ export const playgrounds: PlaygroundView[] = [
     tenant_id: 'tenant-b',
     project_id: 'project-release',
     artifact_id: 'release-assets',
-    playground_id: 'release-candidate',
+    workspace_id: 'release-candidate',
     resource_version: '3',
     lifecycle: activeLifecycle,
     storage_volume_id: 'volume-release',
@@ -743,7 +746,7 @@ const initialTenants = structuredClone(tenants);
 const initialProjects = structuredClone(projects);
 const initialStorageVolumes = structuredClone(storageVolumes);
 const initialArtifacts = structuredClone(artifacts);
-const initialPlaygrounds = structuredClone(playgrounds);
+const initialWorkspaces = structuredClone(workspaces);
 const initialSnapshots = structuredClone(snapshots);
 const initialS3AccessPoints = structuredClone(s3AccessPoints);
 const initialS3Credentials = structuredClone(s3Credentials);
@@ -759,7 +762,7 @@ export function resetMockData(): void {
   projects.splice(0, projects.length, ...structuredClone(initialProjects));
   storageVolumes.splice(0, storageVolumes.length, ...structuredClone(initialStorageVolumes));
   artifacts.splice(0, artifacts.length, ...structuredClone(initialArtifacts));
-  playgrounds.splice(0, playgrounds.length, ...structuredClone(initialPlaygrounds));
+  workspaces.splice(0, workspaces.length, ...structuredClone(initialWorkspaces));
   snapshots.splice(0, snapshots.length, ...structuredClone(initialSnapshots));
   s3AccessPoints.splice(0, s3AccessPoints.length, ...structuredClone(initialS3AccessPoints));
   s3Credentials.splice(0, s3Credentials.length, ...structuredClone(initialS3Credentials));

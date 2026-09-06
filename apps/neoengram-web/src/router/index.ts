@@ -10,7 +10,7 @@ import { queryApiVersion } from '@/api/operations';
 import { isApiProblem } from '@/api/problem';
 import {
   supportsArtifactCatalog,
-  supportsPlaygroundPreCommit,
+  supportsWorkspacePreCommit,
   supportsS3ReadonlyAccessPoint,
   supportsResourceLifecycle,
   supportsSnapshotMaterialize,
@@ -20,7 +20,7 @@ import { useTenantsStore } from '@/stores/tenants';
 
 const tenantMeta = { requiresAuth: true, requiresTenant: true };
 const snapshotMaterializeMeta = { ...tenantMeta, requiredCapability: 'commit_materialization_v2' };
-const playgroundPreCommitMeta = { ...tenantMeta, requiredCapability: 'playground_precommit' };
+const workspacePreCommitMeta = { ...tenantMeta, requiredCapability: 'workspace_precommit' };
 const s3ReadonlyMeta = {
   ...tenantMeta,
   requiredCapability: 's3_readonly_access_point',
@@ -94,15 +94,15 @@ const routes: RouteRecordRaw[] = [
     meta: tenantMeta,
   },
   {
-    path: '/tenants/:tenantId/playgrounds',
-    name: 'playground-list',
-    component: () => import('@/pages/PlaygroundListPage.vue'),
+    path: '/tenants/:tenantId/workspaces',
+    name: 'workspace-list',
+    component: () => import('@/pages/WorkspaceListPage.vue'),
     meta: tenantMeta,
   },
   {
-    path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/playgrounds/:playgroundId',
-    name: 'playground-detail',
-    component: () => import('@/pages/PlaygroundDetailPage.vue'),
+    path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/workspaces/:workspaceId',
+    name: 'workspace-detail',
+    component: () => import('@/pages/WorkspaceDetailPage.vue'),
     meta: tenantMeta,
   },
   {
@@ -112,10 +112,10 @@ const routes: RouteRecordRaw[] = [
     meta: snapshotMaterializeMeta,
   },
   {
-    path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/playgrounds/:playgroundId/commit',
-    name: 'playground-commit',
-    component: () => import('@/pages/PlaygroundCommitPage.vue'),
-    meta: playgroundPreCommitMeta,
+    path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/workspaces/:workspaceId/commit',
+    name: 'workspace-commit',
+    component: () => import('@/pages/WorkspaceCommitPage.vue'),
+    meta: workspacePreCommitMeta,
   },
   {
     path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/snapshots/new',
@@ -194,8 +194,7 @@ export function createAppRouter(history: RouterHistory = createWebHistory()): Ro
     if (
       (requiredCapability === 'commit_materialization_v2' &&
         supportsSnapshotMaterialize(capabilities)) ||
-      (requiredCapability === 'playground_precommit' &&
-        supportsPlaygroundPreCommit(capabilities)) ||
+      (requiredCapability === 'workspace_precommit' && supportsWorkspacePreCommit(capabilities)) ||
       (requiredCapability === 's3_readonly_access_point' &&
         supportsS3ReadonlyAccessPoint(capabilities)) ||
       (requiredCapability === 'resource_lifecycle_v1' && supportsResourceLifecycle(capabilities))
@@ -205,11 +204,11 @@ export function createAppRouter(history: RouterHistory = createWebHistory()): Ro
 
     const projectId = String(to.params.projectId ?? '');
     const artifactId = String(to.params.artifactId ?? '');
-    const playgroundId = String(to.params.playgroundId ?? '');
-    if (projectId && artifactId && playgroundId) {
+    const workspaceId = String(to.params.workspaceId ?? '');
+    if (projectId && artifactId && workspaceId) {
       return {
-        name: 'playground-detail',
-        params: { tenantId, projectId, artifactId, playgroundId },
+        name: 'workspace-detail',
+        params: { tenantId, projectId, artifactId, workspaceId },
       };
     }
     if (supportsArtifactCatalog(capabilities) && projectId && artifactId) {

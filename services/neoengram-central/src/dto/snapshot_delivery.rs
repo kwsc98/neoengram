@@ -98,7 +98,8 @@ pub struct RetrySnapshotDeliveryRequest {
 #[sensitive(opaque)]
 pub struct RetrySnapshotDeliveryResponse {
     pub delivery: SnapshotDeliveryView,
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }
@@ -117,7 +118,8 @@ pub struct DeleteSnapshotDeliveryRequest {
 #[sensitive(opaque)]
 pub struct DeleteSnapshotDeliveryResponse {
     pub delivery: SnapshotDeliveryView,
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }

@@ -3220,6 +3220,13 @@ mod tests {
             central_signature: None,
             message: AgentChannelDownstreamMessage::Decision(JobDecision {
                 job_id: JobId::new("central-decision-job-1").unwrap(),
+                task_fence: neoengram_domain::protocol::TaskExecutionFence::new(
+                    neoengram_domain::protocol::TaskId::new("central-decision-task-1").unwrap(),
+                    neoengram_domain::protocol::Generation::new(1),
+                    "publish_commit",
+                    neoengram_domain::protocol::Generation::new(1),
+                    neoengram_domain::protocol::Generation::new(1),
+                ),
                 assignment_id: AssignmentId::new("central-decision-assignment-1").unwrap(),
                 assignment_generation: AssignmentGeneration::new(2),
                 decision_generation: DecisionGeneration::new(4),
@@ -3265,6 +3272,13 @@ mod tests {
                         request_digest: ContentDigest::from_bytes([0x61; 32]),
                         deadline_unix_ms: UnixMillis::new(now.get().saturating_add(60_000)),
                     },
+                    task_fence: neoengram_domain::protocol::TaskExecutionFence::new(
+                        neoengram_domain::protocol::TaskId::new("task-lifecycle-1").unwrap(),
+                        neoengram_domain::protocol::Generation::new(1),
+                        "quarantine",
+                        neoengram_domain::protocol::Generation::new(1),
+                        neoengram_domain::protocol::Generation::new(1),
+                    ),
                     resource_scope: AgentResourceLifecycleScope::Artifact {
                         project_id: ProjectId::new("project-a").unwrap(),
                         artifact_id: ArtifactId::new("artifact-a").unwrap(),

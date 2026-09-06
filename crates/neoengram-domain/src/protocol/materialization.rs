@@ -23,7 +23,7 @@ use crate::{
     GatewayPoolId, Generation, IntegrityScanId, MaterializationBatchId, MaterializationId,
     MountGeneration, ObjectId, ObjectNamespaceId, ObjectTicketId, PlacementGeneration, PlacementId,
     ProtocolError, ProtocolResult, RegionId, RouteGeneration, SessionGeneration, StorageVolumeId,
-    TaskAttemptId, TaskId, TenantId, UnixMillis,
+    TaskAttemptId, TaskId, TaskPurpose, TenantId, UnixMillis,
 };
 
 /// Version advertised by materialization-specific control and transfer contracts.
@@ -853,11 +853,43 @@ pub struct MaterializationJobKey {
     pub commit_id: CommitId,
     pub target_storage_volume_id: StorageVolumeId,
     pub coverage_goal: CoverageGoal,
+    /// The user-visible purpose is part of execution identity. A repair must never reuse a copy
+    /// plan, even when the target and Commit are otherwise identical.
+    pub purpose: TaskPurpose,
+    /// Repair fence observed by the caller. Exactly one fence is required for `repair`; copy
+    /// requests must leave both unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_observation_digest: Option<ContentDigest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_target_placement_generation: Option<PlacementGeneration>,
 }
 
 impl MaterializationJobKey {
     pub fn validate(&self) -> ProtocolResult<()> {
-        self.coverage_goal.validate()
+        self.coverage_goal.validate()?;
+        match self.purpose {
+            TaskPurpose::Copy => {
+                if self.repair_observation_digest.is_some()
+                    || self.repair_target_placement_generation.is_some()
+                {
+                    return Err(invalid(
+                        "repair_fence",
+                        "copy materialization cannot carry a repair fence",
+                    ));
+                }
+            }
+            TaskPurpose::Repair => {
+                if self.repair_observation_digest.is_some()
+                    == self.repair_target_placement_generation.is_some()
+                {
+                    return Err(invalid(
+                        "repair_fence",
+                        "repair materialization requires exactly one observation digest or target placement generation",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1556,6 +1588,10 @@ pub struct MaterializationAssignment {
     pub operation_task_id: TaskId,
     /// Exact execution attempt authorized for this assignment.
     pub task_attempt_id: TaskAttemptId,
+    /// Explicit root/stage fences are carried in addition to opaque attempt identities.
+    pub task_attempt: Generation,
+    pub stage_key: String,
+    pub stage_attempt: Generation,
     pub signed_ticket: SignedMaterializationBatchTicket,
     pub batch: MaterializationBatch,
     pub manifest: BatchManifest,
@@ -1570,6 +1606,9 @@ impl MaterializationAssignment {
         self.signed_ticket.validate()?;
         if self.operation_task_id != self.signed_ticket.ticket.operation_task_id
             || self.task_attempt_id != self.signed_ticket.ticket.task_attempt_id
+            || self.task_attempt != self.signed_ticket.ticket.task_attempt
+            || self.stage_key != self.signed_ticket.ticket.stage_key
+            || self.stage_attempt != self.signed_ticket.ticket.stage_attempt
         {
             return Err(invalid(
                 "task_identity",
@@ -1621,6 +1660,9 @@ pub enum MaterializationReport {
     Failed {
         operation_task_id: TaskId,
         task_attempt_id: TaskAttemptId,
+        task_attempt: Generation,
+        stage_key: String,
+        stage_attempt: Generation,
         materialization_id: MaterializationId,
         batch_id: MaterializationBatchId,
         plan_revision: Generation,
@@ -1714,6 +1756,30 @@ impl MaterializationReport {
     }
 
     #[must_use]
+    pub fn task_attempt(&self) -> Generation {
+        match self {
+            Self::Receipt { receipt, .. } => receipt.task_attempt,
+            Self::Failed { task_attempt, .. } => *task_attempt,
+        }
+    }
+
+    #[must_use]
+    pub fn stage_key(&self) -> &str {
+        match self {
+            Self::Receipt { receipt, .. } => &receipt.stage_key,
+            Self::Failed { stage_key, .. } => stage_key,
+        }
+    }
+
+    #[must_use]
+    pub fn stage_attempt(&self) -> Generation {
+        match self {
+            Self::Receipt { receipt, .. } => receipt.stage_attempt,
+            Self::Failed { stage_attempt, .. } => *stage_attempt,
+        }
+    }
+
+    #[must_use]
     pub fn target(&self) -> &MaterializationTarget {
         match self {
             Self::Receipt { target, .. } | Self::Failed { target, .. } => target,
@@ -1746,6 +1812,9 @@ impl MaterializationReport {
             Self::Failed {
                 operation_task_id,
                 task_attempt_id,
+                task_attempt,
+                stage_key,
+                stage_attempt,
                 materialization_id,
                 batch_id,
                 plan_revision,
@@ -1779,6 +1848,9 @@ impl MaterializationReport {
                         "report task identities must not be empty",
                     ));
                 }
+                validate_positive("task_attempt", task_attempt.get())?;
+                validate_nonempty_limited("stage_key", stage_key, MAX_STAGING_KEY_BYTES)?;
+                validate_positive("stage_attempt", stage_attempt.get())?;
                 target.validate()?;
                 if target.tenant_id != *tenant_id
                     || target.object_namespace_id != *object_namespace_id
@@ -1844,6 +1916,9 @@ impl MaterializationReport {
             Self::Failed {
                 operation_task_id,
                 task_attempt_id,
+                task_attempt,
+                stage_key,
+                stage_attempt,
                 materialization_id,
                 batch_id,
                 plan_revision,
@@ -1857,6 +1932,9 @@ impl MaterializationReport {
                 if materialization_id != &ticket.materialization_id
                     || operation_task_id != &ticket.operation_task_id
                     || task_attempt_id != &ticket.task_attempt_id
+                    || task_attempt != &ticket.task_attempt
+                    || stage_key != &ticket.stage_key
+                    || stage_attempt != &ticket.stage_attempt
                     || batch_id != &ticket.batch_id
                     || plan_revision != &ticket.plan_revision
                     || batch_attempt != &ticket.batch_attempt
@@ -2217,6 +2295,9 @@ pub struct MaterializationBatchTicket {
     pub ticket_id: ObjectTicketId,
     pub operation_task_id: TaskId,
     pub task_attempt_id: TaskAttemptId,
+    pub task_attempt: Generation,
+    pub stage_key: String,
+    pub stage_attempt: Generation,
     pub materialization_id: MaterializationId,
     pub batch_id: MaterializationBatchId,
     pub plan_revision: Generation,
@@ -2243,6 +2324,9 @@ impl MaterializationBatchTicket {
                 "ticket task identities must not be empty",
             ));
         }
+        validate_positive("task_attempt", self.task_attempt.get())?;
+        validate_nonempty_limited("stage_key", &self.stage_key, MAX_STAGING_KEY_BYTES)?;
+        validate_positive("stage_attempt", self.stage_attempt.get())?;
         self.source.validate()?;
         self.target.validate()?;
         if self.source.tenant_id != self.tenant_id
@@ -2385,6 +2469,9 @@ pub struct MaterializationObjectReceipt {
     pub receipt_id: crate::ObjectReceiptId,
     pub operation_task_id: TaskId,
     pub task_attempt_id: TaskAttemptId,
+    pub task_attempt: Generation,
+    pub stage_key: String,
+    pub stage_attempt: Generation,
     pub materialization_id: MaterializationId,
     pub batch_id: MaterializationBatchId,
     pub plan_revision: Generation,
@@ -2413,6 +2500,9 @@ impl MaterializationObjectReceipt {
                 "receipt task identities must not be empty",
             ));
         }
+        validate_positive("task_attempt", self.task_attempt.get())?;
+        validate_nonempty_limited("stage_key", &self.stage_key, MAX_STAGING_KEY_BYTES)?;
+        validate_positive("stage_attempt", self.stage_attempt.get())?;
         validate_positive("plan_revision", self.plan_revision.get())?;
         validate_positive("batch_attempt", self.batch_attempt.get())?;
         validate_positive(
@@ -2458,6 +2548,9 @@ impl MaterializationObjectReceipt {
         if self.materialization_id != ticket.materialization_id
             || self.operation_task_id != ticket.operation_task_id
             || self.task_attempt_id != ticket.task_attempt_id
+            || self.task_attempt != ticket.task_attempt
+            || self.stage_key != ticket.stage_key
+            || self.stage_attempt != ticket.stage_attempt
             || self.batch_id != ticket.batch_id
             || self.plan_revision != ticket.plan_revision
             || self.batch_attempt != ticket.batch_attempt
@@ -2886,6 +2979,9 @@ mod tests {
             ticket_id: ObjectTicketId::new("ticket-assignment").unwrap(),
             operation_task_id: operation_task_id(),
             task_attempt_id: task_attempt_id(),
+            task_attempt: Generation::new(1),
+            stage_key: "transfer".to_owned(),
+            stage_attempt: Generation::new(1),
             materialization_id: materialization_id.clone(),
             batch_id: batch_id.clone(),
             plan_revision: Generation::new(1),
@@ -2932,6 +3028,9 @@ mod tests {
         MaterializationAssignment {
             operation_task_id: operation_task_id(),
             task_attempt_id: task_attempt_id(),
+            task_attempt: Generation::new(1),
+            stage_key: "transfer".to_owned(),
+            stage_attempt: Generation::new(1),
             signed_ticket,
             batch,
             manifest,
@@ -3040,6 +3139,9 @@ mod tests {
             ticket_id: ObjectTicketId::new("ticket-a").unwrap(),
             operation_task_id: operation_task_id(),
             task_attempt_id: task_attempt_id(),
+            task_attempt: Generation::new(1),
+            stage_key: "transfer".to_owned(),
+            stage_attempt: Generation::new(1),
             materialization_id: MaterializationId::new("materialization-a").unwrap(),
             batch_id: MaterializationBatchId::new("batch-a").unwrap(),
             plan_revision: Generation::new(1),
@@ -3085,6 +3187,9 @@ mod tests {
             ticket_id: ObjectTicketId::new("ticket-a").unwrap(),
             operation_task_id: operation_task_id(),
             task_attempt_id: task_attempt_id(),
+            task_attempt: Generation::new(1),
+            stage_key: "transfer".to_owned(),
+            stage_attempt: Generation::new(1),
             materialization_id: MaterializationId::new("materialization-a").unwrap(),
             batch_id: MaterializationBatchId::new("batch-a").unwrap(),
             plan_revision: Generation::new(1),
@@ -3152,6 +3257,9 @@ mod tests {
         let base = MaterializationReport::Failed {
             operation_task_id: operation_task_id(),
             task_attempt_id: task_attempt_id(),
+            task_attempt: Generation::new(1),
+            stage_key: "transfer".to_owned(),
+            stage_attempt: Generation::new(1),
             materialization_id: assignment.batch.materialization_id.clone(),
             batch_id: assignment.batch.batch_id.clone(),
             plan_revision: assignment.batch.plan_revision,
@@ -3192,6 +3300,9 @@ mod tests {
             receipt_id: crate::ObjectReceiptId::new("receipt-report").unwrap(),
             operation_task_id: operation_task_id(),
             task_attempt_id: task_attempt_id(),
+            task_attempt: Generation::new(1),
+            stage_key: "transfer".to_owned(),
+            stage_attempt: Generation::new(1),
             materialization_id: MaterializationId::new("materialization-a").unwrap(),
             batch_id: MaterializationBatchId::new("batch-a").unwrap(),
             plan_revision: Generation::new(1),
@@ -3387,6 +3498,9 @@ mod tests {
                 commit_id: CommitId::from_bytes([9; 32]),
                 target_storage_volume_id: StorageVolumeId::new("volume-b").unwrap(),
                 coverage_goal: CoverageGoal::ObjectCount(DecimalU64::new(1)),
+                purpose: TaskPurpose::Copy,
+                repair_observation_digest: None,
+                repair_target_placement_generation: None,
             },
             artifact_id: ArtifactId::new("artifact-a").unwrap(),
             state: MaterializationJobState::Complete,
@@ -3423,6 +3537,9 @@ mod tests {
                 commit_id: CommitId::from_bytes([9; 32]),
                 target_storage_volume_id: StorageVolumeId::new("volume-b").unwrap(),
                 coverage_goal: CoverageGoal::Complete,
+                purpose: TaskPurpose::Copy,
+                repair_observation_digest: None,
+                repair_target_placement_generation: None,
             },
             artifact_id: ArtifactId::new("artifact-a").unwrap(),
             state: MaterializationJobState::Queued,
@@ -3483,6 +3600,9 @@ mod tests {
             receipt_id: crate::ObjectReceiptId::new("receipt-a").unwrap(),
             operation_task_id: operation_task_id(),
             task_attempt_id: task_attempt_id(),
+            task_attempt: Generation::new(1),
+            stage_key: "transfer".to_owned(),
+            stage_attempt: Generation::new(1),
             materialization_id: MaterializationId::new("materialization-a").unwrap(),
             batch_id: MaterializationBatchId::new("batch-a").unwrap(),
             plan_revision: Generation::new(1),
@@ -3513,6 +3633,9 @@ mod tests {
             receipt_id: crate::ObjectReceiptId::new("receipt-deadline").unwrap(),
             operation_task_id: operation_task_id(),
             task_attempt_id: task_attempt_id(),
+            task_attempt: Generation::new(1),
+            stage_key: "transfer".to_owned(),
+            stage_attempt: Generation::new(1),
             materialization_id: MaterializationId::new("materialization-a").unwrap(),
             batch_id: MaterializationBatchId::new("batch-a").unwrap(),
             plan_revision: Generation::new(1),
@@ -3532,6 +3655,9 @@ mod tests {
             ticket_id: ObjectTicketId::new("ticket-deadline").unwrap(),
             operation_task_id: operation_task_id(),
             task_attempt_id: task_attempt_id(),
+            task_attempt: Generation::new(1),
+            stage_key: "transfer".to_owned(),
+            stage_attempt: Generation::new(1),
             materialization_id: MaterializationId::new("materialization-a").unwrap(),
             batch_id: MaterializationBatchId::new("batch-a").unwrap(),
             plan_revision: Generation::new(1),
@@ -3562,6 +3688,9 @@ mod tests {
             receipt_id: crate::ObjectReceiptId::new("receipt-a").unwrap(),
             operation_task_id: operation_task_id(),
             task_attempt_id: task_attempt_id(),
+            task_attempt: Generation::new(1),
+            stage_key: "transfer".to_owned(),
+            stage_attempt: Generation::new(1),
             materialization_id: MaterializationId::new("materialization-a").unwrap(),
             batch_id: MaterializationBatchId::new("batch-a").unwrap(),
             plan_revision: Generation::new(1),

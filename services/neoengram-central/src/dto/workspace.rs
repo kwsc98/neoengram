@@ -2,25 +2,27 @@ use serde::{Deserialize, Serialize};
 
 use super::IndexVersionBody;
 
-/// Common identity for a tenant-scoped Playground query.
+/// Common identity for a tenant-scoped Workspace query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, fusen_rs::SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
-pub struct PlaygroundScopeRequest {
+pub struct WorkspaceScopeRequest {
     pub tenant_id: String,
     pub project_id: String,
     pub artifact_id: String,
-    pub playground_id: String,
+    #[serde(rename = "workspace_id")]
+    pub workspace_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, fusen_rs::SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
-pub struct QueryPlaygroundFileListRequest {
+pub struct QueryWorkspaceFileListRequest {
     pub tenant_id: String,
     pub project_id: String,
     pub artifact_id: String,
-    pub playground_id: String,
+    #[serde(rename = "workspace_id")]
+    pub workspace_id: String,
     #[serde(default)]
     pub path_prefix: Option<String>,
     #[serde(default)]
@@ -50,7 +52,7 @@ pub struct LogicalFileEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, fusen_rs::SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
-pub struct QueryPlaygroundFileListResponse {
+pub struct QueryWorkspaceFileListResponse {
     pub index_version: IndexVersionBody,
     pub items: Vec<LogicalFileEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -60,11 +62,12 @@ pub struct QueryPlaygroundFileListResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, fusen_rs::SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
-pub struct QueryPlaygroundChangeListRequest {
+pub struct QueryWorkspaceChangeListRequest {
     pub tenant_id: String,
     pub project_id: String,
     pub artifact_id: String,
-    pub playground_id: String,
+    #[serde(rename = "workspace_id")]
+    pub workspace_id: String,
     #[serde(default)]
     pub precommit_id: Option<String>,
     #[serde(default)]
@@ -80,7 +83,7 @@ pub struct QueryPlaygroundChangeListRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, fusen_rs::SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
-pub struct PlaygroundChangeEntry {
+pub struct WorkspaceChangeEntry {
     pub change_type: String,
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -96,7 +99,7 @@ pub struct PlaygroundChangeEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, fusen_rs::SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
-pub struct PlaygroundChangeSummary {
+pub struct WorkspaceChangeSummary {
     pub files_added: String,
     pub files_modified: String,
     pub files_deleted: String,
@@ -108,13 +111,13 @@ pub struct PlaygroundChangeSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, fusen_rs::SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
-pub struct QueryPlaygroundChangeListResponse {
+pub struct QueryWorkspaceChangeListResponse {
     pub source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub precommit_id: Option<String>,
     pub index_version: IndexVersionBody,
-    pub summary: PlaygroundChangeSummary,
-    pub items: Vec<PlaygroundChangeEntry>,
+    pub summary: WorkspaceChangeSummary,
+    pub items: Vec<WorkspaceChangeEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
 }
@@ -122,11 +125,12 @@ pub struct QueryPlaygroundChangeListResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, fusen_rs::SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
-pub struct QueryPlaygroundFileMetadataRequest {
+pub struct QueryWorkspaceFileMetadataRequest {
     pub tenant_id: String,
     pub project_id: String,
     pub artifact_id: String,
-    pub playground_id: String,
+    #[serde(rename = "workspace_id")]
+    pub workspace_id: String,
     pub path: String,
 }
 
@@ -146,7 +150,7 @@ pub struct FileMetadataView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, fusen_rs::SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
-pub struct QueryPlaygroundFileMetadataResponse {
+pub struct QueryWorkspaceFileMetadataResponse {
     pub index_version: IndexVersionBody,
     pub metadata: FileMetadataView,
 }
@@ -154,11 +158,12 @@ pub struct QueryPlaygroundFileMetadataResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, fusen_rs::SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
-pub struct QueryPlaygroundDatasetProfileRequest {
+pub struct QueryWorkspaceDatasetProfileRequest {
     pub tenant_id: String,
     pub project_id: String,
     pub artifact_id: String,
-    pub playground_id: String,
+    #[serde(rename = "workspace_id")]
+    pub workspace_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, fusen_rs::SensitiveFields)]
@@ -186,7 +191,7 @@ pub struct DatasetProfileView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, fusen_rs::SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
-pub struct QueryPlaygroundDatasetProfileResponse {
+pub struct QueryWorkspaceDatasetProfileResponse {
     pub index_version: IndexVersionBody,
     pub profile: DatasetProfileView,
 }

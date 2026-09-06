@@ -350,7 +350,8 @@ pub struct AgentIndexPageQueryPayload {
     pub job_id: JobId,
     pub artifact_id: crate::ArtifactId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub playground_id: Option<crate::PlaygroundId>,
+    #[serde(rename = "workspace_id")]
+    pub workspace_id: Option<crate::WorkspaceId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_id: Option<crate::SnapshotId>,
     pub index_version: WireIndexVersion,
@@ -367,10 +368,10 @@ pub struct AgentIndexPageQueryPayload {
 impl AgentIndexPageQueryPayload {
     pub fn validate(&self) -> ProtocolResult<()> {
         self.index_version.validate()?;
-        if self.playground_id.is_some() == self.snapshot_id.is_some() {
+        if self.workspace_id.is_some() == self.snapshot_id.is_some() {
             return Err(ProtocolError::InvalidField {
-                field: "playground_id",
-                reason: "exactly one of playground_id or snapshot_id must be present".to_owned(),
+                field: "workspace_id",
+                reason: "exactly one of workspace_id or snapshot_id must be present".to_owned(),
             });
         }
         if self.max_records == 0 || usize::from(self.max_records) > MAX_RECORDS_PER_PAGE {
@@ -385,7 +386,7 @@ impl AgentIndexPageQueryPayload {
                 "tenant_id",
                 "job_id",
                 "artifact_id",
-                "playground_id",
+                "workspace_id",
                 "snapshot_id",
                 "index_version",
                 "page_number",
@@ -699,6 +700,7 @@ pub enum AgentChannelDownstreamMessage {
     Decision(JobDecision),
     #[serde(rename = "resource.lifecycle.assignment")]
     LifecycleAssignment(Box<AgentResourceLifecycleAssignment>),
+    #[schemars(skip)]
     #[serde(rename = "replication.assignment")]
     ReplicationAssignment(Box<ReplicationAssignment>),
     /// Object-level v2 source-grouped assignment signed by Central.
@@ -719,7 +721,6 @@ impl AgentChannelDownstreamMessage {
                 | "job.assignment"
                 | "job.decision"
                 | "resource.lifecycle.assignment"
-                | "replication.assignment"
                 | "materialization.assignment"
                 | "channel.ack"
                 | "protocol.error"
@@ -1046,8 +1047,8 @@ impl AgentChannelDownstreamFrame {
                         "Replication Assignment is a new delivery and cannot correlate an upstream frame",
                     ));
                 }
-                // Keep the legacy DTO deserializable for inventory/reset tooling, but never
-                // allow it over the current channel. v2 uses object-level materialization.
+                // Legacy replication DTOs are not part of the v2 channel. Keep the enum arm
+                // private for inventory/reset code, but reject it before serialization.
                 let _ = payload;
                 return Err(ProtocolError::UnsupportedMessageType(
                     "replication.assignment".to_owned(),
@@ -1091,7 +1092,6 @@ impl AgentChannelDownstreamFrame {
             AgentChannelDownstreamMessage::Assignment(_)
                 | AgentChannelDownstreamMessage::Decision(_)
                 | AgentChannelDownstreamMessage::LifecycleAssignment(_)
-                | AgentChannelDownstreamMessage::ReplicationAssignment(_)
                 | AgentChannelDownstreamMessage::MaterializationAssignment(_)
         ) {
             return Err(invalid_channel_field(
@@ -1459,6 +1459,13 @@ mod tests {
             central_signature: None,
             message: AgentChannelDownstreamMessage::Decision(JobDecision {
                 job_id: JobId::new("central-decision-job-1").unwrap(),
+                task_fence: crate::TaskExecutionFence::new(
+                    crate::TaskId::new("central-decision-task-1").unwrap(),
+                    crate::Generation::new(1),
+                    "publish_commit",
+                    crate::Generation::new(1),
+                    crate::Generation::new(1),
+                ),
                 assignment_id: crate::AssignmentId::new("central-decision-assignment-1").unwrap(),
                 assignment_generation: crate::AssignmentGeneration::new(2),
                 decision_generation: crate::DecisionGeneration::new(4),
@@ -1541,6 +1548,9 @@ mod tests {
             ticket_id: crate::ObjectTicketId::new("ticket-channel").unwrap(),
             operation_task_id: operation_task_id.clone(),
             task_attempt_id: task_attempt_id.clone(),
+            task_attempt: crate::Generation::new(1),
+            stage_key: "transfer".to_owned(),
+            stage_attempt: crate::Generation::new(1),
             materialization_id,
             batch_id,
             plan_revision: crate::Generation::new(1),
@@ -1574,6 +1584,9 @@ mod tests {
         MaterializationAssignment {
             operation_task_id,
             task_attempt_id,
+            task_attempt: crate::Generation::new(1),
+            stage_key: "transfer".to_owned(),
+            stage_attempt: crate::Generation::new(1),
             signed_ticket,
             batch,
             manifest,
@@ -1776,7 +1789,7 @@ mod tests {
         assert!(payload.starts_with(b"neoengram-central-command-channel-v1\0"));
         assert_eq!(
             ContentDigest::hash(&payload).to_string(),
-            "2476b5fa93c2a08878ab9ef3a76290fd4f59fcc295061a8e673569310acc43d2"
+            "9a495de5632e37bb0926be1043aead86ed670b984ef80dee2d8faf75cbdbdd22"
         );
         sign_downstream_command(&mut frame, &key_pair);
         frame.validate().unwrap();
@@ -1917,7 +1930,7 @@ mod tests {
             tenant_id: TenantId::new("tenant-a").unwrap(),
             job_id: JobId::new("job-a").unwrap(),
             artifact_id: crate::ArtifactId::new("artifact-a").unwrap(),
-            playground_id: None,
+            workspace_id: None,
             snapshot_id: Some(crate::SnapshotId::new("snapshot-a").unwrap()),
             index_version: WireIndexVersion {
                 revision: crate::IndexRevision::new(1),
@@ -1931,11 +1944,11 @@ mod tests {
         };
         payload.validate().unwrap();
 
-        payload.playground_id = Some(crate::PlaygroundId::new("playground-a").unwrap());
+        payload.workspace_id = Some(crate::WorkspaceId::new("workspace-a").unwrap());
         assert!(payload.validate().is_err());
         payload.snapshot_id = None;
         payload.validate().unwrap();
-        payload.playground_id = None;
+        payload.workspace_id = None;
         assert!(payload.validate().is_err());
     }
 }

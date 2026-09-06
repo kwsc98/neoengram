@@ -172,7 +172,8 @@ pub struct CreateS3AccessPointResponse {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub secret_access_key: String,
     pub credential_expires_at_unix_ms: String,
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }
@@ -181,7 +182,8 @@ pub struct CreateS3AccessPointResponse {
 #[sensitive(opaque)]
 pub struct UpdateS3AccessPointResponse {
     pub access_point: S3AccessPointView,
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }
@@ -192,7 +194,8 @@ pub struct CreateS3CredentialResponse {
     pub credential: S3CredentialView,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub secret_access_key: String,
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }

@@ -281,10 +281,10 @@ test('browses Artifact Commit graph and related resources', async ({ page }, tes
   await expect(page.getByText(roadMain3CommitId, { exact: true }).first()).toBeVisible();
   await expect(page.getByText('dataset/v4', { exact: true }).first()).toBeVisible();
   await expect(page.getByText(/refs\/heads/)).toHaveCount(0);
-  await page.getByRole('button', { name: '创建 Playground' }).click();
-  const playgroundDialog = page.getByRole('dialog', { name: '创建 Playground' });
-  const baseCommitSelect = playgroundDialog.getByRole('combobox', { name: 'Base Commit' });
-  const baseCommitField = playgroundDialog
+  await page.getByRole('button', { name: '创建 Workspace' }).click();
+  const workspaceDialog = page.getByRole('dialog', { name: '创建 Workspace' });
+  const baseCommitSelect = workspaceDialog.getByRole('combobox', { name: 'Base Commit' });
+  const baseCommitField = workspaceDialog
     .locator('.el-form-item')
     .filter({ hasText: 'Base Commit' });
   await expect(baseCommitField).toContainText(
@@ -299,7 +299,7 @@ test('browses Artifact Commit graph and related resources', async ({ page }, tes
   await expect(baseCommitField).toContainText(
     `完成首轮质量复核 · ${roadMain2CommitId.slice(0, 12)}`,
   );
-  await playgroundDialog.getByRole('button', { name: '取消' }).click();
+  await workspaceDialog.getByRole('button', { name: '取消' }).click();
   await page.screenshot({
     path: testInfo.outputPath('artifact-overview.png'),
     animations: 'disabled',
@@ -317,11 +317,13 @@ test('browses Artifact Commit graph and related resources', async ({ page }, tes
     fullPage: true,
   });
   await latestCommit.getByRole('button', { name: '详情与 Diff' }).click();
-  const commitDrawer = page.getByRole('dialog', { name: 'Commit 详情' });
-  await expect(commitDrawer.getByText('完成首轮质量复核', { exact: true })).toBeVisible();
-  await expect(commitDrawer.getByText('dataset/index.json', { exact: true })).toBeVisible();
-  await expect(commitDrawer.getByText('v1.0', { exact: true })).toBeVisible();
-  await page.keyboard.press('Escape');
+  await expect(page).toHaveURL(new RegExp(`/artifacts/road-scenes/commits/${roadMain3CommitId}$`));
+  await expect(page.getByRole('heading', { name: '父 Commit' })).toBeVisible();
+  await expect(page.getByText('完成首轮质量复核', { exact: true })).toBeVisible();
+  await expect(page.getByText('dataset/index.json', { exact: true })).toBeVisible();
+  await expect(page.getByText('v1.0', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '返回 Artifact' }).click();
+  await expect(page).toHaveURL(/\/artifacts\/road-scenes\?tab=commits$/);
 
   await page.getByRole('tab', { name: '工作区' }).click();
   await page.getByText('标注工作区', { exact: true }).click();
@@ -359,18 +361,18 @@ test('browses Artifact Commit graph and related resources', async ({ page }, tes
   await expectNoOperatorDetails(page);
   await expectHealthyLayout(page);
   await page.screenshot({
-    path: testInfo.outputPath('playground-detail.png'),
+    path: testInfo.outputPath('workspace-detail.png'),
     animations: 'disabled',
     fullPage: true,
   });
 });
 
-test('creates an Artifact, Playground, Commit and Snapshot from resource pages', async ({
+test('creates an Artifact, Workspace, Commit and Snapshot from resource pages', async ({
   page,
 }, testInfo) => {
   const suffix = testInfo.project.name;
   const artifactId = `evaluation-${suffix}`;
-  const playgroundId = `review-${suffix}`;
+  const workspaceId = `review-${suffix}`;
 
   await page.goto('/tenants/tenant-a/artifacts');
   await page.getByRole('button', { name: '创建 Artifact' }).click();
@@ -392,20 +394,20 @@ test('creates an Artifact, Playground, Commit and Snapshot from resource pages',
   await expect(page).toHaveURL(new RegExp(`/artifacts/${artifactId}$`));
   await expect(page.getByRole('heading', { name: '自动驾驶评测集' })).toBeVisible();
 
-  await page.getByRole('button', { name: '创建 Playground' }).click();
-  const playgroundDialog = page.getByRole('dialog', { name: '创建 Playground' });
-  await expect(playgroundDialog.getByLabel('Base Commit')).toHaveValue('空 Artifact');
-  await expect(playgroundDialog.getByLabel('Base Commit')).toHaveAttribute('readonly');
-  await playgroundDialog.getByLabel('Playground ID').fill(playgroundId);
-  await playgroundDialog.getByLabel('名称').fill('提交前复核');
-  await playgroundDialog.getByRole('combobox', { name: 'StorageVolume 选择' }).click();
+  await page.getByRole('button', { name: '创建 Workspace' }).click();
+  const workspaceDialog = page.getByRole('dialog', { name: '创建 Workspace' });
+  await expect(workspaceDialog.getByLabel('Base Commit')).toHaveValue('空 Artifact');
+  await expect(workspaceDialog.getByLabel('Base Commit')).toHaveAttribute('readonly');
+  await workspaceDialog.getByLabel('Workspace ID').fill(workspaceId);
+  await workspaceDialog.getByLabel('名称').fill('提交前复核');
+  await workspaceDialog.getByRole('combobox', { name: 'StorageVolume 选择' }).click();
   await page.getByRole('option', { name: /广州训练集交付 PVC/ }).click();
-  await expect(playgroundDialog.getByText('广州训练集交付 PVC · cn-guangzhou')).toBeVisible();
-  await playgroundDialog.getByRole('button', { name: '创建 Playground' }).click();
-  await expect(page).toHaveURL(new RegExp(`/playgrounds/${playgroundId}$`));
+  await expect(workspaceDialog.getByText('广州训练集交付 PVC · cn-guangzhou')).toBeVisible();
+  await workspaceDialog.getByRole('button', { name: '创建 Workspace' }).click();
+  await expect(page).toHaveURL(new RegExp(`/workspaces/${workspaceId}$`));
 
   await page.getByRole('button', { name: '发起 Pre-commit', exact: true }).click();
-  await expect(page.getByRole('heading', { name: '提交 Playground' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '提交 Workspace' })).toBeVisible();
   await expect(page.locator('.preflight-status__body strong')).toContainText('可提交 · 处理完成');
   await expect(page.getByText('0 项阻断')).toBeVisible();
   await page.getByRole('button', { name: '填写 Commit 信息' }).click();
@@ -448,14 +450,12 @@ test('creates an Artifact, Playground, Commit and Snapshot from resource pages',
   await expectHealthyLayout(page);
 });
 
-test('creates a Playground from an authoritative Artifact selection', async ({
-  page,
-}, testInfo) => {
-  const playgroundId = `list-created-${testInfo.project.name}`;
-  await page.goto('/tenants/tenant-a/playgrounds');
-  await page.getByRole('button', { name: '创建 Playground' }).click();
+test('creates a Workspace from an authoritative Artifact selection', async ({ page }, testInfo) => {
+  const workspaceId = `list-created-${testInfo.project.name}`;
+  await page.goto('/tenants/tenant-a/workspaces');
+  await page.getByRole('button', { name: '创建 Workspace' }).click();
 
-  const dialog = page.getByRole('dialog', { name: '创建 Playground' });
+  const dialog = page.getByRole('dialog', { name: '创建 Workspace' });
   await dialog.getByRole('combobox', { name: 'Artifact 选择' }).click();
   await page.getByRole('option', { name: /道路场景数据集/ }).click();
   const baseCommitSelect = dialog.getByRole('combobox', { name: 'Base Commit' });
@@ -474,13 +474,13 @@ test('creates a Playground from an authoritative Artifact selection', async ({
   );
   await expect(dialog.getByLabel('Project ID')).toHaveCount(0);
   await expect(dialog.getByLabel('Artifact ID')).toHaveCount(0);
-  await dialog.getByLabel('Playground ID').fill(playgroundId);
+  await dialog.getByLabel('Workspace ID').fill(workspaceId);
   await dialog.getByLabel('名称').fill('列表创建工作区');
   await dialog.getByRole('combobox', { name: 'StorageVolume 选择' }).click();
   await page.getByRole('option', { name: /视觉数据 PVC/ }).click();
-  await dialog.getByRole('button', { name: '创建 Playground' }).click();
+  await dialog.getByRole('button', { name: '创建 Workspace' }).click();
 
-  await expect(page).toHaveURL(new RegExp(`/playgrounds/${playgroundId}$`));
+  await expect(page).toHaveURL(new RegExp(`/workspaces/${workspaceId}$`));
   await expect(page.getByRole('heading', { name: '列表创建工作区' })).toBeVisible();
 });
 
@@ -601,18 +601,18 @@ test('renders resource loading, pagination, empty, forbidden and missing states'
   await expectHealthyLayout(page);
 });
 
-test('browses Tenant-wide Playground and Snapshot details', async ({ page }, testInfo) => {
+test('browses Tenant-wide Workspace and Snapshot details', async ({ page }, testInfo) => {
   testInfo.setTimeout(45_000);
-  await page.goto('/tenants/tenant-a/playgrounds');
-  const visiblePlaygroundList = page.locator(
+  await page.goto('/tenants/tenant-a/workspaces');
+  const visibleWorkspaceList = page.locator(
     '.resource-table:visible, .mobile-resource-list:visible',
   );
-  await expect(visiblePlaygroundList.getByText('创建中', { exact: true })).toBeVisible();
-  await expect(visiblePlaygroundList.getByText('已物化', { exact: true }).first()).toBeVisible();
-  await expect(visiblePlaygroundList.getByText('异常', { exact: true })).toBeVisible();
-  await expect(visiblePlaygroundList.getByText(/活动 Pre-commit/).first()).toBeVisible();
-  await expect(visiblePlaygroundList.getByText('计算内容摘要')).toHaveCount(0);
-  await expect(visiblePlaygroundList.getByText('一致性校验')).toHaveCount(0);
+  await expect(visibleWorkspaceList.getByText('创建中', { exact: true })).toBeVisible();
+  await expect(visibleWorkspaceList.getByText('已物化', { exact: true }).first()).toBeVisible();
+  await expect(visibleWorkspaceList.getByText('异常', { exact: true })).toBeVisible();
+  await expect(visibleWorkspaceList.getByText(/活动 Pre-commit/).first()).toBeVisible();
+  await expect(visibleWorkspaceList.getByText('计算内容摘要')).toHaveCount(0);
+  await expect(visibleWorkspaceList.getByText('一致性校验')).toHaveCount(0);
 
   await page.getByRole('button', { name: /夜间回归检查/ }).click();
   // nightly-review 所在归档卷已降级：冻结候选仍可审查，Agent 依赖的操作被暂停。
@@ -626,7 +626,7 @@ test('browses Tenant-wide Playground and Snapshot details', async ({ page }, tes
   });
   await page.getByRole('button', { name: '查看 Pre-commit' }).click();
   await expect(page).toHaveURL(
-    /\/playgrounds\/nightly-review\/commit\?precommit_id=precommit-nightly-0729$/,
+    /\/workspaces\/nightly-review\/commit\?precommit_id=precommit-nightly-0729$/,
   );
   await expect(page.getByText('precommit-nightly-0729', { exact: true })).toBeVisible();
   await expect(page.locator('.preflight-status__body strong')).toContainText('可提交 · 处理完成');
@@ -640,7 +640,7 @@ test('browses Tenant-wide Playground and Snapshot details', async ({ page }, tes
   const cancelDialog = page.locator('.el-message-box').filter({ hasText: '取消 Pre-commit' });
   await cancelDialog.getByRole('button', { name: '确认取消', exact: true }).click();
   await expect(page).toHaveURL(
-    /\/playgrounds\/nightly-review\/commit\?precommit_id=precommit-nightly-0729$/,
+    /\/workspaces\/nightly-review\/commit\?precommit_id=precommit-nightly-0729$/,
   );
   await expect(page.locator('.preflight-status__body strong')).toContainText('已取消 · 处理完成');
   await expect(page.locator('.preflight-status__body small')).toContainText(
@@ -650,7 +650,7 @@ test('browses Tenant-wide Playground and Snapshot details', async ({ page }, tes
   await expect(page.getByRole('button', { name: '失败重试' })).toHaveCount(0);
 
   await page.goto(
-    '/tenants/tenant-a/projects/project-language/artifacts/dialog-corpus/playgrounds/safety-review/commit',
+    '/tenants/tenant-a/projects/project-language/artifacts/dialog-corpus/workspaces/safety-review/commit',
   );
   await expect(page.getByRole('heading', { name: '没有活动 Pre-commit' })).toBeVisible();
   await expect(page.getByText('刷新此页面不会创建任务。')).toBeVisible();
@@ -683,7 +683,7 @@ test('browses Tenant-wide Playground and Snapshot details', async ({ page }, tes
   await expect(page.getByText(/refs\/heads/)).toHaveCount(0);
   await expect(page.getByText('12 GiB', { exact: true }).first()).toBeVisible();
   await expect(page.getByRole('heading', { name: '只读交付' })).toBeVisible();
-  await expect(page.getByRole('radio', { name: 'FUSE' })).toBeChecked();
+  await expect(page.getByText('固定模式：全部复制', { exact: true })).toBeVisible();
   await expect(page.getByText(/cn-shanghai/).first()).toBeVisible();
   await expect(page.getByText('cn-guangzhou', { exact: true })).toHaveCount(0);
   await page.screenshot({
@@ -703,7 +703,7 @@ test('browses Tenant-wide Playground and Snapshot details', async ({ page }, tes
   await expectNoOperatorDetails(page);
 });
 
-test('commits a Playground and delivers a fixed Snapshot', async ({ page }, testInfo) => {
+test('commits a Workspace and delivers a fixed Snapshot', async ({ page }, testInfo) => {
   testInfo.setTimeout(45_000);
   await page.addInitScript(() => {
     const nativeFetch = window.fetch.bind(window);
@@ -712,14 +712,14 @@ test('commits a Playground and delivers a fixed Snapshot', async ({ page }, test
     window.fetch = async (input, init) => {
       const request = input instanceof Request ? input : new Request(input, init);
       const url = new URL(request.url);
-      if (url.pathname.endsWith('/api/playground/commit/create') && rejectFirstCommit) {
+      if (url.pathname.endsWith('/api/workspace/commit/create') && rejectFirstCommit) {
         rejectFirstCommit = false;
         return new Response(
           JSON.stringify({
             type: 'urn:neoengram:problem:head-commit-conflict',
             title: 'Head Commit conflict',
             status: 409,
-            detail: 'The Playground Head changed after Pre-commit froze it',
+            detail: 'The Workspace Head changed after Pre-commit froze it',
             instance: url.pathname,
             code: 'HEAD_COMMIT_CONFLICT',
             request_id: 'req-e2e-head-conflict',
@@ -739,13 +739,13 @@ test('commits a Playground and delivers a fixed Snapshot', async ({ page }, test
   });
 
   await page.goto(
-    '/tenants/tenant-a/projects/project-vision/artifacts/road-scenes/playgrounds/labeling',
+    '/tenants/tenant-a/projects/project-vision/artifacts/road-scenes/workspaces/labeling',
   );
   await page.getByRole('button', { name: '发起 Pre-commit', exact: true }).click();
   await expect(page).toHaveURL(
-    /\/tenants\/tenant-a\/projects\/project-vision\/artifacts\/road-scenes\/playgrounds\/labeling\/commit\?precommit_id=precommit-[^&]+$/,
+    /\/tenants\/tenant-a\/projects\/project-vision\/artifacts\/road-scenes\/workspaces\/labeling\/commit\?precommit_id=precommit-[^&]+$/,
   );
-  await expect(page.getByRole('heading', { name: '提交 Playground' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '提交 Workspace' })).toBeVisible();
   await expect(page.getByText('road-scenes / labeling', { exact: true })).toBeVisible();
   await expect(page.getByText('tenant-a / project-vision', { exact: true })).toBeVisible();
   await expect(page.locator('.preflight-status__body strong')).toContainText('可提交 · 处理完成');
@@ -784,7 +784,7 @@ test('commits a Playground and delivers a fixed Snapshot', async ({ page }, test
   const redetectDialog = page.locator('.el-message-box').filter({ hasText: '重新检测' });
   await redetectDialog.getByRole('button', { name: '重新检测', exact: true }).click();
   await expect(page.locator('.preflight-status__body strong')).toContainText('可提交 · 处理完成');
-  // 存储可达的 Playground 保留完整的取消与重试闭环。
+  // 存储可达的 Workspace 保留完整的取消与重试闭环。
   await page.getByRole('button', { name: '取消 Pre-commit' }).click();
   const cancelDialog = page.locator('.el-message-box').filter({ hasText: '取消 Pre-commit' });
   await cancelDialog.getByRole('button', { name: '确认取消', exact: true }).click();

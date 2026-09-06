@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use super::validation::{parse_unique_json, validate_extension_keys, CONTENT_DIGEST_PATTERN};
 use crate::{
     jcs_blake3, jcs_bytes, ArtifactId, ArtifactPlacementId, DecimalU64, Extensions, IndexRevision,
-    JobId, MetadataBatchId, ObjectReceiptId, PlaygroundId, ProjectId, ProtocolError,
-    ProtocolResult, StorageVolumeId, TenantId, UnixMillis, MAX_METADATA_PAGE_BYTES,
+    JobId, MetadataBatchId, ObjectReceiptId, ProjectId, ProtocolError, ProtocolResult,
+    StorageVolumeId, TenantId, UnixMillis, WorkspaceId, MAX_METADATA_PAGE_BYTES,
     MAX_RECORDS_PER_PAGE,
 };
 
@@ -95,7 +95,10 @@ pub struct MetadataBatchScope {
     pub tenant_id: TenantId,
     pub project_id: ProjectId,
     pub artifact_id: ArtifactId,
-    pub playground_id: PlaygroundId,
+    /// Workspace identity. The Rust field name remains an internal migration detail; the v2 wire
+    /// contract accepts only `workspace_id` and deliberately has no `workspace_id` alias.
+    #[serde(rename = "workspace_id")]
+    pub workspace_id: WorkspaceId,
     pub job_id: JobId,
     pub base_index_version: WireIndexVersion,
     #[serde(default, flatten)]
@@ -111,7 +114,7 @@ impl MetadataBatchScope {
                 "tenant_id",
                 "project_id",
                 "artifact_id",
-                "playground_id",
+                "workspace_id",
                 "job_id",
                 "base_index_version",
             ],
@@ -1084,7 +1087,7 @@ impl MetadataPublication {
             scope.tenant_id.as_str(),
             scope.project_id.as_str(),
             scope.artifact_id.as_str(),
-            scope.playground_id.as_str(),
+            scope.workspace_id.as_str(),
             scope.job_id.as_str(),
             &base_index_version,
             &index_delta,
@@ -1159,7 +1162,7 @@ mod tests {
             tenant_id: TenantId::new("tenant-a").unwrap(),
             project_id: ProjectId::new("project-a").unwrap(),
             artifact_id: ArtifactId::new("artifact-a").unwrap(),
-            playground_id: PlaygroundId::new("playground-a").unwrap(),
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
             job_id: JobId::new("job-a").unwrap(),
             base_index_version: WireIndexVersion {
                 revision: IndexRevision::new(4),
@@ -1303,7 +1306,7 @@ mod tests {
         descriptor.validate_page(&second).unwrap();
 
         let mut wrong_scope = second;
-        wrong_scope.scope.playground_id = PlaygroundId::new("playground-b").unwrap();
+        wrong_scope.scope.workspace_id = WorkspaceId::new("workspace-b").unwrap();
         wrong_scope.page_digest = wrong_scope.computed_digest().unwrap();
         assert!(descriptor.validate_page(&wrong_scope).is_err());
     }

@@ -5,9 +5,9 @@ use fusen_rs::ErrorCategory;
 use neoengram_central::{
     dto::{
         ArtifactInitialization as ArtifactInitializationBody, CreateArtifactRequest,
-        CreateDeletionRequest, CreatePlaygroundRequest, QueryArtifactCommitGraphRequest,
+        CreateDeletionRequest, CreateWorkspaceRequest, QueryArtifactCommitGraphRequest,
         QueryArtifactListRequest, QueryArtifactRequest, QueryDeletionImpactRequest,
-        QueryPlaygroundRequest, QueryStorageVolumeListRequest, QueryStorageVolumeRequest,
+        QueryStorageVolumeListRequest, QueryStorageVolumeRequest, QueryWorkspaceRequest,
         ResourceRefBody,
     },
     AuthenticatedIdentity, CatalogService, Permission, StaticRbacPolicy,
@@ -15,14 +15,14 @@ use neoengram_central::{
 };
 use neoengram_central::{
     ArtifactInitialization, ArtifactRecord, CatalogPvcReference, CentralResult,
-    ControlCatalogRepository, DerivedVolumeState, InMemoryComponents, PlaygroundRecord,
-    PlaygroundState, StorageAccessMode, StorageBackendType, StorageVolumeRecord,
-    StorageVolumeState, TenantRecord,
+    ControlCatalogRepository, DerivedVolumeState, InMemoryComponents, StorageAccessMode,
+    StorageBackendType, StorageVolumeRecord, StorageVolumeState, TenantRecord, WorkspaceRecord,
+    WorkspaceState,
 };
 use neoengram_domain::core::ContentDigest;
 use neoengram_domain::protocol::{
-    ArtifactId, EdgeClusterId, PlaygroundId, PrincipalKind, ProjectId, StorageVolumeId, TenantId,
-    UnixMillis,
+    ArtifactId, EdgeClusterId, PrincipalKind, ProjectId, StorageVolumeId, TenantId, UnixMillis,
+    WorkspaceId,
 };
 
 mod support;
@@ -69,8 +69,8 @@ fn api_version_advertises_the_minimal_artifact_catalog() {
         .iter()
         .any(|capability| capability == "aggregate_browser"));
     for capability in [
-        "playground_materialize",
-        "playground_precommit",
+        "workspace_materialize",
+        "workspace_precommit",
         "commit_materialization_v2",
     ] {
         assert!(!version
@@ -83,11 +83,11 @@ fn api_version_advertises_the_minimal_artifact_catalog() {
     assert!(storage_enabled
         .capabilities
         .iter()
-        .any(|capability| capability == "playground_materialize"));
+        .any(|capability| capability == "workspace_materialize"));
     assert!(storage_enabled
         .capabilities
         .iter()
-        .any(|capability| capability == "playground_precommit"));
+        .any(|capability| capability == "workspace_precommit"));
     assert!(storage_enabled
         .capabilities
         .iter()
@@ -143,7 +143,7 @@ async fn artifact_catalog_is_idempotent_paginated_and_tenant_isolated() {
         .create_artifact(&identity, request.clone())
         .await
         .unwrap();
-    assert!(!created.replayed);
+    assert!(!created.request_replayed);
     assert_eq!(
         created.artifact.initialization,
         ArtifactInitializationBody::Empty
@@ -151,7 +151,7 @@ async fn artifact_catalog_is_idempotent_paginated_and_tenant_isolated() {
     assert!(created.artifact.head_commit_id.is_none());
 
     let replayed = service.create_artifact(&identity, request).await.unwrap();
-    assert!(replayed.replayed);
+    assert!(replayed.request_replayed);
     components.clock.advance(1).unwrap();
     service
         .create_artifact(
@@ -310,7 +310,7 @@ async fn artifact_catalog_is_idempotent_paginated_and_tenant_isolated() {
 }
 
 #[tokio::test]
-async fn playground_requires_an_artifact_and_freezes_the_authoritative_head() {
+async fn workspace_requires_an_artifact_and_freezes_the_authoritative_head() {
     let components = InMemoryComponents::new(1_000);
     let tenant_id = TenantId::new("tenant-a").unwrap();
     let project_id = ProjectId::new("project-a").unwrap();
@@ -350,14 +350,14 @@ async fn playground_requires_an_artifact_and_freezes_the_authoritative_head() {
     let service = catalog_service(
         &components,
         [tenant_id.to_string()],
-        [Permission::PlaygroundCreate],
+        [Permission::WorkspaceCreate],
     );
     let identity = identity();
 
     let missing = service
-        .create_playground(
+        .create_workspace(
             &identity,
-            create_playground_request("playground-missing", None),
+            create_workspace_request("workspace-missing", None),
         )
         .await
         .unwrap_err();
@@ -383,61 +383,61 @@ async fn playground_requires_an_artifact_and_freezes_the_authoritative_head() {
         .unwrap();
     components
         .control_catalog
-        .insert_playground(PlaygroundRecord {
+        .insert_workspace(WorkspaceRecord {
             tenant_id,
             project_id,
             artifact_id,
-            playground_id: PlaygroundId::new("playground-replay").unwrap(),
+            workspace_id: WorkspaceId::new("workspace-replay").unwrap(),
             storage_volume_id: volume_id,
             region: "cn-shanghai".to_owned(),
-            display_name: "Playground".to_owned(),
+            display_name: "Workspace".to_owned(),
             base_commit_id: Some(head),
             head_commit_id: Some(head),
-            state: PlaygroundState::Ready,
+            state: WorkspaceState::Ready,
             resource_version: 1,
             lifecycle: neoengram_domain::protocol::ResourceLifecycle::active(),
-            relative_root: "playgrounds/project-a/artifact-a/playground-replay".to_owned(),
+            relative_root: "workspaces/project-a/artifact-a/workspace-replay".to_owned(),
             created_at_unix_ms: UnixMillis::new(1_000),
             updated_at_unix_ms: UnixMillis::new(1_000),
         })
         .await
         .unwrap();
     let omitted_base = service
-        .create_playground(
+        .create_workspace(
             &identity,
-            create_playground_request("playground-replay", None),
+            create_workspace_request("workspace-replay", None),
         )
         .await
         .unwrap();
-    assert!(omitted_base.replayed);
+    assert!(omitted_base.request_replayed);
     assert_eq!(
-        omitted_base.playground.base_commit_id,
+        omitted_base.workspace.base_commit_id,
         Some(head.to_string())
     );
 
     let replay = service
-        .create_playground(
+        .create_workspace(
             &identity,
-            create_playground_request("playground-replay", Some(head.to_string())),
+            create_workspace_request("workspace-replay", Some(head.to_string())),
         )
         .await
         .unwrap();
-    assert!(replay.replayed);
+    assert!(replay.request_replayed);
 
     let inherited = service
-        .create_playground(
+        .create_workspace(
             &identity,
-            create_playground_request("playground-inherited", None),
+            create_workspace_request("workspace-inherited", None),
         )
         .await
         .unwrap();
-    assert!(!inherited.replayed);
-    assert_eq!(inherited.playground.base_commit_id, Some(head.to_string()));
+    assert!(!inherited.request_replayed);
+    assert_eq!(inherited.workspace.base_commit_id, Some(head.to_string()));
 
     let missing_commit = service
-        .create_playground(
+        .create_workspace(
             &identity,
-            create_playground_request("playground-mismatch", Some("bb".repeat(32))),
+            create_workspace_request("workspace-mismatch", Some("bb".repeat(32))),
         )
         .await
         .unwrap_err();
@@ -445,7 +445,7 @@ async fn playground_requires_an_artifact_and_freezes_the_authoritative_head() {
 }
 
 #[tokio::test]
-async fn playground_create_fails_closed_without_live_storage_availability() {
+async fn workspace_create_fails_closed_without_live_storage_availability() {
     let components = InMemoryComponents::new(1_000);
     let tenant_id = TenantId::new("tenant-a").unwrap();
     insert_tenant(&components, tenant_id.clone()).await;
@@ -500,7 +500,7 @@ async fn playground_create_fails_closed_without_live_storage_availability() {
         StaticRbacPolicy::one_principal(
             "user-a",
             [tenant_id.to_string()],
-            [Permission::PlaygroundCreate],
+            [Permission::WorkspaceCreate],
         )
         .unwrap(),
     );
@@ -513,9 +513,9 @@ async fn playground_create_fails_closed_without_live_storage_availability() {
     .with_precommits(components.precommits.clone());
 
     let error = service
-        .create_playground(
+        .create_workspace(
             &identity(),
-            create_playground_request("playground-no-registry", None),
+            create_workspace_request("workspace-no-registry", None),
         )
         .await
         .unwrap_err();
@@ -524,12 +524,12 @@ async fn playground_create_fails_closed_without_live_storage_availability() {
 }
 
 #[tokio::test]
-async fn playground_lifecycle_and_live_storage_availability_are_independent() {
+async fn workspace_lifecycle_and_live_storage_availability_are_independent() {
     let components = InMemoryComponents::new(1_000);
     let tenant_id = TenantId::new("tenant-a").unwrap();
     let project_id = ProjectId::new("project-a").unwrap();
     let artifact_id = ArtifactId::new("artifact-a").unwrap();
-    let playground_id = PlaygroundId::new("playground-a").unwrap();
+    let workspace_id = WorkspaceId::new("workspace-a").unwrap();
     let storage_volume_id = StorageVolumeId::new("volume-a").unwrap();
     insert_tenant(&components, tenant_id.clone()).await;
     components
@@ -581,20 +581,20 @@ async fn playground_lifecycle_and_live_storage_availability_are_independent() {
         .unwrap();
     components
         .control_catalog
-        .insert_playground(PlaygroundRecord {
+        .insert_workspace(WorkspaceRecord {
             tenant_id: tenant_id.clone(),
             project_id: project_id.clone(),
             artifact_id: artifact_id.clone(),
-            playground_id: playground_id.clone(),
+            workspace_id: workspace_id.clone(),
             storage_volume_id,
             region: "cn-shanghai".to_owned(),
-            display_name: "Playground A".to_owned(),
+            display_name: "Workspace A".to_owned(),
             base_commit_id: None,
             head_commit_id: None,
-            state: PlaygroundState::Ready,
+            state: WorkspaceState::Ready,
             resource_version: 1,
             lifecycle: neoengram_domain::protocol::ResourceLifecycle::active(),
-            relative_root: "playgrounds/project-a/artifact-a/playground-a".to_owned(),
+            relative_root: "workspaces/project-a/artifact-a/workspace-a".to_owned(),
             created_at_unix_ms: UnixMillis::new(1_000),
             updated_at_unix_ms: UnixMillis::new(1_000),
         })
@@ -604,15 +604,15 @@ async fn playground_lifecycle_and_live_storage_availability_are_independent() {
         StaticRbacPolicy::one_principal(
             "user-a",
             [tenant_id.to_string()],
-            [Permission::PlaygroundRead],
+            [Permission::WorkspaceRead],
         )
         .unwrap(),
     );
-    let request = QueryPlaygroundRequest {
+    let request = QueryWorkspaceRequest {
         tenant_id: tenant_id.to_string(),
         project_id: project_id.to_string(),
         artifact_id: artifact_id.to_string(),
-        playground_id: playground_id.to_string(),
+        workspace_id: workspace_id.to_string(),
     };
 
     let unavailable = CatalogService::new(
@@ -624,11 +624,11 @@ async fn playground_lifecycle_and_live_storage_availability_are_independent() {
     .with_storage_availability_provider(Arc::new(FixedStorageAvailability(
         DerivedVolumeState::Unavailable,
     )))
-    .query_playground(&identity(), request.clone())
+    .query_workspace(&identity(), request.clone())
     .await
     .unwrap();
-    assert_eq!(unavailable.playground.state, "ready");
-    assert_eq!(unavailable.playground.storage_availability, "unavailable");
+    assert_eq!(unavailable.workspace.state, "ready");
+    assert_eq!(unavailable.workspace.storage_availability, "unavailable");
 
     let unknown = CatalogService::new(
         components.control_catalog.clone(),
@@ -636,11 +636,11 @@ async fn playground_lifecycle_and_live_storage_availability_are_independent() {
         policy,
         components.clock.clone(),
     )
-    .query_playground(&identity(), request)
+    .query_workspace(&identity(), request)
     .await
     .unwrap();
-    assert_eq!(unknown.playground.state, "ready");
-    assert_eq!(unknown.playground.storage_availability, "unknown");
+    assert_eq!(unknown.workspace.state, "ready");
+    assert_eq!(unknown.workspace.storage_availability, "unknown");
 }
 
 #[tokio::test]
@@ -729,7 +729,7 @@ async fn storage_volume_views_use_live_availability_when_configured() {
 }
 
 #[tokio::test]
-async fn playground_create_rejects_an_unreachable_live_storage_volume() {
+async fn workspace_create_rejects_an_unreachable_live_storage_volume() {
     let components = InMemoryComponents::new(1_000);
     let tenant_id = TenantId::new("tenant-a").unwrap();
     insert_tenant(&components, tenant_id.clone()).await;
@@ -784,7 +784,7 @@ async fn playground_create_rejects_an_unreachable_live_storage_volume() {
         StaticRbacPolicy::one_principal(
             "user-a",
             [tenant_id.to_string()],
-            [Permission::PlaygroundCreate],
+            [Permission::WorkspaceCreate],
         )
         .unwrap(),
     );
@@ -800,9 +800,9 @@ async fn playground_create_rejects_an_unreachable_live_storage_volume() {
     )));
 
     let error = service
-        .create_playground(
+        .create_workspace(
             &identity(),
-            create_playground_request("playground-unreachable", None),
+            create_workspace_request("workspace-unreachable", None),
         )
         .await
         .unwrap_err();
@@ -885,7 +885,7 @@ async fn deletion_create_uses_the_saved_impact_snapshot_after_time_moves() {
         .await
         .unwrap();
     assert_eq!(created.deletion.state, "requested");
-    assert!(!created.replayed);
+    assert!(!created.request_replayed);
 }
 
 fn catalog_service(
@@ -930,17 +930,17 @@ fn create_artifact_request(artifact_id: &str, display_name: &str) -> CreateArtif
     }
 }
 
-fn create_playground_request(
-    playground_id: &str,
+fn create_workspace_request(
+    workspace_id: &str,
     base_commit_id: Option<String>,
-) -> CreatePlaygroundRequest {
-    CreatePlaygroundRequest {
+) -> CreateWorkspaceRequest {
+    CreateWorkspaceRequest {
         tenant_id: "tenant-a".to_owned(),
         project_id: "project-a".to_owned(),
         artifact_id: "artifact-a".to_owned(),
-        playground_id: playground_id.to_owned(),
+        workspace_id: workspace_id.to_owned(),
         storage_volume_id: "volume-a".to_owned(),
-        display_name: "Playground".to_owned(),
+        display_name: "Workspace".to_owned(),
         base_commit_id,
     }
 }

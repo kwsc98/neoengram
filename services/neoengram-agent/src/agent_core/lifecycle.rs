@@ -535,9 +535,10 @@ fn identity_mismatch() -> AgentError {
 mod tests {
     use neoengram_domain::protocol::{
         AgentId, AgentMountId, AgentResourceLifecycleScope, ArtifactId, ArtifactPlacementId,
-        ContentDigest, DeletionId, EdgeClusterId, LifecycleAssignmentId, LifecycleGeneration,
-        PlacementGeneration, ProjectId, ResourceLifecycleAction, ResourceLifecycleAssignment,
-        ResourceRef, StorageVolumeId, TenantId, UnixMillis, VolumeMarkerId,
+        ContentDigest, DeletionId, EdgeClusterId, Generation, LifecycleAssignmentId,
+        LifecycleGeneration, PlacementGeneration, ProjectId, ResourceLifecycleAction,
+        ResourceLifecycleAssignment, ResourceRef, StorageVolumeId, TaskExecutionFence, TaskId,
+        TenantId, UnixMillis, VolumeMarkerId,
     };
 
     use super::*;
@@ -557,6 +558,13 @@ mod tests {
                 request_digest: ContentDigest::from_bytes([0x11; 32]),
                 deadline_unix_ms: UnixMillis::new(10_000),
             },
+            task_fence: TaskExecutionFence::new(
+                TaskId::new("task-del-1").unwrap(),
+                Generation::new(1),
+                "quarantine",
+                Generation::new(1),
+                Generation::new(1),
+            ),
             resource_scope: AgentResourceLifecycleScope::Artifact {
                 project_id: ProjectId::new("project-a").unwrap(),
                 artifact_id: ArtifactId::new("artifact-a").unwrap(),

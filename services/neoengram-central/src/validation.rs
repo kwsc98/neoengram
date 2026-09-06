@@ -7,7 +7,7 @@ use neoengram_domain::core::{
 use neoengram_domain::protocol::{
     AddAssignment, AssignmentGeneration, AssignmentId, IndexDeltaRecord, JobPrepared, JobState,
     LeaseMode, ManifestRecord, MetadataBatchDescriptor, MetadataBatchKind, MetadataBatchRecords,
-    MetadataPublication, WireIndexVersion,
+    MetadataPublication, TaskExecutionFence, WireIndexVersion,
 };
 
 use crate::{
@@ -124,6 +124,7 @@ pub(crate) fn validate_prepared(job: &JobRecord, prepared: &JobPrepared) -> Cent
         &prepared.job_id,
         &prepared.assignment_id,
         prepared.assignment_generation,
+        &prepared.task_fence,
     )?;
     if !same_index_version(
         &prepared.base_index_version,
@@ -171,7 +172,7 @@ pub(crate) fn validate_descriptor_scope(
     if scope.tenant_id != assignment.tenant_id
         || scope.project_id != assignment.project_id
         || scope.artifact_id != assignment.artifact_id
-        || scope.playground_id != assignment.playground_id
+        || scope.workspace_id != assignment.workspace_id
         || scope.job_id != assignment.job_id
         || !same_index_version(
             &scope.base_index_version,
@@ -191,6 +192,7 @@ pub(crate) fn validate_report_identity(
     job_id: &neoengram_domain::protocol::JobId,
     assignment_id: &AssignmentId,
     generation: AssignmentGeneration,
+    task_fence: &TaskExecutionFence,
 ) -> CentralResult<()> {
     if job_id != &assignment.job_id || assignment_id != &assignment.assignment_id {
         return Err(invalid(
@@ -202,6 +204,12 @@ pub(crate) fn validate_report_identity(
         return Err(invalid(
             CentralErrorCode::GenerationMismatch,
             "agent report carries a stale assignment generation",
+        ));
+    }
+    if task_fence != &assignment.task_fence {
+        return Err(invalid(
+            CentralErrorCode::GenerationMismatch,
+            "agent report carries a stale task execution fence",
         ));
     }
     Ok(())

@@ -320,7 +320,11 @@ async function materializeTo(volumeId: string): Promise<void> {
   } else if (result.mode === 'in_flight') {
     ElMessage.info('该目标已有物化任务在执行');
   } else {
-    ElMessage.success(result.result?.data.replayed ? '已返回同一物化任务' : '副本物化已排队');
+    ElMessage.success(
+      result.result && (result.result.data.request_replayed || result.result.data.execution_reused)
+        ? '已返回同一物化任务'
+        : '副本物化已排队',
+    );
   }
 }
 
@@ -332,7 +336,11 @@ async function repairVolume(volumeId: string): Promise<void> {
   } else if (result.mode === 'in_flight') {
     ElMessage.info('该副本已有物化任务在执行');
   } else {
-    ElMessage.success(result.result?.data.replayed ? '已返回同一修复任务' : '副本修复已重新排队');
+    ElMessage.success(
+      result.result && (result.result.data.request_replayed || result.result.data.execution_reused)
+        ? '已返回同一修复任务'
+        : '副本修复已重新排队',
+    );
   }
 }
 

@@ -15,36 +15,36 @@ import { useRoute, useRouter } from 'vue-router';
 
 import {
   queryApiVersion,
-  queryPlayground,
-  queryPlaygroundChangeList,
-  queryPlaygroundDatasetProfile,
-  queryPlaygroundFileList,
-  queryPlaygroundFileMetadata,
-  startPlaygroundPreCommit,
+  queryWorkspace,
+  queryWorkspaceChangeList,
+  queryWorkspaceDatasetProfile,
+  queryWorkspaceFileList,
+  queryWorkspaceFileMetadata,
+  startWorkspacePreCommit,
 } from '@/api/operations';
-import type { DataLayout, PlaygroundChangeEntry, StartPreCommitRequest } from '@/api/types';
+import type { DataLayout, WorkspaceChangeEntry, StartPreCommitRequest } from '@/api/types';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import PageCursor from '@/components/PageCursor.vue';
 import PageHeading from '@/components/PageHeading.vue';
 import {
   supportsCommitLayoutSelection,
   supportsArtifactCommitGraph,
-  supportsPlaygroundBrowser,
-  supportsPlaygroundPreCommit,
+  supportsWorkspaceBrowser,
+  supportsWorkspacePreCommit,
 } from '@/features/capabilities';
 import {
-  isPlaygroundOperational,
-  playgroundLifecycleLabel,
-  playgroundLifecycleTagType,
-  playgroundPollInterval,
-  playgroundStorageAvailability,
-  playgroundStorageAvailabilityLabel,
-  playgroundStorageAvailabilityTagType,
+  isWorkspaceOperational,
+  workspaceLifecycleLabel,
+  workspaceLifecycleTagType,
+  workspacePollInterval,
+  workspaceStorageAvailability,
+  workspaceStorageAvailabilityLabel,
+  workspaceStorageAvailabilityTagType,
 } from '@/features/precommit/status';
 import { useTenantsStore } from '@/stores/tenants';
 import { formatBytes, formatCount, formatTime } from '@/utils/format';
 
-type ChangeFilter = 'all' | PlaygroundChangeEntry['change_type'];
+type ChangeFilter = 'all' | WorkspaceChangeEntry['change_type'];
 
 const route = useRoute();
 const router = useRouter();
@@ -53,10 +53,10 @@ const tenants = useTenantsStore();
 const tenantId = computed(() => String(route.params.tenantId ?? ''));
 const projectId = computed(() => String(route.params.projectId ?? ''));
 const artifactId = computed(() => String(route.params.artifactId ?? ''));
-const playgroundId = computed(() => String(route.params.playgroundId ?? ''));
-const playgroundKey = computed(
+const workspaceId = computed(() => String(route.params.workspaceId ?? ''));
+const workspaceKey = computed(
   () =>
-    ['playground', tenantId.value, projectId.value, artifactId.value, playgroundId.value] as const,
+    ['workspace', tenantId.value, projectId.value, artifactId.value, workspaceId.value] as const,
 );
 
 const workspaceTab = ref('changes');
@@ -81,11 +81,11 @@ const versionQuery = useQuery({
   queryFn: queryApiVersion,
   staleTime: Number.POSITIVE_INFINITY,
 });
-const playgroundBrowserEnabled = computed(() =>
-  supportsPlaygroundBrowser(versionQuery.data.value?.data.capabilities),
+const workspaceBrowserEnabled = computed(() =>
+  supportsWorkspaceBrowser(versionQuery.data.value?.data.capabilities),
 );
-const playgroundPreCommitEnabled = computed(() =>
-  supportsPlaygroundPreCommit(versionQuery.data.value?.data.capabilities),
+const workspacePreCommitEnabled = computed(() =>
+  supportsWorkspacePreCommit(versionQuery.data.value?.data.capabilities),
 );
 const commitLayoutSelectionEnabled = computed(() =>
   supportsCommitLayoutSelection(versionQuery.data.value?.data.capabilities),
@@ -93,18 +93,18 @@ const commitLayoutSelectionEnabled = computed(() =>
 const artifactCommitGraphEnabled = computed(() =>
   supportsArtifactCommitGraph(versionQuery.data.value?.data.capabilities),
 );
-const playgroundQuery = useQuery({
-  queryKey: playgroundKey,
+const workspaceQuery = useQuery({
+  queryKey: workspaceKey,
   queryFn: () =>
-    queryPlayground(tenantId.value, projectId.value, artifactId.value, playgroundId.value),
-  refetchInterval: (query) => playgroundPollInterval(query.state.data?.data.playground),
+    queryWorkspace(tenantId.value, projectId.value, artifactId.value, workspaceId.value),
+  refetchInterval: (query) => workspacePollInterval(query.state.data?.data.workspace),
 });
-const playground = computed(() => playgroundQuery.data.value?.data.playground);
-const storageAvailability = computed(() => playgroundStorageAvailability(playground.value));
-const playgroundOperational = computed(() => isPlaygroundOperational(playground.value));
-const playgroundMaterialized = computed(() => playground.value?.state === 'ready');
-const playgroundIndexVersionKey = computed(() => {
-  const indexVersion = playground.value?.index_version;
+const workspace = computed(() => workspaceQuery.data.value?.data.workspace);
+const storageAvailability = computed(() => workspaceStorageAvailability(workspace.value));
+const workspaceOperational = computed(() => isWorkspaceOperational(workspace.value));
+const workspaceMaterialized = computed(() => workspace.value?.state === 'ready');
+const workspaceIndexVersionKey = computed(() => {
+  const indexVersion = workspace.value?.index_version;
   return indexVersion ? `${indexVersion.revision}:${indexVersion.digest}` : '';
 });
 
@@ -112,12 +112,12 @@ const changeQuery = useQuery({
   queryKey: computed(
     () =>
       [
-        'playground-changes',
+        'workspace-changes',
         tenantId.value,
         projectId.value,
         artifactId.value,
-        playgroundId.value,
-        playgroundIndexVersionKey.value,
+        workspaceId.value,
+        workspaceIndexVersionKey.value,
         'workspace',
         changeType.value,
         changePathPrefix.value,
@@ -125,68 +125,68 @@ const changeQuery = useQuery({
       ] as const,
   ),
   queryFn: () =>
-    queryPlaygroundChangeList({
+    queryWorkspaceChangeList({
       tenant_id: tenantId.value,
       project_id: projectId.value,
       artifact_id: artifactId.value,
-      playground_id: playgroundId.value,
+      workspace_id: workspaceId.value,
       page_size: 50,
       ...(changeType.value !== 'all' ? { change_type: changeType.value } : {}),
       ...(changePathPrefix.value ? { path_prefix: changePathPrefix.value } : {}),
       ...(changeCursor.value ? { cursor: changeCursor.value } : {}),
     }),
-  enabled: computed(() => playgroundBrowserEnabled.value && playgroundMaterialized.value),
+  enabled: computed(() => workspaceBrowserEnabled.value && workspaceMaterialized.value),
 });
 
 const fileQuery = useQuery({
   queryKey: computed(
     () =>
       [
-        'playground-files',
+        'workspace-files',
         tenantId.value,
         projectId.value,
         artifactId.value,
-        playgroundId.value,
-        playgroundIndexVersionKey.value,
+        workspaceId.value,
+        workspaceIndexVersionKey.value,
         filePathPrefix.value,
         fileFormat.value,
         fileCursor.value ?? '',
       ] as const,
   ),
   queryFn: () =>
-    queryPlaygroundFileList({
+    queryWorkspaceFileList({
       tenant_id: tenantId.value,
       project_id: projectId.value,
       artifact_id: artifactId.value,
-      playground_id: playgroundId.value,
+      workspace_id: workspaceId.value,
       page_size: 50,
       ...(filePathPrefix.value ? { path_prefix: filePathPrefix.value } : {}),
       ...(fileFormat.value ? { format: fileFormat.value } : {}),
       ...(fileCursor.value ? { cursor: fileCursor.value } : {}),
     }),
-  enabled: computed(() => playgroundBrowserEnabled.value && playgroundMaterialized.value),
+  enabled: computed(() => workspaceBrowserEnabled.value && workspaceMaterialized.value),
 });
 
 const profileQuery = useQuery({
   queryKey: computed(
     () =>
       [
-        'playground-dataset-profile',
+        'workspace-dataset-profile',
         tenantId.value,
         projectId.value,
         artifactId.value,
-        playgroundId.value,
-        playgroundIndexVersionKey.value,
+        workspaceId.value,
+        workspaceIndexVersionKey.value,
       ] as const,
   ),
   queryFn: () =>
-    queryPlaygroundDatasetProfile({
+    queryWorkspaceDatasetProfile({
       tenant_id: tenantId.value,
       project_id: projectId.value,
       artifact_id: artifactId.value,
-      playground_id: playgroundId.value,
+      workspace_id: workspaceId.value,
     }),
-  enabled: computed(() => playgroundBrowserEnabled.value && playgroundMaterialized.value),
+  enabled: computed(() => workspaceBrowserEnabled.value && workspaceMaterialized.value),
 });
 const profile = computed(() => profileQuery.data.value?.data.profile);
 
@@ -194,43 +194,43 @@ const metadataQuery = useQuery({
   queryKey: computed(
     () =>
       [
-        'playground-file-metadata',
+        'workspace-file-metadata',
         tenantId.value,
         projectId.value,
         artifactId.value,
-        playgroundId.value,
-        playgroundIndexVersionKey.value,
+        workspaceId.value,
+        workspaceIndexVersionKey.value,
         selectedFilePath.value,
       ] as const,
   ),
   queryFn: () =>
-    queryPlaygroundFileMetadata({
+    queryWorkspaceFileMetadata({
       tenant_id: tenantId.value,
       project_id: projectId.value,
       artifact_id: artifactId.value,
-      playground_id: playgroundId.value,
+      workspace_id: workspaceId.value,
       path: selectedFilePath.value,
     }),
   enabled: computed(
     () =>
-      playgroundBrowserEnabled.value &&
-      playgroundMaterialized.value &&
+      workspaceBrowserEnabled.value &&
+      workspaceMaterialized.value &&
       metadataDrawerOpen.value &&
       Boolean(selectedFilePath.value),
   ),
 });
 const metadata = computed(() => metadataQuery.data.value?.data.metadata);
 
-const startMutation = useMutation({ mutationFn: startPlaygroundPreCommit });
+const startMutation = useMutation({ mutationFn: startWorkspacePreCommit });
 const hasCommitPermission = computed(
-  () => tenants.byId(tenantId.value)?.permissions.includes('playground.create') ?? false,
+  () => tenants.byId(tenantId.value)?.permissions.includes('workspace.create') ?? false,
 );
 const canStartPreCommit = computed(
   () =>
-    playgroundPreCommitEnabled.value &&
+    workspacePreCommitEnabled.value &&
     hasCommitPermission.value &&
-    playgroundOperational.value &&
-    !playground.value?.active_precommit_id,
+    workspaceOperational.value &&
+    !workspace.value?.active_precommit_id,
 );
 
 const changeSummary = computed(() => changeQuery.data.value?.data.summary);
@@ -246,14 +246,14 @@ function resetFileCursor(): void {
 }
 
 watch(changeType, resetChangeCursor);
-watch([tenantId, projectId, artifactId, playgroundId], () => {
+watch([tenantId, projectId, artifactId, workspaceId], () => {
   resetChangeCursor();
   resetFileCursor();
   selectedFilePath.value = '';
   metadataDrawerOpen.value = false;
   pendingStartRequest.value = undefined;
 });
-watch(playgroundIndexVersionKey, () => {
+watch(workspaceIndexVersionKey, () => {
   resetChangeCursor();
   resetFileCursor();
   selectedFilePath.value = '';
@@ -293,12 +293,12 @@ function previousFilePage(): void {
   fileCursor.value = fileCursorHistory.value.pop() || undefined;
 }
 
-function changeTypeLabel(type: PlaygroundChangeEntry['change_type']): string {
+function changeTypeLabel(type: WorkspaceChangeEntry['change_type']): string {
   return { added: '新增', modified: '修改', deleted: '删除', renamed: '重命名' }[type];
 }
 
 function changeTagType(
-  type: PlaygroundChangeEntry['change_type'],
+  type: WorkspaceChangeEntry['change_type'],
 ): 'success' | 'warning' | 'danger' | 'info' {
   if (type === 'added') return 'success';
   if (type === 'modified') return 'warning';
@@ -306,11 +306,11 @@ function changeTagType(
   return 'info';
 }
 
-function changeSize(row: PlaygroundChangeEntry): string {
+function changeSize(row: WorkspaceChangeEntry): string {
   return formatBytes(row.new_size_bytes ?? row.old_size_bytes);
 }
 
-function changeImpact(row: PlaygroundChangeEntry): string {
+function changeImpact(row: WorkspaceChangeEntry): string {
   if (row.old_size_bytes === undefined && row.new_size_bytes === undefined) return '—';
   const oldSize = BigInt(row.old_size_bytes ?? '0');
   const newSize = BigInt(row.new_size_bytes ?? '0');
@@ -319,36 +319,36 @@ function changeImpact(row: PlaygroundChangeEntry): string {
 }
 
 function showFileMetadata(path: string): void {
-  if (!playgroundBrowserEnabled.value || !playgroundMaterialized.value) return;
+  if (!workspaceBrowserEnabled.value || !workspaceMaterialized.value) return;
   selectedFilePath.value = path;
   metadataDrawerOpen.value = true;
 }
 
 async function openCommitPage(): Promise<void> {
-  if (!playgroundPreCommitEnabled.value) return;
+  if (!workspacePreCommitEnabled.value) return;
   await router.push({
-    name: 'playground-commit',
+    name: 'workspace-commit',
     params: {
       tenantId: tenantId.value,
       projectId: projectId.value,
       artifactId: artifactId.value,
-      playgroundId: playgroundId.value,
+      workspaceId: workspaceId.value,
     },
-    ...(playground.value?.active_precommit_id
-      ? { query: { precommit_id: playground.value.active_precommit_id } }
+    ...(workspace.value?.active_precommit_id
+      ? { query: { precommit_id: workspace.value.active_precommit_id } }
       : {}),
   });
 }
 
 async function startPreCommit(): Promise<void> {
   if (startMutation.isPending.value) return;
-  const current = playground.value;
-  if (!playgroundPreCommitEnabled.value || !current || !canStartPreCommit.value) return;
+  const current = workspace.value;
+  if (!workspacePreCommitEnabled.value || !current || !canStartPreCommit.value) return;
   pendingStartRequest.value ??= {
     tenant_id: tenantId.value,
     project_id: projectId.value,
     artifact_id: artifactId.value,
-    playground_id: playgroundId.value,
+    workspace_id: workspaceId.value,
     precommit_request_id: `precommit-request-${globalThis.crypto.randomUUID()}`,
     expected_index_version: current.index_version,
     data_layout: commitLayoutSelectionEnabled.value ? selectedDataLayout.value : 'fast_cdc',
@@ -360,32 +360,32 @@ async function startPreCommit(): Promise<void> {
   }
   pendingStartRequest.value = undefined;
   await Promise.all([
-    playgroundQuery.refetch(),
-    queryClient.invalidateQueries({ queryKey: ['playgrounds', tenantId.value] }),
+    workspaceQuery.refetch(),
+    queryClient.invalidateQueries({ queryKey: ['workspaces', tenantId.value] }),
   ]);
   ElMessage.success('Pre-commit 已发起');
   await openCommitPage();
 }
 
 async function openHeadCommit(): Promise<void> {
-  if (!artifactCommitGraphEnabled.value || !playground.value?.head_commit_id) return;
+  if (!artifactCommitGraphEnabled.value || !workspace.value?.head_commit_id) return;
   await router.push({
     name: 'artifact-detail',
     params: { tenantId: tenantId.value, projectId: projectId.value, artifactId: artifactId.value },
-    query: { tab: 'commits', commit_id: playground.value.head_commit_id },
+    query: { tab: 'commits', commit_id: workspace.value.head_commit_id },
   });
 }
 </script>
 
 <template>
-  <div class="page playground-detail">
+  <div class="page workspace-detail">
     <PageHeading
-      :title="playground?.display_name ?? playgroundId"
-      :description="`${projectId} / ${artifactId} / ${playgroundId}`"
+      :title="workspace?.display_name ?? workspaceId"
+      :description="`${projectId} / ${artifactId} / ${workspaceId}`"
     >
       <template #actions>
         <el-button
-          v-if="playgroundPreCommitEnabled && playground?.active_precommit_id"
+          v-if="workspacePreCommitEnabled && workspace?.active_precommit_id"
           type="primary"
           plain
           @click="openCommitPage"
@@ -394,14 +394,14 @@ async function openHeadCommit(): Promise<void> {
         </el-button>
         <el-button
           :icon="Back"
-          @click="router.push({ name: 'playground-list', params: { tenantId } })"
+          @click="router.push({ name: 'workspace-list', params: { tenantId } })"
         >
           返回列表
         </el-button>
         <el-button
           :icon="RefreshRight"
-          :loading="playgroundQuery.isFetching.value"
-          @click="playgroundQuery.refetch"
+          :loading="workspaceQuery.isFetching.value"
+          @click="workspaceQuery.refetch"
         >
           刷新
         </el-button>
@@ -409,29 +409,29 @@ async function openHeadCommit(): Promise<void> {
     </PageHeading>
 
     <ApiProblemAlert
-      v-if="playgroundQuery.error.value"
-      :error="playgroundQuery.error.value"
-      :retrying="playgroundQuery.isFetching.value"
-      @retry="playgroundQuery.refetch"
+      v-if="workspaceQuery.error.value"
+      :error="workspaceQuery.error.value"
+      :retrying="workspaceQuery.isFetching.value"
+      @retry="workspaceQuery.refetch"
     />
     <ApiProblemAlert
-      v-if="playgroundPreCommitEnabled && startMutation.error.value"
+      v-if="workspacePreCommitEnabled && startMutation.error.value"
       :error="startMutation.error.value"
       :retrying="startMutation.isPending.value"
       @retry="startPreCommit"
     />
 
-    <el-skeleton v-if="playgroundQuery.isPending.value" :rows="7" animated />
-    <template v-else-if="playground">
+    <el-skeleton v-if="workspaceQuery.isPending.value" :rows="7" animated />
+    <template v-else-if="workspace">
       <el-alert
-        v-if="playground.issue"
-        :title="playground.issue.message"
-        :type="playground.issue.retryable ? 'warning' : 'error'"
+        v-if="workspace.issue"
+        :title="workspace.issue.message"
+        :type="workspace.issue.retryable ? 'warning' : 'error'"
         :closable="false"
         show-icon
       />
       <el-alert
-        v-else-if="playground.state === 'creating'"
+        v-else-if="workspace.state === 'creating'"
         title="工作区正在创建"
         description="Server 正在等待 Agent 物化工作区目录。完成后生命周期会变为已物化，并单独展示实时存储可达性。"
         type="warning"
@@ -439,7 +439,7 @@ async function openHeadCommit(): Promise<void> {
         show-icon
       />
       <el-alert
-        v-else-if="playground.state === 'abnormal'"
+        v-else-if="workspace.state === 'abnormal'"
         title="工作区物化异常"
         description="当前只能查看权威状态和错误，修复物化问题后再重试。"
         type="error"
@@ -448,11 +448,11 @@ async function openHeadCommit(): Promise<void> {
       />
       <el-alert
         v-else-if="storageAvailability !== 'ready'"
-        :title="playgroundStorageAvailabilityLabel(storageAvailability)"
+        :title="workspaceStorageAvailabilityLabel(storageAvailability)"
         :description="
           storageAvailability === 'unknown'
             ? '服务端尚未确认 StorageVolume 的实时状态。可以查看中心索引，依赖 Agent 的实时操作已暂停。'
-            : 'Playground 已物化，但当前 StorageVolume 无法正常访问。可以查看中心索引，依赖 Agent 的实时操作已暂停。'
+            : 'Workspace 已物化，但当前 StorageVolume 无法正常访问。可以查看中心索引，依赖 Agent 的实时操作已暂停。'
         "
         :type="
           storageAvailability === 'unavailable'
@@ -465,52 +465,52 @@ async function openHeadCommit(): Promise<void> {
         show-icon
       />
 
-      <section v-if="!playgroundBrowserEnabled" class="content-section minimal-playground">
+      <section v-if="!workspaceBrowserEnabled" class="content-section minimal-workspace">
         <div class="section-heading">
           <div>
-            <h2>Playground 元数据</h2>
+            <h2>Workspace 元数据</h2>
           </div>
         </div>
         <dl class="definition-grid definition-grid--scope">
           <div>
             <dt>Tenant</dt>
             <dd>
-              <code>{{ playground.tenant_id }}</code>
+              <code>{{ workspace.tenant_id }}</code>
             </dd>
           </div>
           <div>
             <dt>Project</dt>
             <dd>
-              <code>{{ playground.project_id }}</code>
+              <code>{{ workspace.project_id }}</code>
             </dd>
           </div>
           <div>
             <dt>Artifact</dt>
             <dd>
-              <code>{{ playground.artifact_id }}</code>
+              <code>{{ workspace.artifact_id }}</code>
             </dd>
           </div>
           <div>
-            <dt>Playground</dt>
+            <dt>Workspace</dt>
             <dd>
-              <code>{{ playground.playground_id }}</code>
+              <code>{{ workspace.workspace_id }}</code>
             </dd>
           </div>
           <div>
             <dt>StorageVolume</dt>
             <dd>
-              <code>{{ playground.storage_volume_id }}</code>
+              <code>{{ workspace.storage_volume_id }}</code>
             </dd>
           </div>
           <div>
             <dt>Region</dt>
-            <dd>{{ playground.region }}</dd>
+            <dd>{{ workspace.region }}</dd>
           </div>
           <div>
             <dt>生命周期</dt>
             <dd>
-              <el-tag :type="playgroundLifecycleTagType(playground.state)" effect="plain">
-                {{ playgroundLifecycleLabel(playground.state) }}
+              <el-tag :type="workspaceLifecycleTagType(workspace.state)" effect="plain">
+                {{ workspaceLifecycleLabel(workspace.state) }}
               </el-tag>
             </dd>
           </div>
@@ -518,99 +518,99 @@ async function openHeadCommit(): Promise<void> {
             <dt>存储可达性</dt>
             <dd>
               <el-tag
-                :type="playgroundStorageAvailabilityTagType(storageAvailability)"
+                :type="workspaceStorageAvailabilityTagType(storageAvailability)"
                 effect="plain"
               >
-                {{ playgroundStorageAvailabilityLabel(storageAvailability) }}
+                {{ workspaceStorageAvailabilityLabel(storageAvailability) }}
               </el-tag>
             </dd>
           </div>
-          <div v-if="playground.active_precommit_id">
+          <div v-if="workspace.active_precommit_id">
             <dt>活动 Pre-commit</dt>
             <dd>
-              <code>{{ playground.active_precommit_id }}</code>
+              <code>{{ workspace.active_precommit_id }}</code>
             </dd>
           </div>
           <div>
             <dt>Index revision</dt>
             <dd>
-              <code>{{ playground.index_version.revision }}</code>
+              <code>{{ workspace.index_version.revision }}</code>
             </dd>
           </div>
           <div class="definition-grid__wide">
             <dt>Index digest</dt>
             <dd>
-              <code>{{ playground.index_version.digest }}</code>
+              <code>{{ workspace.index_version.digest }}</code>
             </dd>
           </div>
           <div>
             <dt>创建时间</dt>
-            <dd>{{ formatTime(playground.created_at_unix_ms) }}</dd>
+            <dd>{{ formatTime(workspace.created_at_unix_ms) }}</dd>
           </div>
           <div>
             <dt>更新时间</dt>
-            <dd>{{ formatTime(playground.updated_at_unix_ms) }}</dd>
+            <dd>{{ formatTime(workspace.updated_at_unix_ms) }}</dd>
           </div>
         </dl>
       </section>
 
-      <section v-if="playgroundBrowserEnabled" class="resource-summary playground-summary">
+      <section v-if="workspaceBrowserEnabled" class="resource-summary workspace-summary">
         <div>
           <span>生命周期</span>
-          <el-tag :type="playgroundLifecycleTagType(playground.state)" effect="plain">
-            {{ playgroundLifecycleLabel(playground.state) }}
+          <el-tag :type="workspaceLifecycleTagType(workspace.state)" effect="plain">
+            {{ workspaceLifecycleLabel(workspace.state) }}
           </el-tag>
         </div>
         <div>
           <span>存储可达性</span>
-          <el-tag :type="playgroundStorageAvailabilityTagType(storageAvailability)" effect="plain">
-            {{ playgroundStorageAvailabilityLabel(storageAvailability) }}
+          <el-tag :type="workspaceStorageAvailabilityTagType(storageAvailability)" effect="plain">
+            {{ workspaceStorageAvailabilityLabel(storageAvailability) }}
           </el-tag>
         </div>
         <div>
           <span>当前操作</span>
-          <el-tag v-if="playground.active_precommit_id" type="warning" effect="plain">
+          <el-tag v-if="workspace.active_precommit_id" type="warning" effect="plain">
             活动 Pre-commit
           </el-tag>
           <strong v-else>空闲</strong>
         </div>
         <div>
-          <span>Region</span><strong>{{ playground.region }}</strong>
+          <span>Region</span><strong>{{ workspace.region }}</strong>
         </div>
         <div>
-          <span>Index revision</span><strong>{{ playground.index_version.revision }}</strong>
+          <span>Index revision</span><strong>{{ workspace.index_version.revision }}</strong>
         </div>
         <div>
-          <span>更新时间</span><strong>{{ formatTime(playground.updated_at_unix_ms) }}</strong>
+          <span>更新时间</span><strong>{{ formatTime(workspace.updated_at_unix_ms) }}</strong>
         </div>
       </section>
 
       <section
-        v-if="playgroundPreCommitEnabled"
+        v-if="workspacePreCommitEnabled"
         class="precommit-band"
-        :class="{ 'is-active': playground.active_precommit_id }"
+        :class="{ 'is-active': workspace.active_precommit_id }"
       >
-        <CircleCheck v-if="playgroundOperational" />
+        <CircleCheck v-if="workspaceOperational" />
         <WarningFilled v-else />
         <div>
-          <strong v-if="playground.active_precommit_id && playgroundOperational">
+          <strong v-if="workspace.active_precommit_id && workspaceOperational">
             存在活动 Pre-commit
           </strong>
-          <strong v-else-if="playground.active_precommit_id">Pre-commit 检测已暂停</strong>
-          <strong v-else-if="playgroundOperational">Playground 可以发起 Pre-commit</strong>
-          <strong v-else>Playground 当前不可提交</strong>
-          <p v-if="playground.active_precommit_id">
-            <code>{{ playground.active_precommit_id }}</code
+          <strong v-else-if="workspace.active_precommit_id">Pre-commit 检测已暂停</strong>
+          <strong v-else-if="workspaceOperational">Workspace 可以发起 Pre-commit</strong>
+          <strong v-else>Workspace 当前不可提交</strong>
+          <p v-if="workspace.active_precommit_id">
+            <code>{{ workspace.active_precommit_id }}</code
             >，进入提交页面查看中心保存的权威状态。
           </p>
-          <p v-else-if="playgroundOperational">
+          <p v-else-if="workspaceOperational">
             Pre-commit 会冻结当前 IndexVersion，并返回可审查的变化和检查结果。
           </p>
           <p v-else>需要生命周期为已物化且存储可达，才能执行依赖 Agent 的操作。</p>
         </div>
         <div
           v-if="
-            !playground.active_precommit_id && playgroundOperational && commitLayoutSelectionEnabled
+            !workspace.active_precommit_id && workspaceOperational && commitLayoutSelectionEnabled
           "
           class="precommit-layout"
         >
@@ -624,7 +624,7 @@ async function openHeadCommit(): Promise<void> {
             :disabled="startMutation.isPending.value"
           />
         </div>
-        <el-button v-if="playground.active_precommit_id" type="primary" @click="openCommitPage">
+        <el-button v-if="workspace.active_precommit_id" type="primary" @click="openCommitPage">
           查看状态
         </el-button>
         <el-button
@@ -639,8 +639,8 @@ async function openHeadCommit(): Promise<void> {
       </section>
 
       <section
-        v-if="playgroundBrowserEnabled && playgroundMaterialized"
-        class="content-section playground-console"
+        v-if="workspaceBrowserEnabled && workspaceMaterialized"
+        class="content-section workspace-console"
       >
         <div class="section-heading section-heading--inline">
           <div>
@@ -649,7 +649,7 @@ async function openHeadCommit(): Promise<void> {
           </div>
           <div class="section-actions">
             <el-button
-              v-if="playground.head_commit_id"
+              v-if="workspace.head_commit_id"
               text
               type="primary"
               :icon="Files"
@@ -949,7 +949,7 @@ async function openHeadCommit(): Promise<void> {
     </template>
 
     <el-drawer
-      v-if="playgroundBrowserEnabled"
+      v-if="workspaceBrowserEnabled"
       v-model="metadataDrawerOpen"
       title="文件元数据"
       size="min(560px, 92vw)"
@@ -1009,19 +1009,19 @@ async function openHeadCommit(): Promise<void> {
 </template>
 
 <style scoped>
-.playground-detail {
+.workspace-detail {
   width: min(1240px, 100%);
 }
 
-.playground-summary {
+.workspace-summary {
   grid-template-columns: repeat(5, minmax(0, 1fr));
 }
 
-.minimal-playground {
+.minimal-workspace {
   max-width: 920px;
 }
 
-.minimal-playground code {
+.minimal-workspace code {
   overflow-wrap: anywhere;
 }
 
@@ -1071,7 +1071,7 @@ async function openHeadCommit(): Promise<void> {
   overflow-wrap: anywhere;
 }
 
-.playground-console {
+.workspace-console {
   min-width: 0;
 }
 
@@ -1214,7 +1214,7 @@ async function openHeadCommit(): Promise<void> {
 }
 
 @media (max-width: 900px) {
-  .playground-summary,
+  .workspace-summary,
   .data-metrics,
   .profile-summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1244,7 +1244,7 @@ async function openHeadCommit(): Promise<void> {
     min-width: 0;
   }
 
-  .playground-summary,
+  .workspace-summary,
   .data-metrics,
   .profile-summary {
     grid-template-columns: 1fr;

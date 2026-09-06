@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Mutex, MutexGuard},
 };
 
@@ -9,23 +9,22 @@ use neoengram_domain::protocol::{
     AgentResourceLifecycleAssignment, ArtifactId, DecimalU64, DeletionCompletion, DeletionId,
     DeletionImpact, DeletionMutation, DeletionMutationKind, DeletionOperation,
     DeletionOperationState, DeletionProof, DeliveryGeneration, LifecycleEvent, LifecycleGeneration,
-    PlaygroundId, ProjectId, RequestId, ResourceLifecycle, ResourceLifecycleState, ResourceRef,
-    ResourceVersion, RetentionHold, RetentionHoldId, RetentionHoldState, SnapshotDeliveryId,
-    SnapshotDeliveryState, SnapshotId, StorageVolumeId, TenantId, UnixMillis,
-    DELETION_IMPACT_TTL_MILLIS, DELETION_RECOVERY_WINDOW_MILLIS,
+    ProjectId, RequestId, ResourceLifecycle, ResourceLifecycleState, ResourceRef, ResourceVersion,
+    RetentionHold, RetentionHoldId, RetentionHoldState, SnapshotDeliveryId, SnapshotDeliveryState,
+    SnapshotId, StorageVolumeId, TenantId, UnixMillis, WorkspaceId, DELETION_IMPACT_TTL_MILLIS,
+    DELETION_RECOVERY_WINDOW_MILLIS,
 };
 
 use crate::{
     validate_snapshot_delivery_mutation_request, validate_snapshot_delivery_parents,
-    validate_snapshot_delivery_retention_roots, AdvancePlaygroundCommitOutcome,
-    AdvancePlaygroundCommitRequest, ArtifactHeadExpectation, ArtifactInitialization,
+    validate_snapshot_delivery_retention_roots, AdvanceWorkspaceCommitOutcome,
+    AdvanceWorkspaceCommitRequest, ArtifactHeadExpectation, ArtifactInitialization,
     ArtifactListCursor, ArtifactListPage, ArtifactListRequest, ArtifactRecord,
     CatalogInsertOutcome, CentralError, CentralErrorCode, CentralResult, ControlCatalogRepository,
     CreateDeletionRequest, CreateRetentionHoldRequest, DeletionImpactQuery, DeletionImpactRecord,
     DeletionListCursor, DeletionListPage, DeletionListRequest, DeletionTransitionRequest,
     LifecycleAssignmentInsertOutcome, LifecycleAssignmentOutboxRecord, LifecycleEvidenceBatch,
-    PlaygroundInsertRequest, PlaygroundListCursor, PlaygroundListPage, PlaygroundListRequest,
-    PlaygroundRecord, ProjectListCursor, ProjectListPage, ProjectListRequest, ProjectRecord,
+    ProjectListCursor, ProjectListPage, ProjectListRequest, ProjectRecord,
     ReleaseRetentionHoldRequest, RestoreDeletionRequest, RetryDeletionRequest,
     S3AccessPointCreateResult, S3AccessPointInsertOutcome, S3AccessPointListPage,
     S3AccessPointListRequest, S3AccessPointRecord, S3AccessPointState, S3CredentialInsertOutcome,
@@ -36,16 +35,17 @@ use crate::{
     SnapshotListRequest, SnapshotRecord, SnapshotState, SnapshotWithDeliveryInsertRequest,
     SnapshotWithDeliveryInsertResult, StorageBackendType, StorageVolumeListCursor,
     StorageVolumeListPage, StorageVolumeListRequest, StorageVolumeRecord, StorageVolumeState,
-    TenantListCursor, TenantListPage, TenantListRequest, TenantRecord,
+    TenantListCursor, TenantListPage, TenantListRequest, TenantRecord, WorkspaceInsertRequest,
+    WorkspaceListCursor, WorkspaceListPage, WorkspaceListRequest, WorkspaceRecord,
 };
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct InMemoryControlCatalog {
     tenants: Mutex<BTreeMap<TenantId, TenantRecord>>,
     projects: Mutex<BTreeMap<(TenantId, ProjectId), ProjectRecord>>,
     artifacts: Mutex<BTreeMap<(TenantId, ArtifactId), ArtifactRecord>>,
     volumes: Mutex<BTreeMap<(TenantId, StorageVolumeId), StorageVolumeRecord>>,
-    playgrounds: Mutex<BTreeMap<(TenantId, ProjectId, ArtifactId, PlaygroundId), PlaygroundRecord>>,
+    workspaces: Mutex<BTreeMap<(TenantId, ProjectId, ArtifactId, WorkspaceId), WorkspaceRecord>>,
     snapshots: Mutex<BTreeMap<(TenantId, SnapshotId), SnapshotRecord>>,
     /// Serializes the aggregate publication path. The individual maps remain separately
     /// lockable for the legacy repository methods, while this fence keeps a Snapshot and its
@@ -85,6 +85,21 @@ impl InMemoryControlCatalog {
     /// Deterministic evidence inspection for state-machine tests.
     pub fn deletion_proofs(&self) -> CentralResult<Vec<DeletionProof>> {
         Ok(lock(&self.deletion_proofs)?.values().cloned().collect())
+    }
+
+    /// Returns the Artifact identities owned by a Project. Lifecycle cleanup uses this
+    /// relationship to remove placement evidence without putting Project ownership on object
+    /// receipts themselves.
+    pub fn artifact_ids_for_project(
+        &self,
+        tenant_id: &TenantId,
+        project_id: &ProjectId,
+    ) -> CentralResult<BTreeSet<ArtifactId>> {
+        Ok(lock(&self.artifacts)?
+            .values()
+            .filter(|record| &record.tenant_id == tenant_id && &record.project_id == project_id)
+            .map(|record| record.artifact_id.clone())
+            .collect())
     }
 }
 
@@ -170,6 +185,7 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
         let mut records = lock(&self.projects)?
             .values()
             .filter(|record| record.tenant_id == request.tenant_id)
+            .filter(|record| record.lifecycle.is_active())
             .filter(|record| {
                 matches_query(
                     &record.project_id.to_string(),
@@ -436,47 +452,47 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
         Ok(CatalogInsertOutcome::Inserted(record))
     }
 
-    async fn get_playground(
+    async fn get_workspace(
         &self,
         tenant_id: &TenantId,
         project_id: &ProjectId,
         artifact_id: &ArtifactId,
-        playground_id: &PlaygroundId,
-    ) -> CentralResult<Option<PlaygroundRecord>> {
-        Ok(lock(&self.playgrounds)?
+        workspace_id: &WorkspaceId,
+    ) -> CentralResult<Option<WorkspaceRecord>> {
+        Ok(lock(&self.workspaces)?
             .get(&(
                 tenant_id.clone(),
                 project_id.clone(),
                 artifact_id.clone(),
-                playground_id.clone(),
+                workspace_id.clone(),
             ))
             .filter(|record| record.lifecycle.is_active())
             .cloned())
     }
 
-    async fn get_playground_for_lifecycle(
+    async fn get_workspace_for_lifecycle(
         &self,
         tenant_id: &TenantId,
         project_id: &ProjectId,
         artifact_id: &ArtifactId,
-        playground_id: &PlaygroundId,
-    ) -> CentralResult<Option<PlaygroundRecord>> {
-        Ok(lock(&self.playgrounds)?
+        workspace_id: &WorkspaceId,
+    ) -> CentralResult<Option<WorkspaceRecord>> {
+        Ok(lock(&self.workspaces)?
             .get(&(
                 tenant_id.clone(),
                 project_id.clone(),
                 artifact_id.clone(),
-                playground_id.clone(),
+                workspace_id.clone(),
             ))
             .cloned())
     }
 
-    async fn list_playgrounds(
+    async fn list_workspaces(
         &self,
-        request: &PlaygroundListRequest,
-    ) -> CentralResult<PlaygroundListPage> {
+        request: &WorkspaceListRequest,
+    ) -> CentralResult<WorkspaceListPage> {
         validate_limit(request.limit)?;
-        let mut records = lock(&self.playgrounds)?
+        let mut records = lock(&self.workspaces)?
             .values()
             .filter(|record| record.tenant_id == request.tenant_id)
             .filter(|record| record.lifecycle.is_active())
@@ -501,7 +517,7 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
             .filter(|record| request.state.is_none_or(|state| record.state == state))
             .filter(|record| {
                 matches_query(
-                    &record.playground_id.to_string(),
+                    &record.workspace_id.to_string(),
                     &record.display_name,
                     request.query.as_deref(),
                 )
@@ -510,7 +526,7 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
                 request
                     .after
                     .as_ref()
-                    .is_none_or(|after| playground_after(record, after))
+                    .is_none_or(|after| workspace_after(record, after))
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -520,47 +536,47 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
                 .cmp(&left.created_at_unix_ms)
                 .then_with(|| left.project_id.cmp(&right.project_id))
                 .then_with(|| left.artifact_id.cmp(&right.artifact_id))
-                .then_with(|| left.playground_id.cmp(&right.playground_id))
+                .then_with(|| left.workspace_id.cmp(&right.workspace_id))
         });
         let has_more = records.len() > usize::from(request.limit);
         records.truncate(usize::from(request.limit));
         let next = has_more.then(|| {
             let last = records.last().expect("non-empty keyset page");
-            PlaygroundListCursor {
+            WorkspaceListCursor {
                 created_at_unix_ms: last.created_at_unix_ms,
                 project_id: last.project_id.clone(),
                 artifact_id: last.artifact_id.clone(),
-                playground_id: last.playground_id.clone(),
+                workspace_id: last.workspace_id.clone(),
             }
         });
-        Ok(PlaygroundListPage { records, next })
+        Ok(WorkspaceListPage { records, next })
     }
 
-    async fn insert_playground_fenced(
+    async fn insert_workspace_fenced(
         &self,
-        request: PlaygroundInsertRequest,
-    ) -> CentralResult<CatalogInsertOutcome<PlaygroundRecord>> {
-        let PlaygroundInsertRequest {
+        request: WorkspaceInsertRequest,
+    ) -> CentralResult<CatalogInsertOutcome<WorkspaceRecord>> {
+        let WorkspaceInsertRequest {
             record,
             artifact_head,
         } = request;
-        validate_new_resource(record.resource_version, &record.lifecycle, "Playground")?;
+        validate_new_resource(record.resource_version, &record.lifecycle, "Workspace")?;
         // Keep this order fixed so validation and insertion form one atomic critical section.
         let artifacts = lock(&self.artifacts)?;
         let volumes = lock(&self.volumes)?;
-        let mut records = lock(&self.playgrounds)?;
+        let mut records = lock(&self.workspaces)?;
         let key = (
             record.tenant_id.clone(),
             record.project_id.clone(),
             record.artifact_id.clone(),
-            record.playground_id.clone(),
+            record.workspace_id.clone(),
         );
         if let Some(existing) = records.get(&key) {
-            require_active(&existing.lifecycle, "Playground")?;
-            return if playground_matches_insert(existing, &record, &artifact_head) {
+            require_active(&existing.lifecycle, "Workspace")?;
+            return if workspace_matches_insert(existing, &record, &artifact_head) {
                 Ok(CatalogInsertOutcome::Existing(existing.clone()))
             } else {
-                Err(conflict("Playground ID is already used"))
+                Err(conflict("Workspace ID is already used"))
             };
         }
         let artifact = artifacts
@@ -569,21 +585,21 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
             .ok_or_else(|| {
                 catalog_parent_error(
                     CentralErrorCode::ArtifactNotFound,
-                    "Playground Artifact does not exist",
+                    "Workspace Artifact does not exist",
                 )
             })?;
-        require_active(&artifact.lifecycle, "Playground Artifact")?;
+        require_active(&artifact.lifecycle, "Workspace Artifact")?;
         if record.base_commit_id != record.head_commit_id {
             return Err(catalog_parent_error(
                 CentralErrorCode::ArtifactHeadMismatch,
-                "Playground base Commit must match its initial head Commit",
+                "Workspace base Commit must match its initial head Commit",
             ));
         }
         if let ArtifactHeadExpectation::Exact(expected) = artifact_head {
             if record.base_commit_id != expected {
                 return Err(CentralError::new(
                     CentralErrorCode::ProtocolInvalid,
-                    "fenced Playground base Commit does not match the observed Artifact Head",
+                    "fenced Workspace base Commit does not match the observed Artifact Head",
                 )
                 .with_retryable(false));
             }
@@ -596,50 +612,50 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
             .ok_or_else(|| {
                 catalog_parent_error(
                     CentralErrorCode::StorageVolumeNotFound,
-                    "Playground StorageVolume does not exist",
+                    "Workspace StorageVolume does not exist",
                 )
             })?;
-        require_active(&volume.lifecycle, "Playground StorageVolume")?;
+        require_active(&volume.lifecycle, "Workspace StorageVolume")?;
         if volume.state != StorageVolumeState::Ready {
             return Err(catalog_parent_error(
                 CentralErrorCode::StorageVolumeNotReady,
-                "Playground StorageVolume is not ready",
+                "Workspace StorageVolume is not ready",
             ));
         }
         if record.region != volume.region {
             return Err(catalog_parent_error(
                 CentralErrorCode::StorageVolumeRegionMismatch,
-                "Playground region must match the StorageVolume region",
+                "Workspace region must match the StorageVolume region",
             ));
         }
         records.insert(key, record.clone());
         Ok(CatalogInsertOutcome::Inserted(record))
     }
 
-    async fn transition_playground_state(
+    async fn transition_workspace_state(
         &self,
         tenant_id: &TenantId,
         project_id: &ProjectId,
         artifact_id: &ArtifactId,
-        playground_id: &PlaygroundId,
-        expected: crate::PlaygroundState,
-        next: crate::PlaygroundState,
+        workspace_id: &WorkspaceId,
+        expected: crate::WorkspaceState,
+        next: crate::WorkspaceState,
         updated_at_unix_ms: neoengram_domain::protocol::UnixMillis,
-    ) -> CentralResult<PlaygroundRecord> {
+    ) -> CentralResult<WorkspaceRecord> {
         let key = (
             tenant_id.clone(),
             project_id.clone(),
             artifact_id.clone(),
-            playground_id.clone(),
+            workspace_id.clone(),
         );
-        let mut records = lock(&self.playgrounds)?;
+        let mut records = lock(&self.workspaces)?;
         let record = records.get_mut(&key).ok_or_else(|| {
             catalog_parent_error(
                 CentralErrorCode::ArtifactNotFound,
-                "Playground does not exist",
+                "Workspace does not exist",
             )
         })?;
-        require_active(&record.lifecycle, "Playground")?;
+        require_active(&record.lifecycle, "Workspace")?;
         if record.state == next {
             return Ok(record.clone());
         }
@@ -647,7 +663,7 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
             return Err(CentralError::new(
                 CentralErrorCode::ConcurrentUpdate,
                 format!(
-                    "Playground is in {:?}, expected {:?} for state transition",
+                    "Workspace is in {:?}, expected {:?} for state transition",
                     record.state, expected
                 ),
             ));
@@ -657,19 +673,19 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
         Ok(record.clone())
     }
 
-    async fn advance_playground_commit(
+    async fn advance_workspace_commit(
         &self,
-        request: AdvancePlaygroundCommitRequest,
-    ) -> CentralResult<AdvancePlaygroundCommitOutcome> {
+        request: AdvanceWorkspaceCommitRequest,
+    ) -> CentralResult<AdvanceWorkspaceCommitOutcome> {
         let artifact_key = (request.tenant_id.clone(), request.artifact_id.clone());
-        let playground_key = (
+        let workspace_key = (
             request.tenant_id.clone(),
             request.project_id.clone(),
             request.artifact_id.clone(),
-            request.playground_id.clone(),
+            request.workspace_id.clone(),
         );
         let mut artifacts = lock(&self.artifacts)?;
-        let mut playgrounds = lock(&self.playgrounds)?;
+        let mut workspaces = lock(&self.workspaces)?;
         let artifact = artifacts
             .get(&artifact_key)
             .filter(|record| record.project_id == request.project_id)
@@ -680,34 +696,34 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
                     "Commit Artifact does not exist",
                 )
             })?;
-        let playground = playgrounds.get(&playground_key).cloned().ok_or_else(|| {
+        let workspace = workspaces.get(&workspace_key).cloned().ok_or_else(|| {
             catalog_parent_error(
                 CentralErrorCode::ArtifactNotFound,
-                "Commit Playground does not exist",
+                "Commit Workspace does not exist",
             )
         })?;
         require_active(&artifact.lifecycle, "Commit Artifact")?;
-        require_active(&playground.lifecycle, "Commit Playground")?;
-        // A Playground can publish from a historical Commit while another Playground has moved
-        // the Artifact's convenience Head. Once this Playground already observes the new Commit,
+        require_active(&workspace.lifecycle, "Commit Workspace")?;
+        // A Workspace can publish from a historical Commit while another Workspace has moved
+        // the Artifact's convenience Head. Once this Workspace already observes the new Commit,
         // treat the request as a replay without moving the Artifact pointer backwards.
-        if playground.head_commit_id == Some(request.commit_id) {
-            return Ok(AdvancePlaygroundCommitOutcome {
+        if workspace.head_commit_id == Some(request.commit_id) {
+            return Ok(AdvanceWorkspaceCommitOutcome {
                 artifact,
-                playground,
+                workspace,
                 replayed: true,
             });
         }
-        if playground.head_commit_id != request.expected_head_commit_id {
+        if workspace.head_commit_id != request.expected_head_commit_id {
             return Err(catalog_parent_error(
                 CentralErrorCode::ArtifactHeadMismatch,
-                "Playground Head changed after Pre-commit",
+                "Workspace Head changed after Pre-commit",
             ));
         }
-        if playground.state != crate::PlaygroundState::Ready {
+        if workspace.state != crate::WorkspaceState::Ready {
             return Err(catalog_parent_error(
                 CentralErrorCode::InvalidState,
-                "only a Ready Playground can publish a Commit",
+                "only a Ready Workspace can publish a Commit",
             ));
         }
         let next_resource_version = artifact.resource_version.checked_add(1).ok_or_else(|| {
@@ -723,15 +739,15 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
         artifact.resource_version = next_resource_version;
         artifact.updated_at_unix_ms = request.updated_at_unix_ms;
         let artifact = artifact.clone();
-        let playground = playgrounds
-            .get_mut(&playground_key)
-            .expect("Playground was validated while holding the catalog lock");
-        playground.head_commit_id = Some(request.commit_id);
-        playground.updated_at_unix_ms = request.updated_at_unix_ms;
-        let playground = playground.clone();
-        Ok(AdvancePlaygroundCommitOutcome {
+        let workspace = workspaces
+            .get_mut(&workspace_key)
+            .expect("Workspace was validated while holding the catalog lock");
+        workspace.head_commit_id = Some(request.commit_id);
+        workspace.updated_at_unix_ms = request.updated_at_unix_ms;
+        let workspace = workspace.clone();
+        Ok(AdvanceWorkspaceCommitOutcome {
             artifact,
-            playground,
+            workspace,
             replayed: false,
         })
     }
@@ -1586,6 +1602,11 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
         let expected_operation = match state {
             S3AccessPointState::Active => S3MutationKind::AccessPointEnable,
             S3AccessPointState::Disabled => S3MutationKind::AccessPointDisable,
+            S3AccessPointState::Deleted => {
+                return Err(conflict(
+                    "deleted state requires the Access Point delete operation",
+                ));
+            }
         };
         if mutation.operation != expected_operation {
             return Err(conflict("invalid S3 Access Point state mutation binding"));
@@ -1616,6 +1637,10 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
                 "S3 Access Point does not exist",
             )
         })?;
+        if state == S3AccessPointState::Active && access_point.state == S3AccessPointState::Deleted
+        {
+            return Err(conflict("deleted S3 Access Point cannot be enabled"));
+        }
         if state == S3AccessPointState::Active {
             require_s3_snapshot(&snapshots, &deliveries, access_point)?;
         }
@@ -1643,6 +1668,56 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
             access_point.state = state;
             access_point.policy_generation = next_policy_generation;
             access_point.updated_at_unix_ms = updated_at_unix_ms;
+        }
+        let result = access_point.clone();
+        mutations.insert(mutation_key, mutation);
+        Ok(CatalogInsertOutcome::Inserted(result))
+    }
+
+    async fn delete_s3_access_point_idempotent(
+        &self,
+        mutation: S3MutationRecord,
+        access_point_id: &neoengram_domain::protocol::S3AccessPointId,
+        updated_at_unix_ms: neoengram_domain::protocol::UnixMillis,
+    ) -> CentralResult<CatalogInsertOutcome<S3AccessPointRecord>> {
+        if mutation.operation != S3MutationKind::AccessPointDelete {
+            return Err(conflict("invalid S3 Access Point delete mutation binding"));
+        }
+        let mutation_key = (mutation.tenant_id.clone(), mutation.request_id.clone());
+        let access_point_key = (mutation.tenant_id.clone(), access_point_id.clone());
+        let mut mutations = lock(&self.s3_mutations)?;
+        let mut access_points = lock(&self.s3_access_points)?;
+        let mut credentials = lock(&self.s3_credentials)?;
+        if let Some(existing) = mutations.get(&mutation_key) {
+            if !same_s3_mutation_identity(existing, &mutation) {
+                return Err(conflict("S3 request identity is already used"));
+            }
+            let current = access_points
+                .get(&access_point_key)
+                .cloned()
+                .ok_or_else(|| corruption("S3 mutation references a missing Access Point"))?;
+            return Ok(CatalogInsertOutcome::Existing(current));
+        }
+        let access_point = access_points.get_mut(&access_point_key).ok_or_else(|| {
+            catalog_parent_error(
+                CentralErrorCode::ArtifactNotFound,
+                "S3 Access Point does not exist",
+            )
+        })?;
+        if access_point.state != S3AccessPointState::Deleted {
+            access_point.policy_generation = access_point
+                .policy_generation
+                .checked_add(1)
+                .ok_or_else(|| conflict("S3 policy generation exhausted"))?;
+            access_point.state = S3AccessPointState::Deleted;
+            access_point.updated_at_unix_ms = updated_at_unix_ms;
+        }
+        for credential in credentials.values_mut().filter(|credential| {
+            credential.access_point_id == *access_point_id
+                && credential.state == S3CredentialState::Active
+        }) {
+            credential.state = S3CredentialState::Revoked;
+            credential.encrypted_secret.clear();
         }
         let result = access_point.clone();
         mutations.insert(mutation_key, mutation);
@@ -1962,17 +2037,19 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
         &self,
         request: DeletionImpactQuery,
     ) -> CentralResult<DeletionImpactRecord> {
+        let projects = lock(&self.projects)?;
         let artifacts = lock(&self.artifacts)?;
         let volumes = lock(&self.volumes)?;
-        let playgrounds = lock(&self.playgrounds)?;
+        let workspaces = lock(&self.workspaces)?;
         let snapshots = lock(&self.snapshots)?;
         let access_points = lock(&self.s3_access_points)?;
         let credentials = lock(&self.s3_credentials)?;
         let impact = build_deletion_impact(
             &request,
+            &projects,
             &artifacts,
             &volumes,
-            &playgrounds,
+            &workspaces,
             &snapshots,
             &access_points,
             &credentials,
@@ -2097,16 +2174,18 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
             DELETION_RECOVERY_WINDOW_MILLIS,
             "deletion recovery deadline overflow",
         )?;
+        let mut projects = lock(&self.projects)?;
         let mut artifacts = lock(&self.artifacts)?;
         let mut volumes = lock(&self.volumes)?;
-        let mut playgrounds = lock(&self.playgrounds)?;
+        let mut workspaces = lock(&self.workspaces)?;
         let mut snapshots = lock(&self.snapshots)?;
         validate_current_targets(
             &request.tenant_id,
             &impact.impact.targets,
+            &projects,
             &artifacts,
             &volumes,
-            &playgrounds,
+            &workspaces,
             &snapshots,
         )?;
         let targets = fence_targets_for_delete(
@@ -2115,9 +2194,10 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
             &request.deletion_id,
             request.now_unix_ms,
             purge_after_unix_ms,
+            &mut projects,
             &mut artifacts,
             &mut volumes,
-            &mut playgrounds,
+            &mut workspaces,
             &mut snapshots,
         )?;
 
@@ -2211,9 +2291,10 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
         {
             return Err(conflict("deletion operation is no longer restorable"));
         }
+        let mut projects = lock(&self.projects)?;
         let mut artifacts = lock(&self.artifacts)?;
         let mut volumes = lock(&self.volumes)?;
-        let mut playgrounds = lock(&self.playgrounds)?;
+        let mut workspaces = lock(&self.workspaces)?;
         let mut snapshots = lock(&self.snapshots)?;
         operation.targets = set_target_lifecycle_state(
             &request.tenant_id,
@@ -2221,9 +2302,10 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
             &request.deletion_id,
             ResourceLifecycleState::Restoring,
             request.now_unix_ms,
+            &mut projects,
             &mut artifacts,
             &mut volumes,
-            &mut playgrounds,
+            &mut workspaces,
             &mut snapshots,
         )?;
         operation.state = DeletionOperationState::Restoring;
@@ -2345,9 +2427,10 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
             }
         }
 
+        let mut projects = lock(&self.projects)?;
         let mut artifacts = lock(&self.artifacts)?;
         let mut volumes = lock(&self.volumes)?;
-        let mut playgrounds = lock(&self.playgrounds)?;
+        let mut workspaces = lock(&self.workspaces)?;
         let mut snapshots = lock(&self.snapshots)?;
         if request.next_state == DeletionOperationState::Quarantining {
             operation.targets = set_target_lifecycle_state(
@@ -2356,9 +2439,10 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
                 &request.deletion_id,
                 ResourceLifecycleState::Deleting,
                 request.now_unix_ms,
+                &mut projects,
                 &mut artifacts,
                 &mut volumes,
-                &mut playgrounds,
+                &mut workspaces,
                 &mut snapshots,
             )?;
         } else if request.expected_state == DeletionOperationState::Restoring
@@ -2370,9 +2454,10 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
                 &request.deletion_id,
                 DeletionCompletion::Restored,
                 request.now_unix_ms,
+                &mut projects,
                 &mut artifacts,
                 &mut volumes,
-                &mut playgrounds,
+                &mut workspaces,
                 &mut snapshots,
             )?;
             operation.completion = Some(DeletionCompletion::Restored);
@@ -2385,9 +2470,10 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
                 &request.deletion_id,
                 DeletionCompletion::Purged,
                 request.now_unix_ms,
+                &mut projects,
                 &mut artifacts,
                 &mut volumes,
-                &mut playgrounds,
+                &mut workspaces,
                 &mut snapshots,
             )?;
             operation.completion = Some(DeletionCompletion::Purged);
@@ -2759,9 +2845,10 @@ impl ControlCatalogRepository for InMemoryControlCatalog {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_deletion_impact(
     request: &DeletionImpactQuery,
+    projects: &BTreeMap<(TenantId, ProjectId), ProjectRecord>,
     artifacts: &BTreeMap<(TenantId, ArtifactId), ArtifactRecord>,
     volumes: &BTreeMap<(TenantId, StorageVolumeId), StorageVolumeRecord>,
-    playgrounds: &BTreeMap<(TenantId, ProjectId, ArtifactId, PlaygroundId), PlaygroundRecord>,
+    workspaces: &BTreeMap<(TenantId, ProjectId, ArtifactId, WorkspaceId), WorkspaceRecord>,
     snapshots: &BTreeMap<(TenantId, SnapshotId), SnapshotRecord>,
     access_points: &BTreeMap<
         (TenantId, neoengram_domain::protocol::S3AccessPointId),
@@ -2772,6 +2859,90 @@ pub(crate) fn build_deletion_impact(
     let mut targets = Vec::new();
     let mut blockers = request.additional_blockers.clone();
     match &request.root {
+        ResourceRef::Project { project_id } => {
+            let project = projects
+                .get(&(request.tenant_id.clone(), project_id.clone()))
+                .ok_or_else(|| {
+                    catalog_parent_error(
+                        CentralErrorCode::ArtifactNotFound,
+                        "Project does not exist",
+                    )
+                })?;
+            targets.push(deletion_target(
+                request.root.clone(),
+                project.resource_version,
+                &project.lifecycle,
+                false,
+            ));
+            let mut dependencies = artifacts
+                .values()
+                .filter(|record| {
+                    record.tenant_id == request.tenant_id
+                        && record.project_id == *project_id
+                        && record.lifecycle.state != ResourceLifecycleState::Deleted
+                })
+                .map(|record| {
+                    deletion_target(
+                        ResourceRef::Artifact {
+                            project_id: record.project_id.clone(),
+                            artifact_id: record.artifact_id.clone(),
+                        },
+                        record.resource_version,
+                        &record.lifecycle,
+                        true,
+                    )
+                })
+                .chain(
+                    workspaces
+                        .values()
+                        .filter(|record| {
+                            record.tenant_id == request.tenant_id
+                                && record.project_id == *project_id
+                                && record.lifecycle.state != ResourceLifecycleState::Deleted
+                        })
+                        .map(|record| {
+                            deletion_target(
+                                ResourceRef::Workspace {
+                                    project_id: record.project_id.clone(),
+                                    artifact_id: record.artifact_id.clone(),
+                                    workspace_id: record.workspace_id.clone(),
+                                },
+                                record.resource_version,
+                                &record.lifecycle,
+                                true,
+                            )
+                        }),
+                )
+                .chain(
+                    snapshots
+                        .values()
+                        .filter(|record| {
+                            record.tenant_id == request.tenant_id
+                                && record.project_id == *project_id
+                                && record.lifecycle.state != ResourceLifecycleState::Deleted
+                        })
+                        .map(|record| {
+                            deletion_target(
+                                ResourceRef::Snapshot {
+                                    snapshot_id: record.snapshot_id.clone(),
+                                },
+                                record.resource_version,
+                                &record.lifecycle,
+                                true,
+                            )
+                        }),
+                )
+                .collect::<Vec<_>>();
+            if !dependencies.is_empty() && !request.cascade {
+                blockers.push(neoengram_domain::protocol::DeletionBlocker {
+                    code: "DEPENDENCIES_REQUIRE_CASCADE".to_owned(),
+                    resource: Some(request.root.clone()),
+                    message: "Project still has Artifact, Workspace or Snapshot dependencies"
+                        .to_owned(),
+                });
+            }
+            targets.append(&mut dependencies);
+        }
         ResourceRef::StorageVolume { storage_volume_id } => {
             let volume = volumes
                 .get(&(request.tenant_id.clone(), storage_volume_id.clone()))
@@ -2787,7 +2958,7 @@ pub(crate) fn build_deletion_impact(
                 &volume.lifecycle,
                 true,
             ));
-            let mut dependencies = playgrounds
+            let mut dependencies = workspaces
                 .values()
                 .filter(|record| {
                     record.tenant_id == request.tenant_id
@@ -2796,10 +2967,10 @@ pub(crate) fn build_deletion_impact(
                 })
                 .map(|record| {
                     deletion_target(
-                        ResourceRef::Playground {
+                        ResourceRef::Workspace {
                             project_id: record.project_id.clone(),
                             artifact_id: record.artifact_id.clone(),
-                            playground_id: record.playground_id.clone(),
+                            workspace_id: record.workspace_id.clone(),
                         },
                         record.resource_version,
                         &record.lifecycle,
@@ -2811,7 +2982,7 @@ pub(crate) fn build_deletion_impact(
                 blockers.push(neoengram_domain::protocol::DeletionBlocker {
                     code: "DEPENDENCIES_REQUIRE_CASCADE".to_owned(),
                     resource: Some(request.root.clone()),
-                    message: "StorageVolume still contains Playground resources".to_owned(),
+                    message: "StorageVolume still contains Workspace resources".to_owned(),
                 });
             }
             if !request.confirm_managed_data_erase {
@@ -2843,7 +3014,7 @@ pub(crate) fn build_deletion_impact(
                 &artifact.lifecycle,
                 true,
             ));
-            let mut dependencies = playgrounds
+            let mut dependencies = workspaces
                 .values()
                 .filter(|record| {
                     record.tenant_id == request.tenant_id
@@ -2853,10 +3024,10 @@ pub(crate) fn build_deletion_impact(
                 })
                 .map(|record| {
                     deletion_target(
-                        ResourceRef::Playground {
+                        ResourceRef::Workspace {
                             project_id: record.project_id.clone(),
                             artifact_id: record.artifact_id.clone(),
-                            playground_id: record.playground_id.clone(),
+                            workspace_id: record.workspace_id.clone(),
                         },
                         record.resource_version,
                         &record.lifecycle,
@@ -2888,33 +3059,33 @@ pub(crate) fn build_deletion_impact(
                 blockers.push(neoengram_domain::protocol::DeletionBlocker {
                     code: "DEPENDENCIES_REQUIRE_CASCADE".to_owned(),
                     resource: Some(request.root.clone()),
-                    message: "Artifact still has Playground or Snapshot dependencies".to_owned(),
+                    message: "Artifact still has Workspace or Snapshot dependencies".to_owned(),
                 });
             }
             targets.append(&mut dependencies);
         }
-        ResourceRef::Playground {
+        ResourceRef::Workspace {
             project_id,
             artifact_id,
-            playground_id,
+            workspace_id,
         } => {
-            let playground = playgrounds
+            let workspace = workspaces
                 .get(&(
                     request.tenant_id.clone(),
                     project_id.clone(),
                     artifact_id.clone(),
-                    playground_id.clone(),
+                    workspace_id.clone(),
                 ))
                 .ok_or_else(|| {
                     catalog_parent_error(
                         CentralErrorCode::ArtifactNotFound,
-                        "Playground does not exist",
+                        "Workspace does not exist",
                     )
                 })?;
             targets.push(deletion_target(
                 request.root.clone(),
-                playground.resource_version,
-                &playground.lifecycle,
+                workspace.resource_version,
+                &workspace.lifecycle,
                 true,
             ));
         }
@@ -2943,9 +3114,10 @@ pub(crate) fn build_deletion_impact(
             || current_lifecycle_state(
                 &request.tenant_id,
                 &target.resource,
+                projects,
                 artifacts,
                 volumes,
-                playgrounds,
+                workspaces,
                 snapshots,
             )? != ResourceLifecycleState::Active
         {
@@ -2961,9 +3133,10 @@ pub(crate) fn build_deletion_impact(
             && current_lifecycle_state(
                 &request.tenant_id,
                 &target.resource,
+                projects,
                 artifacts,
                 volumes,
-                playgrounds,
+                workspaces,
                 snapshots,
             )? != ResourceLifecycleState::Active
         {
@@ -3048,12 +3221,16 @@ fn deletion_target(
 fn current_lifecycle_state(
     tenant_id: &TenantId,
     resource: &ResourceRef,
+    projects: &BTreeMap<(TenantId, ProjectId), ProjectRecord>,
     artifacts: &BTreeMap<(TenantId, ArtifactId), ArtifactRecord>,
     volumes: &BTreeMap<(TenantId, StorageVolumeId), StorageVolumeRecord>,
-    playgrounds: &BTreeMap<(TenantId, ProjectId, ArtifactId, PlaygroundId), PlaygroundRecord>,
+    workspaces: &BTreeMap<(TenantId, ProjectId, ArtifactId, WorkspaceId), WorkspaceRecord>,
     snapshots: &BTreeMap<(TenantId, SnapshotId), SnapshotRecord>,
 ) -> CentralResult<ResourceLifecycleState> {
     match resource {
+        ResourceRef::Project { project_id } => projects
+            .get(&(tenant_id.clone(), project_id.clone()))
+            .map(|record| record.lifecycle.state),
         ResourceRef::StorageVolume { storage_volume_id } => volumes
             .get(&(tenant_id.clone(), storage_volume_id.clone()))
             .map(|record| record.lifecycle.state),
@@ -3064,16 +3241,16 @@ fn current_lifecycle_state(
             .get(&(tenant_id.clone(), artifact_id.clone()))
             .filter(|record| record.project_id == *project_id)
             .map(|record| record.lifecycle.state),
-        ResourceRef::Playground {
+        ResourceRef::Workspace {
             project_id,
             artifact_id,
-            playground_id,
-        } => playgrounds
+            workspace_id,
+        } => workspaces
             .get(&(
                 tenant_id.clone(),
                 project_id.clone(),
                 artifact_id.clone(),
-                playground_id.clone(),
+                workspace_id.clone(),
             ))
             .map(|record| record.lifecycle.state),
         ResourceRef::Snapshot { snapshot_id } => snapshots
@@ -3087,13 +3264,17 @@ fn current_lifecycle_state(
 pub(crate) fn validate_current_targets(
     tenant_id: &TenantId,
     targets: &[neoengram_domain::protocol::DeletionTarget],
+    projects: &BTreeMap<(TenantId, ProjectId), ProjectRecord>,
     artifacts: &BTreeMap<(TenantId, ArtifactId), ArtifactRecord>,
     volumes: &BTreeMap<(TenantId, StorageVolumeId), StorageVolumeRecord>,
-    playgrounds: &BTreeMap<(TenantId, ProjectId, ArtifactId, PlaygroundId), PlaygroundRecord>,
+    workspaces: &BTreeMap<(TenantId, ProjectId, ArtifactId, WorkspaceId), WorkspaceRecord>,
     snapshots: &BTreeMap<(TenantId, SnapshotId), SnapshotRecord>,
 ) -> CentralResult<()> {
     for target in targets {
         let current = match &target.resource {
+            ResourceRef::Project { project_id } => projects
+                .get(&(tenant_id.clone(), project_id.clone()))
+                .map(|record| (record.resource_version, &record.lifecycle)),
             ResourceRef::StorageVolume { storage_volume_id } => volumes
                 .get(&(tenant_id.clone(), storage_volume_id.clone()))
                 .map(|record| (record.resource_version, &record.lifecycle)),
@@ -3104,16 +3285,16 @@ pub(crate) fn validate_current_targets(
                 .get(&(tenant_id.clone(), artifact_id.clone()))
                 .filter(|record| record.project_id == *project_id)
                 .map(|record| (record.resource_version, &record.lifecycle)),
-            ResourceRef::Playground {
+            ResourceRef::Workspace {
                 project_id,
                 artifact_id,
-                playground_id,
-            } => playgrounds
+                workspace_id,
+            } => workspaces
                 .get(&(
                     tenant_id.clone(),
                     project_id.clone(),
                     artifact_id.clone(),
-                    playground_id.clone(),
+                    workspace_id.clone(),
                 ))
                 .map(|record| (record.resource_version, &record.lifecycle)),
             ResourceRef::Snapshot { snapshot_id } => snapshots
@@ -3138,14 +3319,23 @@ pub(crate) fn fence_targets_for_delete(
     deletion_id: &DeletionId,
     now_unix_ms: UnixMillis,
     purge_after_unix_ms: UnixMillis,
+    projects: &mut BTreeMap<(TenantId, ProjectId), ProjectRecord>,
     artifacts: &mut BTreeMap<(TenantId, ArtifactId), ArtifactRecord>,
     volumes: &mut BTreeMap<(TenantId, StorageVolumeId), StorageVolumeRecord>,
-    playgrounds: &mut BTreeMap<(TenantId, ProjectId, ArtifactId, PlaygroundId), PlaygroundRecord>,
+    workspaces: &mut BTreeMap<(TenantId, ProjectId, ArtifactId, WorkspaceId), WorkspaceRecord>,
     snapshots: &mut BTreeMap<(TenantId, SnapshotId), SnapshotRecord>,
 ) -> CentralResult<Vec<neoengram_domain::protocol::DeletionTarget>> {
     let mut fenced = Vec::with_capacity(targets.len());
     for target in targets {
         let (resource_version, lifecycle) = match &target.resource {
+            ResourceRef::Project { project_id } => {
+                let record = projects
+                    .get_mut(&(tenant_id.clone(), project_id.clone()))
+                    .ok_or_else(|| concurrent("Project disappeared during delete"))?;
+                record.resource_version = next_plain_version(record.resource_version)?;
+                record.updated_at_unix_ms = now_unix_ms;
+                (record.resource_version, &mut record.lifecycle)
+            }
             ResourceRef::StorageVolume { storage_volume_id } => {
                 let record = volumes
                     .get_mut(&(tenant_id.clone(), storage_volume_id.clone()))
@@ -3166,19 +3356,19 @@ pub(crate) fn fence_targets_for_delete(
                 record.updated_at_unix_ms = now_unix_ms;
                 (record.resource_version, &mut record.lifecycle)
             }
-            ResourceRef::Playground {
+            ResourceRef::Workspace {
                 project_id,
                 artifact_id,
-                playground_id,
+                workspace_id,
             } => {
-                let record = playgrounds
+                let record = workspaces
                     .get_mut(&(
                         tenant_id.clone(),
                         project_id.clone(),
                         artifact_id.clone(),
-                        playground_id.clone(),
+                        workspace_id.clone(),
                     ))
-                    .ok_or_else(|| concurrent("Playground disappeared during delete"))?;
+                    .ok_or_else(|| concurrent("Workspace disappeared during delete"))?;
                 record.resource_version = next_plain_version(record.resource_version)?;
                 record.updated_at_unix_ms = now_unix_ms;
                 (record.resource_version, &mut record.lifecycle)
@@ -3218,9 +3408,10 @@ pub(crate) fn set_target_lifecycle_state(
     deletion_id: &DeletionId,
     state: ResourceLifecycleState,
     now_unix_ms: UnixMillis,
+    projects: &mut BTreeMap<(TenantId, ProjectId), ProjectRecord>,
     artifacts: &mut BTreeMap<(TenantId, ArtifactId), ArtifactRecord>,
     volumes: &mut BTreeMap<(TenantId, StorageVolumeId), StorageVolumeRecord>,
-    playgrounds: &mut BTreeMap<(TenantId, ProjectId, ArtifactId, PlaygroundId), PlaygroundRecord>,
+    workspaces: &mut BTreeMap<(TenantId, ProjectId, ArtifactId, WorkspaceId), WorkspaceRecord>,
     snapshots: &mut BTreeMap<(TenantId, SnapshotId), SnapshotRecord>,
 ) -> CentralResult<Vec<neoengram_domain::protocol::DeletionTarget>> {
     let mut updated = Vec::with_capacity(targets.len());
@@ -3229,9 +3420,10 @@ pub(crate) fn set_target_lifecycle_state(
             tenant_id,
             &target.resource,
             now_unix_ms,
+            projects,
             artifacts,
             volumes,
-            playgrounds,
+            workspaces,
             snapshots,
         )?;
         if lifecycle.active_deletion_id.as_ref() != Some(deletion_id)
@@ -3260,9 +3452,10 @@ pub(crate) fn finalize_targets(
     deletion_id: &DeletionId,
     completion: DeletionCompletion,
     now_unix_ms: UnixMillis,
+    projects: &mut BTreeMap<(TenantId, ProjectId), ProjectRecord>,
     artifacts: &mut BTreeMap<(TenantId, ArtifactId), ArtifactRecord>,
     volumes: &mut BTreeMap<(TenantId, StorageVolumeId), StorageVolumeRecord>,
-    playgrounds: &mut BTreeMap<(TenantId, ProjectId, ArtifactId, PlaygroundId), PlaygroundRecord>,
+    workspaces: &mut BTreeMap<(TenantId, ProjectId, ArtifactId, WorkspaceId), WorkspaceRecord>,
     snapshots: &mut BTreeMap<(TenantId, SnapshotId), SnapshotRecord>,
 ) -> CentralResult<Vec<neoengram_domain::protocol::DeletionTarget>> {
     let mut updated = Vec::with_capacity(targets.len());
@@ -3271,9 +3464,10 @@ pub(crate) fn finalize_targets(
             tenant_id,
             &target.resource,
             now_unix_ms,
+            projects,
             artifacts,
             volumes,
-            playgrounds,
+            workspaces,
             snapshots,
         )?;
         if lifecycle.active_deletion_id.as_ref() != Some(deletion_id) {
@@ -3310,15 +3504,21 @@ fn mutable_resource_lifecycle<'a>(
     tenant_id: &TenantId,
     resource: &ResourceRef,
     now_unix_ms: UnixMillis,
+    projects: &'a mut BTreeMap<(TenantId, ProjectId), ProjectRecord>,
     artifacts: &'a mut BTreeMap<(TenantId, ArtifactId), ArtifactRecord>,
     volumes: &'a mut BTreeMap<(TenantId, StorageVolumeId), StorageVolumeRecord>,
-    playgrounds: &'a mut BTreeMap<
-        (TenantId, ProjectId, ArtifactId, PlaygroundId),
-        PlaygroundRecord,
-    >,
+    workspaces: &'a mut BTreeMap<(TenantId, ProjectId, ArtifactId, WorkspaceId), WorkspaceRecord>,
     snapshots: &'a mut BTreeMap<(TenantId, SnapshotId), SnapshotRecord>,
 ) -> CentralResult<(u64, &'a mut ResourceLifecycle)> {
     match resource {
+        ResourceRef::Project { project_id } => {
+            let record = projects
+                .get_mut(&(tenant_id.clone(), project_id.clone()))
+                .ok_or_else(|| concurrent("Project disappeared during lifecycle update"))?;
+            record.resource_version = next_plain_version(record.resource_version)?;
+            record.updated_at_unix_ms = now_unix_ms;
+            Ok((record.resource_version, &mut record.lifecycle))
+        }
         ResourceRef::StorageVolume { storage_volume_id } => {
             let record = volumes
                 .get_mut(&(tenant_id.clone(), storage_volume_id.clone()))
@@ -3339,19 +3539,19 @@ fn mutable_resource_lifecycle<'a>(
             record.updated_at_unix_ms = now_unix_ms;
             Ok((record.resource_version, &mut record.lifecycle))
         }
-        ResourceRef::Playground {
+        ResourceRef::Workspace {
             project_id,
             artifact_id,
-            playground_id,
+            workspace_id,
         } => {
-            let record = playgrounds
+            let record = workspaces
                 .get_mut(&(
                     tenant_id.clone(),
                     project_id.clone(),
                     artifact_id.clone(),
-                    playground_id.clone(),
+                    workspace_id.clone(),
                 ))
-                .ok_or_else(|| concurrent("Playground disappeared during lifecycle update"))?;
+                .ok_or_else(|| concurrent("Workspace disappeared during lifecycle update"))?;
             record.resource_version = next_plain_version(record.resource_version)?;
             record.updated_at_unix_ms = now_unix_ms;
             Ok((record.resource_version, &mut record.lifecycle))
@@ -3380,7 +3580,9 @@ fn disable_snapshot_s3_access(
     let affected = access_points
         .values_mut()
         .filter(|access_point| {
-            access_point.tenant_id == *tenant_id && snapshot_ids.contains(&access_point.snapshot_id)
+            access_point.tenant_id == *tenant_id
+                && snapshot_ids.contains(&access_point.snapshot_id)
+                && access_point.state != S3AccessPointState::Deleted
         })
         .map(|access_point| {
             access_point.state = S3AccessPointState::Disabled;
@@ -3556,14 +3758,14 @@ fn artifact_after(record: &ArtifactRecord, after: &ArtifactListCursor) -> bool {
             && (&record.project_id, &record.artifact_id) > (&after.project_id, &after.artifact_id))
 }
 
-fn playground_after(record: &PlaygroundRecord, after: &PlaygroundListCursor) -> bool {
+fn workspace_after(record: &WorkspaceRecord, after: &WorkspaceListCursor) -> bool {
     record.created_at_unix_ms < after.created_at_unix_ms
         || (record.created_at_unix_ms == after.created_at_unix_ms
             && (
                 &record.project_id,
                 &record.artifact_id,
-                &record.playground_id,
-            ) > (&after.project_id, &after.artifact_id, &after.playground_id))
+                &record.workspace_id,
+            ) > (&after.project_id, &after.artifact_id, &after.workspace_id))
 }
 
 fn snapshot_after(record: &SnapshotRecord, after: &SnapshotListCursor) -> bool {
@@ -3600,9 +3802,9 @@ fn artifact_matches(left: &ArtifactRecord, right: &ArtifactRecord) -> bool {
         && left.initialization == right.initialization
 }
 
-fn playground_matches_insert(
-    existing: &PlaygroundRecord,
-    requested: &PlaygroundRecord,
+fn workspace_matches_insert(
+    existing: &WorkspaceRecord,
+    requested: &WorkspaceRecord,
     artifact_head: &ArtifactHeadExpectation,
 ) -> bool {
     let commit_selection_matches = match artifact_head {
@@ -3617,7 +3819,7 @@ fn playground_matches_insert(
     existing.tenant_id == requested.tenant_id
         && existing.project_id == requested.project_id
         && existing.artifact_id == requested.artifact_id
-        && existing.playground_id == requested.playground_id
+        && existing.workspace_id == requested.workspace_id
         && existing.storage_volume_id == requested.storage_volume_id
         && existing.region == requested.region
         && existing.display_name == requested.display_name
@@ -3790,7 +3992,7 @@ fn catalog_parent_error(code: CentralErrorCode, message: &'static str) -> Centra
 fn artifact_head_changed() -> CentralError {
     CentralError::new(
         CentralErrorCode::ArtifactHeadMismatch,
-        "Artifact Head changed before Playground creation",
+        "Artifact Head changed before Workspace creation",
     )
     .with_retryable(true)
 }

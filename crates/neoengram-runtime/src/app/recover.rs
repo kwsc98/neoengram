@@ -174,7 +174,7 @@ mod tests {
                 identity: MutationIdentity {
                     tenant_id: "standalone".to_owned(),
                     artifact_id: "repository".to_owned(),
-                    playground_id: "workspace".to_owned(),
+                    workspace_id: "workspace".to_owned(),
                     job_id: name.to_owned(),
                     storage_volume_id: "filesystem".to_owned(),
                     owner_generation: 1,

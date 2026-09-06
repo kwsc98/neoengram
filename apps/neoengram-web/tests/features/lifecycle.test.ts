@@ -26,10 +26,10 @@ describe('resource lifecycle UI helpers', () => {
   it('renders fully scoped resource identities', () => {
     expect(
       resourceRefScope({
-        type: 'playground',
+        type: 'workspace',
         project_id: 'project-a',
         artifact_id: 'artifact-a',
-        playground_id: 'review-a',
+        workspace_id: 'review-a',
       }),
     ).toBe('project-a / artifact-a / review-a');
   });

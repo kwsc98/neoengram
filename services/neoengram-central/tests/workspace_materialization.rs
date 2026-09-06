@@ -1,26 +1,36 @@
 use neoengram_central::{
     AgentReport, ArtifactInitialization, ArtifactRecord, AssignWorkspaceMaterializationRequest,
     CatalogPvcReference, ControlCatalogRepository, CreateWorkspaceMaterializationRequest,
-    InMemoryComponents, PlaygroundRecord, PlaygroundState, ReceiveReportRequest, StorageAccessMode,
-    StorageBackendType, StorageVolumeRecord, StorageVolumeState, TenantRecord,
-    WorkspaceMaterializeSpec, WorkspaceMaterializeTarget,
+    InMemoryComponents, ReceiveReportRequest, StorageAccessMode, StorageBackendType,
+    StorageVolumeRecord, StorageVolumeState, TenantRecord, WorkspaceMaterializeSpec,
+    WorkspaceMaterializeTarget, WorkspaceRecord, WorkspaceState,
 };
 use neoengram_domain::core::LogicalPath;
 use neoengram_domain::protocol::{
     AgentId, AgentMountId, ArtifactId, AssignmentGeneration, AssignmentId, ControlError,
-    DecimalU64, EdgeClusterId, ErrorCode, Extensions, JobAccepted, JobFailed, JobFailureStage,
-    JobId, JobProgress, JobState, MountGeneration, OwnerGeneration, PlaygroundId, PrincipalId,
+    DecimalU64, EdgeClusterId, ErrorCode, Extensions, Generation, JobAccepted, JobFailed,
+    JobFailureStage, JobId, JobProgress, JobState, MountGeneration, OwnerGeneration, PrincipalId,
     PrincipalKind, PrincipalRef, ProjectId, ResourceLifecycle, SessionGeneration, StorageVolumeId,
-    TenantId, UnixMillis, WorkspaceMaterializeOperation,
+    TaskExecutionFence, TaskId, TenantId, UnixMillis, WorkspaceId, WorkspaceMaterializeOperation,
 };
 
+fn task_fence(job_id: &JobId) -> TaskExecutionFence {
+    TaskExecutionFence::new(
+        TaskId::new(format!("task-{job_id}")).unwrap(),
+        Generation::new(1),
+        "materialize",
+        Generation::new(1),
+        Generation::new(1),
+    )
+}
+
 #[tokio::test]
-async fn materialization_reports_publish_the_playground_lifecycle_idempotently() {
+async fn materialization_reports_publish_the_workspace_lifecycle_idempotently() {
     let components = InMemoryComponents::new(1_000);
     let tenant_id = TenantId::new("tenant-a").unwrap();
     let project_id = ProjectId::new("project-a").unwrap();
     let artifact_id = ArtifactId::new("artifact-a").unwrap();
-    let playground_id = PlaygroundId::new("playground-a").unwrap();
+    let workspace_id = WorkspaceId::new("workspace-a").unwrap();
     let storage_volume_id = StorageVolumeId::new("volume-a").unwrap();
     let now = UnixMillis::new(1_000);
     components
@@ -82,21 +92,20 @@ async fn materialization_reports_publish_the_playground_lifecycle_idempotently()
         })
         .await
         .unwrap();
-    let relative_root =
-        LogicalPath::parse("playgrounds/project-a/artifact-a/playground-a").unwrap();
+    let relative_root = LogicalPath::parse("workspaces/project-a/artifact-a/workspace-a").unwrap();
     components
         .control_catalog
-        .insert_playground(PlaygroundRecord {
+        .insert_workspace(WorkspaceRecord {
             tenant_id: tenant_id.clone(),
             project_id: project_id.clone(),
             artifact_id: artifact_id.clone(),
-            playground_id: playground_id.clone(),
+            workspace_id: workspace_id.clone(),
             storage_volume_id: storage_volume_id.clone(),
             region: "local".to_owned(),
-            display_name: "Playground A".to_owned(),
+            display_name: "Workspace A".to_owned(),
             base_commit_id: None,
             head_commit_id: None,
-            state: PlaygroundState::Creating,
+            state: WorkspaceState::Creating,
             resource_version: 1,
             lifecycle: ResourceLifecycle::active(),
             relative_root: relative_root.to_string(),
@@ -118,7 +127,7 @@ async fn materialization_reports_publish_the_playground_lifecycle_idempotently()
         tenant_id: tenant_id.clone(),
         project_id: project_id.clone(),
         artifact_id: artifact_id.clone(),
-        playground_id: playground_id.clone(),
+        workspace_id: workspace_id.clone(),
         storage_volume_id: storage_volume_id.clone(),
         relative_root: relative_root.clone(),
         base_commit_id: None,
@@ -136,13 +145,14 @@ async fn materialization_reports_publish_the_playground_lifecycle_idempotently()
                 tenant_id: tenant_id.clone(),
                 project_id: project_id.clone(),
                 artifact_id: artifact_id.clone(),
-                playground_id: playground_id.clone(),
+                workspace_id: workspace_id.clone(),
                 storage_volume_id: storage_volume_id.clone(),
                 relative_root,
                 base_commit_id: None,
                 base_index_version: None,
                 request_digest,
                 deadline_unix_ms: UnixMillis::new(10_000),
+                operation_task_id: None,
             },
         })
         .await
@@ -183,6 +193,7 @@ async fn materialization_reports_publish_the_playground_lifecycle_idempotently()
             agent_id: agent_id.clone(),
             report: AgentReport::Accepted(JobAccepted {
                 job_id: job_id.clone(),
+                task_fence: task_fence(&job_id),
                 assignment_id: assignment_id.clone(),
                 assignment_generation: AssignmentGeneration::new(1),
                 accepted_at_unix_ms: UnixMillis::new(1_100),
@@ -220,6 +231,7 @@ async fn materialization_reports_publish_the_playground_lifecycle_idempotently()
             agent_id: agent_id.clone(),
             report: AgentReport::Accepted(JobAccepted {
                 job_id: job_id.clone(),
+                task_fence: task_fence(&job_id),
                 assignment_id: assignment_id.clone(),
                 assignment_generation: AssignmentGeneration::new(1),
                 accepted_at_unix_ms: UnixMillis::new(1_150),
@@ -264,30 +276,30 @@ async fn materialization_reports_publish_the_playground_lifecycle_idempotently()
         .unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.job.state, JobState::Succeeded);
-    let playground = components
+    let workspace = components
         .control_catalog
-        .get_playground(&tenant_id, &project_id, &artifact_id, &playground_id)
+        .get_workspace(&tenant_id, &project_id, &artifact_id, &workspace_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(playground.state, PlaygroundState::Ready);
+    assert_eq!(workspace.state, WorkspaceState::Ready);
 
-    let failed_playground_id = PlaygroundId::new("playground-failed").unwrap();
+    let failed_workspace_id = WorkspaceId::new("workspace-failed").unwrap();
     let failed_root =
-        LogicalPath::parse("playgrounds/project-a/artifact-a/playground-failed").unwrap();
+        LogicalPath::parse("workspaces/project-a/artifact-a/workspace-failed").unwrap();
     components
         .control_catalog
-        .insert_playground(PlaygroundRecord {
+        .insert_workspace(WorkspaceRecord {
             tenant_id: tenant_id.clone(),
             project_id: project_id.clone(),
             artifact_id: artifact_id.clone(),
-            playground_id: failed_playground_id.clone(),
+            workspace_id: failed_workspace_id.clone(),
             storage_volume_id: storage_volume_id.clone(),
             region: "local".to_owned(),
-            display_name: "Failed Playground".to_owned(),
+            display_name: "Failed Workspace".to_owned(),
             base_commit_id: None,
             head_commit_id: None,
-            state: PlaygroundState::Creating,
+            state: WorkspaceState::Creating,
             resource_version: 1,
             lifecycle: ResourceLifecycle::active(),
             relative_root: failed_root.to_string(),
@@ -308,7 +320,7 @@ async fn materialization_reports_publish_the_playground_lifecycle_idempotently()
         tenant_id: tenant_id.clone(),
         project_id: project_id.clone(),
         artifact_id: artifact_id.clone(),
-        playground_id: failed_playground_id.clone(),
+        workspace_id: failed_workspace_id.clone(),
         storage_volume_id: storage_volume_id.clone(),
         relative_root: failed_root.clone(),
         base_commit_id: None,
@@ -325,13 +337,14 @@ async fn materialization_reports_publish_the_playground_lifecycle_idempotently()
                 tenant_id: tenant_id.clone(),
                 project_id: project_id.clone(),
                 artifact_id: artifact_id.clone(),
-                playground_id: failed_playground_id.clone(),
+                workspace_id: failed_workspace_id.clone(),
                 storage_volume_id: storage_volume_id.clone(),
                 relative_root: failed_root,
                 base_commit_id: None,
                 base_index_version: None,
                 request_digest: failed_digest,
                 deadline_unix_ms: UnixMillis::new(10_000),
+                operation_task_id: None,
             },
         })
         .await
@@ -359,7 +372,8 @@ async fn materialization_reports_publish_the_playground_lifecycle_idempotently()
             agent_id: AgentId::new("agent-failed").unwrap(),
             report: AgentReport::Failed(JobFailed {
                 tenant_id: tenant_id.clone(),
-                job_id: failed_job_id,
+                job_id: failed_job_id.clone(),
+                task_fence: task_fence(&failed_job_id),
                 assignment_id: failed_assignment_id,
                 assignment_generation: AssignmentGeneration::new(1),
                 final_state: JobState::Failed,
@@ -380,12 +394,12 @@ async fn materialization_reports_publish_the_playground_lifecycle_idempotently()
     assert_eq!(
         components
             .control_catalog
-            .get_playground(&tenant_id, &project_id, &artifact_id, &failed_playground_id,)
+            .get_workspace(&tenant_id, &project_id, &artifact_id, &failed_workspace_id,)
             .await
             .unwrap()
             .unwrap()
             .state,
-        PlaygroundState::Abnormal
+        WorkspaceState::Abnormal
     );
 }
 
@@ -397,6 +411,7 @@ fn progress(
 ) -> JobProgress {
     JobProgress {
         job_id: job_id.clone(),
+        task_fence: task_fence(job_id),
         assignment_id: assignment_id.clone(),
         assignment_generation: AssignmentGeneration::new(1),
         state,

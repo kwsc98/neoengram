@@ -59,7 +59,7 @@ impl<'de> Deserialize<'de> for JournalId {
 pub struct MutationIdentity {
     pub tenant_id: String,
     pub artifact_id: String,
-    pub playground_id: String,
+    pub workspace_id: String,
     pub job_id: String,
     pub storage_volume_id: String,
     pub owner_generation: u64,
@@ -71,7 +71,7 @@ impl MutationIdentity {
         for (name, value) in [
             ("tenant_id", &self.tenant_id),
             ("artifact_id", &self.artifact_id),
-            ("playground_id", &self.playground_id),
+            ("workspace_id", &self.workspace_id),
             ("job_id", &self.job_id),
             ("storage_volume_id", &self.storage_volume_id),
         ] {
@@ -188,7 +188,7 @@ impl MutationPlan {
         hasher.write_str(&self.plan_id)?;
         hasher.write_str(&self.identity.tenant_id)?;
         hasher.write_str(&self.identity.artifact_id)?;
-        hasher.write_str(&self.identity.playground_id)?;
+        hasher.write_str(&self.identity.workspace_id)?;
         hasher.write_str(&self.identity.job_id)?;
         hasher.write_str(&self.identity.storage_volume_id)?;
         hasher.write_u64(self.identity.owner_generation);
@@ -982,7 +982,7 @@ mod tests {
                 MutationIdentity {
                     tenant_id: "tenant-a".to_owned(),
                     artifact_id: "artifact-a".to_owned(),
-                    playground_id: "playground-a".to_owned(),
+                    workspace_id: "workspace-a".to_owned(),
                     job_id: "job-a".to_owned(),
                     storage_volume_id: "volume-a".to_owned(),
                     owner_generation: 3,
@@ -1062,7 +1062,7 @@ mod tests {
         assert_eq!(plan.digest(), plan.canonical_digest().unwrap());
         assert_eq!(
             plan.digest().to_string(),
-            "93897507288906c4636ca5bc6f509638ed8e5bbda343ef787ee6d7ac555f0799"
+            "936f8a1b7e41da7ae195b70afde4a8d447df10b3ed6a912c01e76c017ef7b95f"
         );
 
         let mut forged_digest = plan.clone();

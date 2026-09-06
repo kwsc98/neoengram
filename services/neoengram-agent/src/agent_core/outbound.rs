@@ -435,7 +435,8 @@ fn identity_mismatch() -> AgentError {
 #[cfg(test)]
 mod tests {
     use neoengram_domain::protocol::{
-        AssignmentGeneration, AssignmentId, Extensions, JobAccepted, JobId,
+        AssignmentGeneration, AssignmentId, Extensions, Generation, JobAccepted, JobId,
+        TaskExecutionFence, TaskId,
     };
 
     use super::*;
@@ -447,6 +448,13 @@ mod tests {
     fn report_at(job_id: &str, accepted_at: u64) -> AgentReport {
         AgentReport::Accepted(JobAccepted {
             job_id: JobId::new(job_id).unwrap(),
+            task_fence: TaskExecutionFence::new(
+                TaskId::new(format!("task-{job_id}")).unwrap(),
+                Generation::new(1),
+                "scan_changes",
+                Generation::new(1),
+                Generation::new(1),
+            ),
             assignment_id: AssignmentId::new("assignment-a").unwrap(),
             assignment_generation: AssignmentGeneration::new(1),
             accepted_at_unix_ms: UnixMillis::new(accepted_at),

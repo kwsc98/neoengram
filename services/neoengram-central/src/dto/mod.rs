@@ -11,8 +11,8 @@ mod lifecycle;
 pub use lifecycle::*;
 mod precommit;
 pub use precommit::*;
-mod playground;
-pub use playground::*;
+mod workspace;
+pub use workspace::*;
 mod placement;
 pub use placement::*;
 mod snapshot;
@@ -47,7 +47,8 @@ pub struct CreateAddJobRequest {
     pub tenant_id: String,
     pub project_id: String,
     pub artifact_id: String,
-    pub playground_id: String,
+    #[serde(rename = "workspace_id")]
+    pub workspace_id: String,
     pub job_id: String,
     pub expected_index_version: IndexVersionBody,
     pub deadline_unix_ms: String,
@@ -132,7 +133,8 @@ pub struct JobView {
     pub tenant_id: String,
     pub project_id: String,
     pub artifact_id: String,
-    pub playground_id: String,
+    #[serde(rename = "workspace_id")]
+    pub workspace_id: String,
     pub job_id: String,
     pub state: String,
     pub resource_version: String,
@@ -242,7 +244,8 @@ pub struct CreateStorageEnrollmentTokenResponse {
     pub bootstrap_token: String,
     pub volume_descriptor_digest: String,
     pub expires_at_unix_ms: String,
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }
@@ -311,7 +314,8 @@ pub struct ApproveStorageEnrollmentRequest {
 pub struct ApproveStorageEnrollmentResponse {
     pub enrollment: StorageEnrollmentView,
     pub storage_volume: StorageVolumeView,
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }
@@ -335,6 +339,8 @@ pub struct CompleteStorageRecoveryRequest {
 pub struct CompleteStorageRecoveryResponse {
     pub enrollment: StorageEnrollmentView,
     pub storage_volume: StorageVolumeView,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }
@@ -358,7 +364,8 @@ pub struct RejectStorageEnrollmentRequest {
 #[sensitive(opaque)]
 pub struct RejectStorageEnrollmentResponse {
     pub enrollment: StorageEnrollmentView,
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }
@@ -435,7 +442,7 @@ mod tests {
             "tenant_id": "tenant-a",
             "project_id": "project-a",
             "artifact_id": "artifact-a",
-            "playground_id": "playground-a",
+            "workspace_id": "workspace-a",
             "job_id": "job-a",
             "expected_index_version": { "revision": "0", "digest": "0".repeat(64) },
             "deadline_unix_ms": "2000000000000",

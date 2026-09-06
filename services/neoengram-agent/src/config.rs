@@ -103,6 +103,11 @@ impl AgentConfig {
         if let Some(trust_domain) = &self.gateway_workload_trust_domain {
             validate_gateway_trust_domain(trust_domain)?;
         }
+        if self.replication.enabled && self.gateway_workload_trust_domain.is_none() {
+            return Err(configuration(
+                "gateway_workload_trust_domain is required when replication is enabled",
+            ));
+        }
         if let Some(path) = &self.central_command_trust_bundle_file {
             validate_absolute_normal_path("central_command_trust_bundle_file", path)?;
         } else if self.gateway_endpoint.scheme() == "https" {
@@ -630,6 +635,8 @@ logging:
             config.replication_listen_socket_addr().unwrap(),
             Some("127.0.0.1:9191".parse().unwrap())
         );
+        config.gateway_workload_trust_domain = None;
+        assert!(config.validate().is_err());
     }
 
     #[test]

@@ -83,7 +83,7 @@ impl AddPublicationFixture {
             "tenant-1",
             "project-1",
             "artifact-1",
-            "playground-1",
+            "workspace-1",
             "job-1",
             &self.base,
             &self.delta,
@@ -306,7 +306,7 @@ fn add_publication_digest_is_stable_across_set_order_and_page_boundaries(
     let digest = fixture.digest()?;
     assert_eq!(
         digest.to_string(),
-        "4987126fe99b25ae3688ff28a8ebb685867d3588fdf985274ae357caef1365f5"
+        "862b3aebf29ab3d5f66a715cbe24f89faf1e71a981ae72e194ae16f6080f3c16"
     );
 
     let mut reordered = fixture.clone();
@@ -328,7 +328,7 @@ fn add_publication_digest_is_stable_across_set_order_and_page_boundaries(
             "tenant-1",
             "project-1",
             "artifact-1",
-            "playground-1",
+            "workspace-1",
             "job-1",
             &fixture.base,
             &repaged,
@@ -358,7 +358,7 @@ fn add_publication_digest_binds_scope_base_result_and_content(
         "tenant-1",
         "project-1",
         "artifact-1",
-        "playground-1",
+        "workspace-1",
         "job-1",
     ];
     for position in 0..scope.len() {
@@ -460,7 +460,7 @@ fn add_publication_digest_rejects_open_or_inconsistent_closures(
             "tenant-1",
             "project-1",
             "artifact-1",
-            "playground-1",
+            "workspace-1",
             "job-1",
             &fixture.base,
             &fixture.delta,

@@ -396,7 +396,7 @@ struct ActiveJob {
 struct JobScope {
     project_id: neoengram_domain::protocol::ProjectId,
     artifact_id: neoengram_domain::protocol::ArtifactId,
-    playground_id: Option<neoengram_domain::protocol::PlaygroundId>,
+    workspace_id: Option<neoengram_domain::protocol::WorkspaceId>,
     snapshot_id: Option<neoengram_domain::protocol::SnapshotId>,
     storage_volume_id: neoengram_domain::protocol::StorageVolumeId,
 }
@@ -493,7 +493,7 @@ impl JobScope {
                 Self {
                     project_id: input.project_id.clone(),
                     artifact_id: input.artifact_id.clone(),
-                    playground_id: Some(input.playground_id.clone()),
+                    workspace_id: Some(input.workspace_id.clone()),
                     snapshot_id: None,
                     storage_volume_id: input.storage_volume_id.clone(),
                 },
@@ -503,7 +503,7 @@ impl JobScope {
                 Self {
                     project_id: input.project_id.clone(),
                     artifact_id: input.artifact_id.clone(),
-                    playground_id: Some(input.playground_id.clone()),
+                    workspace_id: Some(input.workspace_id.clone()),
                     snapshot_id: None,
                     storage_volume_id: input.storage_volume_id.clone(),
                 },
@@ -513,7 +513,7 @@ impl JobScope {
                 Self {
                     project_id: input.project_id.clone(),
                     artifact_id: input.artifact_id.clone(),
-                    playground_id: None,
+                    workspace_id: None,
                     snapshot_id: Some(input.snapshot_id.clone()),
                     storage_volume_id: input.storage_volume_id.clone(),
                 },
@@ -524,7 +524,7 @@ impl JobScope {
     fn matches_same(&self, other: &Self) -> bool {
         self.project_id == other.project_id
             && self.artifact_id == other.artifact_id
-            && self.playground_id == other.playground_id
+            && self.workspace_id == other.workspace_id
             && self.snapshot_id == other.snapshot_id
             && self.storage_volume_id == other.storage_volume_id
     }
@@ -544,16 +544,16 @@ impl JobScope {
                     && artifact_id == &self.artifact_id
                     && storage_volume_id == &self.storage_volume_id
             }
-            AgentResourceLifecycleScope::Playground {
+            AgentResourceLifecycleScope::Workspace {
                 project_id,
                 artifact_id,
-                playground_id,
+                workspace_id,
                 storage_volume_id,
                 ..
             } => {
                 project_id == &self.project_id
                     && artifact_id == &self.artifact_id
-                    && self.playground_id.as_ref() == Some(playground_id)
+                    && self.workspace_id.as_ref() == Some(workspace_id)
                     && storage_volume_id == &self.storage_volume_id
             }
             AgentResourceLifecycleScope::Snapshot {
@@ -1190,13 +1190,29 @@ fn lifecycle_state_error(message: impl Into<String>) -> AgentError {
 mod tests {
     use neoengram_domain::protocol::{
         AgentId, AgentInstallationId, AgentMountId, ArtifactId, ArtifactPlacementId, DeletionId,
-        EdgeClusterId, Extensions, LifecycleAssignmentId, LifecycleGeneration, MountAccessMode,
-        MountGeneration, OwnerGeneration, PlacementGeneration, PlaygroundId, ProjectId,
+        EdgeClusterId, Extensions, Generation, LifecycleAssignmentId, LifecycleGeneration,
+        MountAccessMode, MountGeneration, OwnerGeneration, PlacementGeneration, ProjectId,
         ResourceLifecycleAssignment, ResourceRef, SessionGeneration, SnapshotId, StorageVolumeId,
-        TenantId, VolumeMarkerId,
+        TaskExecutionFence, TaskId, TenantId, VolumeMarkerId, WorkspaceId,
     };
 
     use super::*;
+
+    fn task_fence(deletion_id: &str, action: ResourceLifecycleAction) -> TaskExecutionFence {
+        let stage_key = match action {
+            ResourceLifecycleAction::Quarantine => "quarantine",
+            ResourceLifecycleAction::Restore => "restore",
+            ResourceLifecycleAction::Purge => "purge",
+            ResourceLifecycleAction::CancelJobs => "cancel_jobs",
+        };
+        TaskExecutionFence::new(
+            TaskId::new(format!("task-{deletion_id}")).unwrap(),
+            Generation::new(1),
+            stage_key,
+            Generation::new(1),
+            Generation::new(1),
+        )
+    }
 
     #[derive(Debug)]
     struct NeverBridge;
@@ -1395,7 +1411,7 @@ mod tests {
     }
 
     #[test]
-    fn playground_quarantine_restore_and_purge_are_durable_and_idempotent() {
+    fn workspace_quarantine_restore_and_purge_are_durable_and_idempotent() {
         let temporary = tempfile::tempdir().unwrap();
         let data_root = temporary.path().join("data");
         let state_root = temporary.path().join("state");
@@ -1406,10 +1422,10 @@ mod tests {
             b"volume-a\n",
         )
         .unwrap();
-        let playground = data_root.join("playgrounds/project-a/artifact-a/playground-a");
-        fs::create_dir_all(playground.join("nested")).unwrap();
-        fs::write(playground.join("one.txt"), b"one").unwrap();
-        fs::write(playground.join("nested/two.txt"), b"two-two").unwrap();
+        let workspace = data_root.join("workspaces/project-a/artifact-a/workspace-a");
+        fs::create_dir_all(workspace.join("nested")).unwrap();
+        fs::write(workspace.join("one.txt"), b"one").unwrap();
+        fs::write(workspace.join("nested/two.txt"), b"two-two").unwrap();
 
         let volume = test_volume(data_root.clone(), state_root.clone());
         let snapshots = Arc::new(
@@ -1429,7 +1445,7 @@ mod tests {
         );
         let executor = FilesystemResourceLifecycleExecutor::new(volume, snapshots).unwrap();
 
-        let quarantine = playground_assignment(
+        let quarantine = workspace_assignment(
             "deletion-a",
             "quarantine-a",
             ResourceLifecycleAction::Quarantine,
@@ -1442,7 +1458,7 @@ mod tests {
         let evidence = report.evidence.unwrap();
         assert_eq!(evidence.file_count.get(), 2);
         assert_eq!(evidence.byte_count.get(), 10);
-        assert!(!playground.exists());
+        assert!(!workspace.exists());
         assert_eq!(
             executor
                 .execute(&quarantine, UnixMillis::new(1_001))
@@ -1452,7 +1468,7 @@ mod tests {
         );
 
         let restore =
-            playground_assignment("deletion-a", "restore-a", ResourceLifecycleAction::Restore);
+            workspace_assignment("deletion-a", "restore-a", ResourceLifecycleAction::Restore);
         assert_eq!(
             executor
                 .execute(&restore, UnixMillis::new(1_002))
@@ -1461,11 +1477,11 @@ mod tests {
             ResourceLifecycleReportState::Restored
         );
         assert_eq!(
-            fs::read(playground.join("nested/two.txt")).unwrap(),
+            fs::read(workspace.join("nested/two.txt")).unwrap(),
             b"two-two"
         );
 
-        let quarantine = playground_assignment(
+        let quarantine = workspace_assignment(
             "deletion-b",
             "quarantine-b",
             ResourceLifecycleAction::Quarantine,
@@ -1474,11 +1490,11 @@ mod tests {
         executor
             .execute(&quarantine, UnixMillis::new(1_003))
             .unwrap();
-        let purge = playground_assignment("deletion-b", "purge-b", ResourceLifecycleAction::Purge);
+        let purge = workspace_assignment("deletion-b", "purge-b", ResourceLifecycleAction::Purge);
         let report = executor.execute(&purge, UnixMillis::new(1_004)).unwrap();
         assert_eq!(report.state, ResourceLifecycleReportState::Purged);
         assert_eq!(report.evidence.unwrap().file_count.get(), 2);
-        assert!(!playground.exists());
+        assert!(!workspace.exists());
         assert_eq!(
             executor
                 .execute(&purge, UnixMillis::new(1_005))
@@ -1552,33 +1568,34 @@ mod tests {
         }
     }
 
-    fn playground_assignment(
+    fn workspace_assignment(
         deletion_id: &str,
         assignment_id: &str,
         action: ResourceLifecycleAction,
     ) -> AgentResourceLifecycleAssignment {
         let project_id = ProjectId::new("project-a").unwrap();
         let artifact_id = ArtifactId::new("artifact-a").unwrap();
-        let playground_id = PlaygroundId::new("playground-a").unwrap();
+        let workspace_id = WorkspaceId::new("workspace-a").unwrap();
         AgentResourceLifecycleAssignment {
             assignment: ResourceLifecycleAssignment {
                 assignment_id: LifecycleAssignmentId::new(assignment_id).unwrap(),
                 tenant_id: TenantId::new("tenant-a").unwrap(),
                 deletion_id: DeletionId::new(deletion_id).unwrap(),
-                resource: ResourceRef::Playground {
+                resource: ResourceRef::Workspace {
                     project_id: project_id.clone(),
                     artifact_id: artifact_id.clone(),
-                    playground_id: playground_id.clone(),
+                    workspace_id: workspace_id.clone(),
                 },
                 action,
                 lifecycle_generation: LifecycleGeneration::new(2),
                 request_digest: ContentDigest::from_bytes([0x66; 32]),
                 deadline_unix_ms: UnixMillis::new(10_000),
             },
-            resource_scope: AgentResourceLifecycleScope::Playground {
+            task_fence: task_fence(deletion_id, action),
+            resource_scope: AgentResourceLifecycleScope::Workspace {
                 project_id,
                 artifact_id,
-                playground_id,
+                workspace_id,
                 storage_volume_id: StorageVolumeId::new("volume-a").unwrap(),
                 artifact_placement_id: ArtifactPlacementId::new("placement-a").unwrap(),
                 placement_generation: PlacementGeneration::new(2),
@@ -1615,6 +1632,7 @@ mod tests {
                 request_digest: ContentDigest::from_bytes([0x77; 32]),
                 deadline_unix_ms: UnixMillis::new(10_000),
             },
+            task_fence: task_fence(deletion_id, action),
             resource_scope: AgentResourceLifecycleScope::Snapshot {
                 project_id,
                 artifact_id,
@@ -1654,6 +1672,7 @@ mod tests {
                 request_digest: ContentDigest::from_bytes([0x44; 32]),
                 deadline_unix_ms: UnixMillis::new(10_000),
             },
+            task_fence: task_fence(deletion_id, ResourceLifecycleAction::Quarantine),
             resource_scope: AgentResourceLifecycleScope::Artifact {
                 project_id,
                 artifact_id,

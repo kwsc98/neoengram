@@ -17,7 +17,7 @@ pub struct ManagedResource {
     pub tenant_id: String,
     pub project_id: String,
     pub artifact_id: String,
-    pub playground_id: String,
+    pub workspace_id: String,
     pub job_id: String,
 }
 
@@ -27,7 +27,7 @@ impl ManagedResource {
             ("tenant_id", &self.tenant_id),
             ("project_id", &self.project_id),
             ("artifact_id", &self.artifact_id),
-            ("playground_id", &self.playground_id),
+            ("workspace_id", &self.workspace_id),
             ("job_id", &self.job_id),
         ] {
             if value.is_empty() {
@@ -167,7 +167,7 @@ impl PreparedAdd {
             &self.resource.tenant_id,
             &self.resource.project_id,
             &self.resource.artifact_id,
-            &self.resource.playground_id,
+            &self.resource.workspace_id,
             &self.resource.job_id,
             &self.base_index_version,
             &self.index_delta,
@@ -311,7 +311,7 @@ impl PreparedAdd {
         hasher.write_str(&self.resource.tenant_id)?;
         hasher.write_str(&self.resource.project_id)?;
         hasher.write_str(&self.resource.artifact_id)?;
-        hasher.write_str(&self.resource.playground_id)?;
+        hasher.write_str(&self.resource.workspace_id)?;
         hasher.write_str(&self.resource.job_id)?;
         hasher.write_u64(self.base_index_version.revision);
         hasher.write_digest(self.base_index_version.digest)?;
@@ -394,7 +394,7 @@ mod tests {
             tenant_id: "tenant-a".to_owned(),
             project_id: "project-a".to_owned(),
             artifact_id: "artifact-a".to_owned(),
-            playground_id: "playground-a".to_owned(),
+            workspace_id: "workspace-a".to_owned(),
             job_id: job_id.to_owned(),
         }
     }
@@ -556,7 +556,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             prepared.candidate_digest().to_string(),
-            "fcb3ad9773fb4a005879ae51d89cc5d81d252e9571bcd59d65ed61cd6f420e77"
+            "3d73509503fdea0c5f6751c0fc7c47f916f20d8801d94abdf0fd4ba875333bfe"
         );
 
         let mut reordered = prepared.clone();

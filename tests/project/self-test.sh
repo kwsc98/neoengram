@@ -26,7 +26,7 @@ check_script_syntax() {
 
 check_expected_modules() {
   local module
-  for module in domain runtime agent central gateway cli openapi web web-e2e manifests quality; do
+  for module in domain runtime agent central gateway dev-stack cli openapi web web-e2e manifests quality; do
     [[ -x "${PROJECT_TEST_ROOT}/tests/project/modules/${module}.sh" ]] || {
       project_test_log "module is missing or not executable: ${module}.sh"
       return 1

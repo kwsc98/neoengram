@@ -13,11 +13,16 @@ export type RetryTaskRequest = components['schemas']['RetryTaskRequest'];
 export type CancelTaskRequest = components['schemas']['CancelTaskRequest'];
 export type TaskMutationResponse = components['schemas']['TaskMutationResponse'];
 export type TaskView = components['schemas']['TaskView'];
+export type TaskResourceRefView = components['schemas']['TaskResourceRefView'];
+export type TaskResourceLinkView = components['schemas']['TaskResourceLinkView'];
+export type TaskStageView = components['schemas']['TaskStageView'];
+export type TaskCompletionView = components['schemas']['TaskCompletionView'];
 export type TaskAttemptView = components['schemas']['TaskAttemptView'];
 export type TaskEventView = components['schemas']['TaskEventView'];
 export type TaskSummaryView = components['schemas']['TaskSummaryView'];
 export type TaskState = components['schemas']['TaskState'];
-export type TaskKind = components['schemas']['TaskKind'];
+export type TaskIntent = components['schemas']['TaskIntent'];
+export type TaskPurpose = components['schemas']['TaskPurpose'];
 export type ProblemDetails = components['schemas']['ProblemDetails'];
 export type HealthResponse = components['schemas']['HealthResponse'];
 export type QueryTenantListRequest = components['schemas']['QueryTenantListRequest'];
@@ -85,23 +90,23 @@ export type QueryArtifactCommitDiffResponse =
   components['schemas']['QueryArtifactCommitDiffResponse'];
 export type CommitDiffView = components['schemas']['CommitDiffView'];
 export type CommitDiffEntry = components['schemas']['CommitDiffEntry'];
-export type QueryPlaygroundListRequest = components['schemas']['QueryPlaygroundListRequest'];
-export type QueryPlaygroundListResponse = Omit<
-  components['schemas']['QueryPlaygroundListResponse'],
+export type QueryWorkspaceListRequest = components['schemas']['QueryWorkspaceListRequest'];
+export type QueryWorkspaceListResponse = Omit<
+  components['schemas']['QueryWorkspaceListResponse'],
   'items'
-> & { items: PlaygroundView[] };
-export type QueryPlaygroundResponse = Omit<
-  components['schemas']['QueryPlaygroundResponse'],
-  'playground'
-> & { playground: PlaygroundView };
-export type CreatePlaygroundRequest = components['schemas']['CreatePlaygroundRequest'];
-export type CreatePlaygroundResponse = Omit<
-  components['schemas']['CreatePlaygroundResponse'],
-  'playground'
-> & { playground: PlaygroundView };
-export type PlaygroundState = components['schemas']['PlaygroundState'];
-export type PlaygroundStorageAvailability = components['schemas']['PlaygroundStorageAvailability'];
-export type PlaygroundView = components['schemas']['PlaygroundView'];
+> & { items: WorkspaceView[] };
+export type QueryWorkspaceResponse = Omit<
+  components['schemas']['QueryWorkspaceResponse'],
+  'workspace'
+> & { workspace: WorkspaceView };
+export type CreateWorkspaceRequest = components['schemas']['CreateWorkspaceRequest'];
+export type CreateWorkspaceResponse = Omit<
+  components['schemas']['CreateWorkspaceResponse'],
+  'workspace'
+> & { workspace: WorkspaceView };
+export type WorkspaceState = components['schemas']['WorkspaceState'];
+export type WorkspaceStorageAvailability = components['schemas']['WorkspaceStorageAvailability'];
+export type WorkspaceView = components['schemas']['WorkspaceView'];
 export type StartPreCommitRequest = components['schemas']['StartPreCommitRequest'];
 export type StartPreCommitResponse = components['schemas']['StartPreCommitResponse'];
 export type QueryPreCommitRequest = components['schemas']['QueryPreCommitRequest'];
@@ -113,26 +118,25 @@ export type CancelPreCommitResponse = components['schemas']['CancelPreCommitResp
 export type PreCommitState = components['schemas']['PreCommitState'];
 export type PreCommitPhase = components['schemas']['PreCommitPhase'];
 export type PreCommitView = components['schemas']['PreCommitView'];
-export type CommitPlaygroundRequest = components['schemas']['CommitPlaygroundRequest'];
-export type CommitPlaygroundResponse = components['schemas']['CommitPlaygroundResponse'];
-export type QueryPlaygroundFileListRequest =
-  components['schemas']['QueryPlaygroundFileListRequest'];
-export type QueryPlaygroundFileListResponse =
-  components['schemas']['QueryPlaygroundFileListResponse'];
-export type QueryPlaygroundChangeListRequest =
-  components['schemas']['QueryPlaygroundChangeListRequest'];
-export type QueryPlaygroundChangeListResponse =
-  components['schemas']['QueryPlaygroundChangeListResponse'];
-export type QueryPlaygroundFileMetadataRequest =
-  components['schemas']['QueryPlaygroundFileMetadataRequest'];
-export type QueryPlaygroundFileMetadataResponse =
-  components['schemas']['QueryPlaygroundFileMetadataResponse'];
-export type QueryPlaygroundDatasetProfileRequest =
-  components['schemas']['QueryPlaygroundDatasetProfileRequest'];
-export type QueryPlaygroundDatasetProfileResponse =
-  components['schemas']['QueryPlaygroundDatasetProfileResponse'];
+export type CommitWorkspaceRequest = components['schemas']['CommitWorkspaceRequest'];
+export type CommitWorkspaceResponse = components['schemas']['CommitWorkspaceResponse'];
+export type QueryWorkspaceFileListRequest = components['schemas']['QueryWorkspaceFileListRequest'];
+export type QueryWorkspaceFileListResponse =
+  components['schemas']['QueryWorkspaceFileListResponse'];
+export type QueryWorkspaceChangeListRequest =
+  components['schemas']['QueryWorkspaceChangeListRequest'];
+export type QueryWorkspaceChangeListResponse =
+  components['schemas']['QueryWorkspaceChangeListResponse'];
+export type QueryWorkspaceFileMetadataRequest =
+  components['schemas']['QueryWorkspaceFileMetadataRequest'];
+export type QueryWorkspaceFileMetadataResponse =
+  components['schemas']['QueryWorkspaceFileMetadataResponse'];
+export type QueryWorkspaceDatasetProfileRequest =
+  components['schemas']['QueryWorkspaceDatasetProfileRequest'];
+export type QueryWorkspaceDatasetProfileResponse =
+  components['schemas']['QueryWorkspaceDatasetProfileResponse'];
 export type LogicalFileEntry = components['schemas']['LogicalFileEntry'];
-export type PlaygroundChangeEntry = components['schemas']['PlaygroundChangeEntry'];
+export type WorkspaceChangeEntry = components['schemas']['WorkspaceChangeEntry'];
 export type FileMetadataView = components['schemas']['FileMetadataView'];
 export type DatasetProfileView = components['schemas']['DatasetProfileView'];
 export type QuerySnapshotListRequest = components['schemas']['QuerySnapshotListRequest'];
@@ -162,8 +166,6 @@ export type QueryCommitAvailabilityV2Response =
   components['schemas']['QueryCommitAvailabilityResponse'];
 export type MaterializationView = components['schemas']['MaterializationView'];
 export type VolumeCommitCoverageView = components['schemas']['VolumeCommitCoverageView'];
-export type CreateWorkspaceRequest = components['schemas']['CreateWorkspaceRequest'];
-export type CreateWorkspaceResponse = components['schemas']['CreateWorkspaceResponse'];
 export type RetrySnapshotDeliveryRequest = components['schemas']['RetrySnapshotDeliveryRequest'];
 export type RetrySnapshotDeliveryResponse = components['schemas']['RetrySnapshotDeliveryResponse'];
 export type QuerySnapshotFileListRequest = components['schemas']['QuerySnapshotFileListRequest'];
@@ -196,7 +198,7 @@ export type DeleteSnapshotDeliveryResponse =
   components['schemas']['DeleteSnapshotDeliveryResponse'];
 
 /** Read-only S3 response/request views; secret fields stay optional on idempotent replays. */
-export type S3AccessPointState = 'active' | 'disabled';
+export type S3AccessPointState = 'active' | 'disabled' | 'deleted';
 export type S3CredentialState = 'active' | 'revoked' | 'expired';
 export type S3ObjectEntryType = 'object' | 'prefix';
 
@@ -271,7 +273,8 @@ export interface CreateS3AccessPointResponse {
   /** Returned only for the first successful execution, never for an idempotent replay. */
   secret_access_key?: string;
   credential_expires_at_unix_ms: string;
-  replayed: boolean;
+  request_replayed: boolean;
+  execution_reused: boolean;
 }
 
 export interface UpdateS3AccessPointRequest {
@@ -282,7 +285,8 @@ export interface UpdateS3AccessPointRequest {
 
 export interface UpdateS3AccessPointResponse {
   access_point: S3AccessPointView;
-  replayed: boolean;
+  request_replayed: boolean;
+  execution_reused: boolean;
 }
 
 export interface CreateS3CredentialRequest {
@@ -296,7 +300,8 @@ export interface CreateS3CredentialResponse {
   credential: S3CredentialView;
   /** Returned only for the first successful execution, never for an idempotent replay. */
   secret_access_key?: string;
-  replayed: boolean;
+  request_replayed: boolean;
+  execution_reused: boolean;
 }
 
 export interface QueryS3CredentialListRequest {

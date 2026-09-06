@@ -404,8 +404,9 @@ mod tests {
     use neoengram_domain::protocol::{
         AgentChannelDownstreamMessage, AssignmentGeneration, AssignmentId, ControlError,
         DecisionGeneration, Ed25519Signature, ErrorCode, Extensions, GatewayOpaqueBytes,
-        IndexRevision, JobDecision, JobId, JobState, MessageId, PublishDecision, SequenceNumber,
-        SessionGeneration, WireIndexVersion, CURRENT_WIRE_VERSION,
+        Generation, IndexRevision, JobDecision, JobId, JobState, MessageId, PublishDecision,
+        SequenceNumber, SessionGeneration, TaskExecutionFence, TaskId, WireIndexVersion,
+        CURRENT_WIRE_VERSION,
     };
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
@@ -436,6 +437,13 @@ mod tests {
     fn decision() -> JobDecision {
         JobDecision {
             job_id: JobId::new("job-a").unwrap(),
+            task_fence: TaskExecutionFence::new(
+                TaskId::new("task-job-a").unwrap(),
+                Generation::new(1),
+                "scan_changes",
+                Generation::new(1),
+                Generation::new(1),
+            ),
             assignment_id: AssignmentId::new("assignment-a").unwrap(),
             assignment_generation: AssignmentGeneration::new(1),
             decision_generation: DecisionGeneration::new(1),

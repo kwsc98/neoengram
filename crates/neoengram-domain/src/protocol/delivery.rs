@@ -11,7 +11,7 @@ use crate::{
     AgentId, AgentMountId, AssignmentGeneration, AssignmentId, ContentDigest, DecimalU64,
     DeliveryGeneration, Extensions, JobId, MountGeneration, OwnerGeneration, PlacementGeneration,
     PrincipalRef, ProjectId, ProtocolError, ProtocolResult, SnapshotDeliveryId, SnapshotId,
-    StorageVolumeId, TenantId, UnixMillis, WireChunkingStrategy,
+    StorageVolumeId, TaskExecutionFence, TenantId, UnixMillis, WireChunkingStrategy,
 };
 
 /// The physical strategy used to expose one immutable Snapshot.
@@ -209,6 +209,9 @@ impl SnapshotDeliveryOperation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SnapshotDeliveryAssignment {
     pub job_id: JobId,
+    /// Root operation/stage fence for this Agent delivery.
+    #[serde(flatten)]
+    pub task_fence: TaskExecutionFence,
     pub assignment_id: AssignmentId,
     pub assignment_generation: AssignmentGeneration,
     pub agent_id: AgentId,
@@ -267,6 +270,7 @@ impl SnapshotDeliveryAssignment {
     }
 
     pub fn validate(&self) -> ProtocolResult<()> {
+        self.task_fence.validate()?;
         for (field, value) in [
             ("assignment_generation", self.assignment_generation.get()),
             ("mount_generation", self.mount_generation.get()),
@@ -295,6 +299,11 @@ impl SnapshotDeliveryAssignment {
             &self.extensions,
             &[
                 "job_id",
+                "task_id",
+                "attempt",
+                "stage_key",
+                "stage_attempt",
+                "plan_revision",
                 "assignment_id",
                 "assignment_generation",
                 "agent_id",

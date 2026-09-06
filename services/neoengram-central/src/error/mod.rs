@@ -245,7 +245,7 @@ fn conflict_message(code: CentralErrorCode) -> &'static str {
         }
         CentralErrorCode::ConcurrentUpdate => "the Job was updated concurrently",
         CentralErrorCode::ArtifactHeadMismatch => {
-            "the Playground base or head differs from the Artifact head"
+            "the Workspace base or head differs from the Artifact head"
         }
         CentralErrorCode::StorageVolumeNotReady => "the StorageVolume is not ready",
         CentralErrorCode::SnapshotDeliveryUnavailable => {
@@ -255,7 +255,7 @@ fn conflict_message(code: CentralErrorCode) -> &'static str {
             "the requested SnapshotDelivery mode is unsupported"
         }
         CentralErrorCode::StorageVolumeRegionMismatch => {
-            "the Playground region differs from the StorageVolume region"
+            "the Workspace region differs from the StorageVolume region"
         }
         _ => "the requested operation conflicts with current state",
     }

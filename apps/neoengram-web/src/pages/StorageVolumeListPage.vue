@@ -375,7 +375,7 @@ async function submitEnrollment(): Promise<void> {
     const result = await tokenMutation.mutateAsync(request);
     if (tenantId.value !== requestTenantId || pendingTokenRequest.value !== request) return;
     tokenResult.value = result.data;
-    ElMessage.success(result.data.replayed ? '已返回原接入凭证' : '接入凭证已生成');
+    ElMessage.success(result.data.request_replayed ? '已返回原接入凭证' : '接入凭证已生成');
   } catch (error) {
     if (tenantId.value !== requestTenantId || pendingTokenRequest.value !== request) return;
     enrollmentError.value = error instanceof Error ? error.message : '生成接入凭证失败';
@@ -432,7 +432,7 @@ async function submitNfsCreate(): Promise<void> {
     if (!isCurrentTenantScope(requestTenantId, requestScopeVersion)) return;
     nfsOpen.value = false;
     ElMessage.success(
-      result.data.replayed ? '已返回现有 StorageVolume' : '已登记，等待挂载健康检查',
+      result.data.request_replayed ? '已返回现有 StorageVolume' : '已登记，等待挂载健康检查',
     );
   } catch (error) {
     if (!isCurrentTenantScope(requestTenantId, requestScopeVersion)) return;
@@ -486,7 +486,7 @@ async function approve(enrollment: StorageEnrollmentView): Promise<void> {
       queryClient.invalidateQueries({ queryKey: ['storage-volumes', request.tenant_id] }),
     ]);
     if (!isCurrentTenantScope(requestTenantId, requestScopeVersion)) return;
-    ElMessage.success(result.data.replayed ? '已返回原审批结果' : '存储接入已批准');
+    ElMessage.success(result.data.request_replayed ? '已返回原审批结果' : '存储接入已批准');
   } catch (error) {
     if (isApiProblem(error) && !error.retryable) {
       if (approvalRequests.get(requestKey) === request) approvalRequests.delete(requestKey);
@@ -540,7 +540,7 @@ async function reject(enrollment: StorageEnrollmentView): Promise<void> {
       queryKey: ['storage-enrollments', request.tenant_id],
     });
     if (!isCurrentTenantScope(requestTenantId, requestScopeVersion)) return;
-    ElMessage.success(result.data.replayed ? '已返回原拒绝结果' : '存储接入已拒绝');
+    ElMessage.success(result.data.request_replayed ? '已返回原拒绝结果' : '存储接入已拒绝');
   } catch (error) {
     if (isApiProblem(error) && !error.retryable) {
       if (rejectionRequests.get(requestKey) === request) rejectionRequests.delete(requestKey);

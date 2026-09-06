@@ -7,8 +7,8 @@ use neoengram_central::{
 };
 use neoengram_domain::core::{ContentDigest, IndexVersion, LogicalPath};
 use neoengram_domain::protocol::{
-    ArtifactId, CommitDataLayout, Extensions, JobId, PlaygroundId, PrincipalId, PrincipalKind,
-    PrincipalRef, ProjectId, TenantId, UnixMillis, WireIndexVersion,
+    ArtifactId, CommitDataLayout, Extensions, JobId, PrincipalId, PrincipalKind, PrincipalRef,
+    ProjectId, TenantId, UnixMillis, WireIndexVersion, WorkspaceId,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -74,7 +74,7 @@ async fn query_returns_the_authoritative_job_and_authorizes_its_persisted_scope(
     assert_eq!(queries[0].action, Action::QueryJob);
     assert_eq!(queries[0].tenant_id, result.job.spec.tenant_id);
     assert_eq!(queries[0].artifact_id, result.job.spec.artifact_id);
-    assert_eq!(queries[0].playground_id, result.job.spec.playground_id);
+    assert_eq!(queries[0].workspace_id, result.job.spec.workspace_id);
     assert_eq!(queries[0].job_id, result.job.spec.job_id);
     assert_ne!(queries[0].actor, Actor::Principal(creator));
 }
@@ -110,7 +110,7 @@ async fn query_hides_an_authorization_denial_as_not_found() {
     assert_eq!(queries.len(), 1);
     assert_eq!(queries[0].tenant_id, spec.tenant_id);
     assert_eq!(queries[0].artifact_id, spec.artifact_id);
-    assert_eq!(queries[0].playground_id, spec.playground_id);
+    assert_eq!(queries[0].workspace_id, spec.workspace_id);
     assert_eq!(queries[0].job_id, spec.job_id);
 }
 
@@ -162,7 +162,7 @@ fn add_job_spec(principal: &PrincipalRef) -> AddJobSpec {
         tenant_id: TenantId::new("tenant-real").unwrap(),
         project_id: ProjectId::new("project-real").unwrap(),
         artifact_id: ArtifactId::new("artifact-real").unwrap(),
-        playground_id: PlaygroundId::new("playground-real").unwrap(),
+        workspace_id: WorkspaceId::new("workspace-real").unwrap(),
         expected_index_version: WireIndexVersion::from(
             IndexVersion::from_snapshot(0, &[]).unwrap(),
         ),
@@ -170,6 +170,7 @@ fn add_job_spec(principal: &PrincipalRef) -> AddJobSpec {
         deadline_unix_ms: UnixMillis::new(10_000),
         paths: vec![LogicalPath::parse("dataset/file.bin").unwrap()],
         all: false,
+        operation_task_id: None,
         data_layout: CommitDataLayout::FastCdc,
         extensions: Extensions::new(),
     };

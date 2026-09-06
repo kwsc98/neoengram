@@ -357,7 +357,7 @@ pub fn add_publication_digest(
     tenant_id: &str,
     project_id: &str,
     artifact_id: &str,
-    playground_id: &str,
+    workspace_id: &str,
     job_id: &str,
     base_index_version: &IndexVersion,
     index_delta: &IndexDelta,
@@ -368,7 +368,7 @@ pub fn add_publication_digest(
         ("tenant_id", tenant_id),
         ("project_id", project_id),
         ("artifact_id", artifact_id),
-        ("playground_id", playground_id),
+        ("workspace_id", workspace_id),
         ("job_id", job_id),
     ] {
         if value.is_empty() {
@@ -451,7 +451,7 @@ pub fn add_publication_digest(
     }
 
     let mut hasher = canonical_hasher(ADD_PUBLICATION_HASH_DOMAIN);
-    for value in [tenant_id, project_id, artifact_id, playground_id, job_id] {
+    for value in [tenant_id, project_id, artifact_id, workspace_id, job_id] {
         update_bytes_with_len(&mut hasher, value.as_bytes())?;
     }
     hasher.update(&base_index_version.revision.to_le_bytes());

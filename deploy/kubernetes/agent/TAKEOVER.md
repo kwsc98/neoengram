@@ -7,8 +7,8 @@ It provides cooperative fencing and must fail closed whenever the old writer can
 ## Planned Or Incident Takeover
 
 1. Mark the StorageVolume unavailable/draining in the central administrative plane and freeze all new read-
-   write Assignments for the entire Volume, not only one Playground. Stop or make read-only every external
-   business/Playground Pod that can write this PVC; central Assignment freeze does not fence direct POSIX I/O.
+   write Assignments for the entire Volume, not only one Workspace. Stop or make read-only every external
+   business/Workspace Pod that can write this PVC; central Assignment freeze does not fence direct POSIX I/O.
 2. Record the current AgentInstance, active session, outstanding Jobs and leases, mount fingerprint,
    `credential_generation`, `config_generation`, `session_generation`, `mount_generation`, and
    `owner_generation`.
@@ -28,10 +28,10 @@ It provides cooperative fencing and must fail closed whenever the old writer can
 9. Atomically revoke any remaining old ownership and advance the relevant credential, config, session,
    mount, and owner generations. Bind `active_rw_agent_id` to the new approved identity. A stale generation
    must not renew leases, receive Assignments, or publish results.
-10. Let the new Agent rebuild cache from central metadata, inspect every Playground journal and worktree on
+10. Let the new Agent rebuild cache from central metadata, inspect every Workspace journal and worktree on
     the Volume, and run explicit RecoverJobs. Do not replay a normal Job whose filesystem side effects are
     unknown.
-11. Reconcile central IndexVersions, journals, running Jobs, and snapshot/playground health. Return the
+11. Reconcile central IndexVersions, journals, running Jobs, and snapshot/Workspace health. Return the
     StorageVolume to Ready only after full-volume recovery succeeds.
 
 ## Rollback

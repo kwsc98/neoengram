@@ -88,7 +88,7 @@ impl TransferReceipt {
             if scope.tenant_id != assignment.tenant_id
                 || scope.project_id != assignment.project_id
                 || scope.artifact_id != assignment.artifact_id
-                || scope.playground_id != assignment.playground_id
+                || scope.workspace_id != assignment.workspace_id
                 || scope.job_id != assignment.job_id
                 || scope.base_index_version.revision != assignment.expected_index_version.revision
                 || scope.base_index_version.digest != assignment.expected_index_version.digest
@@ -179,7 +179,7 @@ impl TransferReceipt {
             tenant_id: assignment.tenant_id.clone(),
             project_id: assignment.project_id.clone(),
             artifact_id: assignment.artifact_id.clone(),
-            playground_id: assignment.playground_id.clone(),
+            workspace_id: assignment.workspace_id.clone(),
             job_id: assignment.job_id.clone(),
             base_index_version: assignment.expected_index_version.clone(),
             extensions: neoengram_domain::protocol::Extensions::new(),

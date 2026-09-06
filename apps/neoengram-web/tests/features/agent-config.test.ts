@@ -23,7 +23,8 @@ const token = {
   bootstrap_token: 'ngenr_v1_do-not-serialize',
   volume_descriptor_digest: 'a'.repeat(64),
   expires_at_unix_ms: '1785168500000',
-  replayed: false,
+  request_replayed: false,
+  execution_reused: false,
 };
 
 describe('Agent YAML configuration', () => {

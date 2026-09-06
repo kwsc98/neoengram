@@ -2,13 +2,13 @@ import { describe, expect, it } from 'vitest';
 
 import {
   canCommitPreCommit,
-  isPlaygroundOperational,
-  playgroundLifecycleLabel,
-  playgroundListPollInterval,
-  playgroundOperationUnavailableReason,
-  playgroundPollInterval,
-  playgroundStorageAvailability,
-  playgroundStorageAvailabilityLabel,
+  isWorkspaceOperational,
+  workspaceLifecycleLabel,
+  workspaceListPollInterval,
+  workspaceOperationUnavailableReason,
+  workspacePollInterval,
+  workspaceStorageAvailability,
+  workspaceStorageAvailabilityLabel,
   preCommitPhaseLabels,
   preCommitPollInterval,
 } from '@/features/precommit/status';
@@ -19,7 +19,7 @@ function precommit(overrides: Partial<PreCommitView> = {}): PreCommitView {
     tenant_id: 'tenant-a',
     project_id: 'project-a',
     artifact_id: 'artifact-a',
-    playground_id: 'playground-a',
+    workspace_id: 'workspace-a',
     precommit_id: 'precommit-a',
     precommit_request_id: 'request-a',
     attempt: 1,
@@ -55,69 +55,69 @@ describe('Pre-commit status helpers', () => {
   });
 
   it('separates the persisted lifecycle from live storage availability', () => {
-    expect(playgroundLifecycleLabel('ready')).toBe('已物化');
-    expect(playgroundStorageAvailabilityLabel('unavailable')).toBe('存储不可达');
-    expect(isPlaygroundOperational({ state: 'ready', storage_availability: 'ready' })).toBe(true);
-    expect(isPlaygroundOperational({ state: 'ready', storage_availability: 'unavailable' })).toBe(
+    expect(workspaceLifecycleLabel('ready')).toBe('已物化');
+    expect(workspaceStorageAvailabilityLabel('unavailable')).toBe('存储不可达');
+    expect(isWorkspaceOperational({ state: 'ready', storage_availability: 'ready' })).toBe(true);
+    expect(isWorkspaceOperational({ state: 'ready', storage_availability: 'unavailable' })).toBe(
       false,
     );
-    expect(isPlaygroundOperational({ state: 'abnormal', storage_availability: 'ready' })).toBe(
+    expect(isWorkspaceOperational({ state: 'abnormal', storage_availability: 'ready' })).toBe(
       false,
     );
   });
 
-  it('keeps polling ready Playgrounds so live Agent availability changes are discovered', () => {
-    expect(playgroundPollInterval({ state: 'creating', storage_availability: 'unknown' })).toBe(
+  it('keeps polling ready Workspaces so live Agent availability changes are discovered', () => {
+    expect(workspacePollInterval({ state: 'creating', storage_availability: 'unknown' })).toBe(
       1_000,
     );
     expect(
-      playgroundPollInterval({
+      workspacePollInterval({
         state: 'ready',
         storage_availability: 'ready',
         active_precommit_id: 'precommit-a',
       }),
     ).toBe(1_000);
-    expect(playgroundPollInterval({ state: 'ready', storage_availability: 'ready' })).toBe(5_000);
-    expect(playgroundPollInterval({ state: 'ready', storage_availability: 'unavailable' })).toBe(
+    expect(workspacePollInterval({ state: 'ready', storage_availability: 'ready' })).toBe(5_000);
+    expect(workspacePollInterval({ state: 'ready', storage_availability: 'unavailable' })).toBe(
       5_000,
     );
     expect(
-      playgroundListPollInterval([
+      workspaceListPollInterval([
         { state: 'ready', storage_availability: 'ready' },
         { state: 'creating', storage_availability: 'unknown' },
       ]),
     ).toBe(1_000);
-    expect(playgroundListPollInterval([])).toBe(5_000);
+    expect(workspaceListPollInterval([])).toBe(5_000);
   });
 
   it('explains lifecycle failures before live storage availability', () => {
     expect(
-      playgroundOperationUnavailableReason({
+      workspaceOperationUnavailableReason({
         state: 'abnormal',
         storage_availability: 'ready',
       }),
-    ).toBe('Playground 生命周期异常');
+    ).toBe('Workspace 生命周期异常');
     expect(
-      playgroundOperationUnavailableReason({
+      workspaceOperationUnavailableReason({
         state: 'abnormal',
         storage_availability: 'unavailable',
       }),
-    ).toBe('Playground 生命周期异常');
+    ).toBe('Workspace 生命周期异常');
     expect(
-      playgroundOperationUnavailableReason({
+      workspaceOperationUnavailableReason({
         state: 'ready',
         storage_availability: 'unavailable',
       }),
     ).toBe('StorageVolume 当前不可达');
     expect(
-      playgroundOperationUnavailableReason({ state: 'ready', storage_availability: 'ready' }),
+      workspaceOperationUnavailableReason({ state: 'ready', storage_availability: 'ready' }),
     ).toBeUndefined();
   });
 
   it('treats a legacy response without storage availability as unknown and non-operational', () => {
-    const legacyPlayground = { state: 'ready' as const };
+    const legacyWorkspace = { state: 'ready' as const };
 
-    expect(playgroundStorageAvailability(legacyPlayground)).toBe('unknown');
-    expect(isPlaygroundOperational(legacyPlayground)).toBe(false);
+    expect(workspaceStorageAvailability(legacyWorkspace)).toBe('unknown');
+    expect(isWorkspaceOperational(legacyWorkspace)).toBe(false);
   });
 });

@@ -841,7 +841,7 @@ fn lifecycle_scope_matches_delivery(
                 && artifact_id == &assignment.artifact_id
                 && storage_volume_id == &assignment.storage_volume_id
         }
-        AgentResourceLifecycleScope::Playground { .. } => false,
+        AgentResourceLifecycleScope::Workspace { .. } => false,
         AgentResourceLifecycleScope::Snapshot {
             project_id,
             artifact_id,
@@ -866,7 +866,7 @@ fn lifecycle_scope_matches_job(
             scope,
             &input.project_id,
             &input.artifact_id,
-            Some(&input.playground_id),
+            Some(&input.workspace_id),
             None,
             &input.storage_volume_id,
         ),
@@ -874,7 +874,7 @@ fn lifecycle_scope_matches_job(
             scope,
             &input.project_id,
             &input.artifact_id,
-            Some(&input.playground_id),
+            Some(&input.workspace_id),
             None,
             &input.storage_volume_id,
         ),
@@ -894,7 +894,7 @@ fn lifecycle_scope_matches_parts(
     scope: &AgentResourceLifecycleScope,
     project_id: &neoengram_domain::protocol::ProjectId,
     artifact_id: &neoengram_domain::protocol::ArtifactId,
-    playground_id: Option<&neoengram_domain::protocol::PlaygroundId>,
+    workspace_id: Option<&neoengram_domain::protocol::WorkspaceId>,
     snapshot_id: Option<&SnapshotId>,
     storage_volume_id: &StorageVolumeId,
 ) -> bool {
@@ -912,16 +912,16 @@ fn lifecycle_scope_matches_parts(
                 && expected_artifact == artifact_id
                 && expected_volume == storage_volume_id
         }
-        AgentResourceLifecycleScope::Playground {
+        AgentResourceLifecycleScope::Workspace {
             project_id: expected_project,
             artifact_id: expected_artifact,
-            playground_id: expected_playground,
+            workspace_id: expected_workspace,
             storage_volume_id: expected_volume,
             ..
         } => {
             expected_project == project_id
                 && expected_artifact == artifact_id
-                && playground_id == Some(expected_playground)
+                && workspace_id == Some(expected_workspace)
                 && expected_volume == storage_volume_id
         }
         AgentResourceLifecycleScope::Snapshot {
@@ -1976,11 +1976,11 @@ mod tests {
     };
     use neoengram_domain::protocol::{
         ArtifactPlacementId, AssignmentGeneration, AssignmentId, DecimalU64, DeletionId,
-        DeliveryGeneration, EdgeClusterId, Extensions, HardlinkPolicy, LifecycleAssignmentId,
-        LifecycleGeneration, PlacementGeneration, PrincipalId, PrincipalKind, PrincipalRef,
-        ProjectId, ResourceLifecycleAction, ResourceLifecycleAssignment, ResourceRef,
-        SnapshotDeliveryAction, SnapshotDeliveryMode, SnapshotId, VolumeMarkerId,
-        CURRENT_WIRE_VERSION,
+        DeliveryGeneration, EdgeClusterId, Extensions, Generation, HardlinkPolicy,
+        LifecycleAssignmentId, LifecycleGeneration, PlacementGeneration, PrincipalId,
+        PrincipalKind, PrincipalRef, ProjectId, ResourceLifecycleAction,
+        ResourceLifecycleAssignment, ResourceRef, SnapshotDeliveryAction, SnapshotDeliveryMode,
+        SnapshotId, TaskExecutionFence, TaskId, VolumeMarkerId, CURRENT_WIRE_VERSION,
     };
     use neoengram_runtime::engine::ObjectStore;
 
@@ -2091,6 +2091,13 @@ mod tests {
             .unwrap();
         let mut assignment = SnapshotDeliveryAssignment {
             job_id: neoengram_domain::protocol::JobId::new("job-delivery-a").unwrap(),
+            task_fence: TaskExecutionFence::new(
+                TaskId::new("task-job-delivery-a").unwrap(),
+                Generation::new(1),
+                "delivery_materialize",
+                Generation::new(1),
+                Generation::new(1),
+            ),
             assignment_id: AssignmentId::new("assignment-delivery-a").unwrap(),
             assignment_generation: AssignmentGeneration::new(1),
             agent_id: AgentId::new("agent-a").unwrap(),
@@ -2145,6 +2152,13 @@ mod tests {
                 request_digest: ContentDigest::from_bytes([0x33; 32]),
                 deadline_unix_ms: neoengram_domain::protocol::UnixMillis::new(10_000),
             },
+            task_fence: TaskExecutionFence::new(
+                TaskId::new("task-deletion-snapshot-a").unwrap(),
+                Generation::new(1),
+                "quarantine",
+                Generation::new(1),
+                Generation::new(1),
+            ),
             resource_scope: AgentResourceLifecycleScope::Snapshot {
                 project_id: delivery.project_id.clone(),
                 artifact_id: delivery.artifact_id.clone(),

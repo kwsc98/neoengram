@@ -4,6 +4,7 @@ import {
   createS3AccessPoint,
   createS3Credential,
   createS3DownloadUrl,
+  deleteS3AccessPoint,
   disableS3AccessPoint,
   queryS3AccessPointList,
   queryS3CredentialList,
@@ -77,10 +78,10 @@ describe('read-only S3 control operations', () => {
     };
     const created = await createS3AccessPoint(request);
     expect(created.data.secret_access_key).toBeTruthy();
-    expect(created.data.replayed).toBe(false);
+    expect(created.data.request_replayed).toBe(false);
 
     const replay = await createS3AccessPoint(request);
-    expect(replay.data.replayed).toBe(true);
+    expect(replay.data.request_replayed).toBe(true);
     expect(replay.data.secret_access_key).toBeUndefined();
 
     const accessPointId = created.data.access_point.access_point_id;
@@ -95,7 +96,7 @@ describe('read-only S3 control operations', () => {
       access_point_id: accessPointId,
       request_id: 's3-credential-test-1',
     });
-    expect(rotationReplay.data.replayed).toBe(true);
+    expect(rotationReplay.data.request_replayed).toBe(true);
     expect(rotationReplay.data.secret_access_key).toBeUndefined();
 
     await expect(
@@ -117,5 +118,12 @@ describe('read-only S3 control operations', () => {
     });
     expect(credentials.data.items).toHaveLength(2);
     expect(credentials.data.items.every((credential) => credential.state === 'revoked')).toBe(true);
+
+    const deleted = await deleteS3AccessPoint({
+      tenant_id: 'tenant-a',
+      access_point_id: accessPointId,
+      request_id: 's3-delete-test-1',
+    });
+    expect(deleted.data.access_point.state).toBe('deleted');
   });
 });

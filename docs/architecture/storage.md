@@ -72,7 +72,7 @@ Managed 中心的逻辑权威通过异步 `AuthorityStore` 组合统一 `TaskRep
 `authority.lock`，连接池固定单连接，并启用 WAL、foreign keys、`synchronous=FULL` 和 busy timeout。
 
 该数据库不属于 Standalone 仓库格式 9，也不得与 Standalone 共用文件。它只接受当前
-`application_id`/`user_version=20` 和当前 JSON record format；旧格式、错误 schema 和未知非空数据库
+`application_id`/`user_version=21` 和当前 JSON record format；旧格式、错误 schema 和未知非空数据库
 直接拒绝，不提供 migration、双读、字段别名或回退。所有租户查询和复合键都包含 tenant ID，但
 SQLite 仍是应用层隔离，不伪装成数据库级 RLS、HA 或多进程后端。
 
@@ -118,10 +118,10 @@ durability barrier 并提交幂等 receipt 后，Placement 才能进入 `verifie
 或 batch attempt 不能改变 `(materialization_id, namespace, object_id)` staging key 或 confirmed offset。Workspace、
 SnapshotDelivery 和 S3 只有在 Coverage 完整且视图校验通过后才能 Ready；全局对象并集完整不等于任一 Volume 可读。
 
-当前 authority schema 为 `user_version=20`，已安装 v2 表（含 `object_placements`、Coverage、Materialization、OperationTask、
+当前 authority schema 为 `user_version=21`，已安装 v2 表（含 `object_placements`、Coverage、Materialization、OperationTask、
 object-read/staging lease），并通过 InMemory/SQLite 的 CAS、幂等 Receipt 和重规划 checkpoint 契约。v1
 `commit_placement_sets`、`replications`、`replication_objects` 和旧 ObjectCatalog/Assignment mapper 尚未删除，
-因此该 schema 仍是开发阶段 clean-slate；v19 及更早 authority 数据库与 v20 DDL 不兼容，升级不隐式删除或迁移，
+因此该 schema 仍是开发阶段 clean-slate；v20 及更早 authority 数据库与 v21 DDL 不兼容，升级不隐式删除或迁移，
 clean-slate reset/inventory rebuild 必须由显式运维动作完成。
 
 Managed Add 的固定发布闭环为：
@@ -158,7 +158,7 @@ Index 仍可解析；Conflict/Rejected 不发布候选 Manifest。
 这项网络拓扑调整不改变任何存储权威：
 
 - Gateway Replica 不挂载业务 PVC、NFS export 或 StorageVolume；
-- Gateway 不读取或写入 Volume CAS、Playground、journal、Agent Ledger 或 candidate database；
+- Gateway 不读取或写入 Volume CAS、Workspace、journal、Agent Ledger 或 candidate database；
 - 所有 Manifest 驱动的 Chunk I/O、Hash 复核、`fsync`、durability barrier 和原子发布仍在 Volume
   Owner Agent 执行；
 - Gateway 的多副本和跨 Replica forwarding 只提供入口可用性，不构成对象或 metadata 副本；

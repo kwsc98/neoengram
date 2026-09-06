@@ -8,12 +8,12 @@ use std::{
 use fusen_rs::{RunningServer, ServerState};
 use neoengram_central::{
     open_sqlite_authority, ArtifactInitialization, ArtifactRecord, CatalogPvcReference,
-    PlaygroundRecord, PlaygroundState, SqliteAuthorityConfig, StorageAccessMode,
-    StorageBackendType, StorageVolumeRecord, StorageVolumeState, TenantRecord,
+    SqliteAuthorityConfig, StorageAccessMode, StorageBackendType, StorageVolumeRecord,
+    StorageVolumeState, TenantRecord, WorkspaceRecord, WorkspaceState,
 };
 use neoengram_central::{AppState, Config};
 use neoengram_domain::protocol::{
-    ArtifactId, EdgeClusterId, PlaygroundId, ProjectId, StorageVolumeId, TenantId, UnixMillis,
+    ArtifactId, EdgeClusterId, ProjectId, StorageVolumeId, TenantId, UnixMillis, WorkspaceId,
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -257,7 +257,7 @@ async fn catalog_write_replays_the_same_task_without_exposing_execution_identity
     let request = project_request("tenant-a", "replayed-project");
     let first = post_json(running.local_addr(), "/api/project/create", &request).await;
     let second = post_json(running.local_addr(), "/api/project/create", &request).await;
-    for (response, replayed) in [(&first, false), (&second, true)] {
+    for (response, request_replayed) in [(&first, false), (&second, true)] {
         assert_eq!(
             response.status,
             200,
@@ -265,7 +265,8 @@ async fn catalog_write_replays_the_same_task_without_exposing_execution_identity
             String::from_utf8_lossy(&response.body)
         );
         let body = response.json();
-        assert_eq!(body["replayed"], replayed);
+        assert_eq!(body["request_replayed"], request_replayed);
+        assert_eq!(body["execution_reused"], false);
         assert_eq!(body["task"]["state"], "succeeded");
         assert_public_operation_task_view(&body["task"]);
         let encoded = serde_json::to_string(&body["task"]).unwrap();
@@ -447,7 +448,7 @@ async fn seed_catalog_scopes(path: &Path, tenants: &[&str]) {
         .expect("SQLite authority must compose the control catalog");
     let project_id = ProjectId::new("project-a").unwrap();
     let artifact_id = ArtifactId::new("artifact-a").unwrap();
-    let playground_id = PlaygroundId::new("playground-a").unwrap();
+    let workspace_id = WorkspaceId::new("workspace-a").unwrap();
     let storage_volume_id = StorageVolumeId::new("volume-a").unwrap();
     let now = UnixMillis::new(1_000);
     for tenant in tenants {
@@ -509,20 +510,20 @@ async fn seed_catalog_scopes(path: &Path, tenants: &[&str]) {
             .await
             .unwrap();
         catalog
-            .insert_playground(PlaygroundRecord {
+            .insert_workspace(WorkspaceRecord {
                 tenant_id,
                 project_id: project_id.clone(),
                 artifact_id: artifact_id.clone(),
-                playground_id: playground_id.clone(),
+                workspace_id: workspace_id.clone(),
                 storage_volume_id: storage_volume_id.clone(),
                 region: "cn-shanghai".to_owned(),
-                display_name: "Playground A".to_owned(),
+                display_name: "Workspace A".to_owned(),
                 base_commit_id: None,
                 head_commit_id: None,
-                state: PlaygroundState::Ready,
+                state: WorkspaceState::Ready,
                 resource_version: 1,
                 lifecycle: neoengram_domain::protocol::ResourceLifecycle::active(),
-                relative_root: "playgrounds/project-a/artifact-a/playground-a".to_owned(),
+                relative_root: "workspaces/project-a/artifact-a/workspace-a".to_owned(),
                 created_at_unix_ms: now,
                 updated_at_unix_ms: now,
             })
@@ -592,10 +593,16 @@ fn assert_public_operation_task_view(task: &Value) {
     let object = task.as_object().expect("TaskView must be a JSON object");
     for required in [
         "task_id",
-        "task_kind",
+        "intent_kind",
         "state",
-        "phase",
         "tenant_id",
+        "primary_resource",
+        "resource_links",
+        "execution_id",
+        "execution_key_digest",
+        "execution_reused",
+        "current_stage",
+        "stages",
         "request_id",
         "request_digest",
         "actor",

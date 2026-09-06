@@ -27,7 +27,7 @@ Commands:
   mount-probe               Run the explicit Linux real-mount probe
 
 Module names:
-  domain runtime agent central gateway cli openapi web web-e2e manifests quality
+  domain runtime agent central gateway dev-stack cli openapi web web-e2e manifests quality gaps
 
 Options:
   --no-install              Do not run npm ci during bootstrap/all
@@ -100,7 +100,9 @@ run_module() {
 
 run_modules() {
   local module_name
-  for module_name in domain runtime agent central gateway cli openapi web web-e2e manifests quality; do
+  # gaps is opt-in for now: its bundle-collision audit fails on the nine known
+  # agent schema name collisions. Add it to this list once they are resolved.
+  for module_name in domain runtime agent central gateway dev-stack cli openapi web web-e2e manifests quality; do
     project_test_run_step "module-${module_name}" run_module "${module_name}"
   done
 }

@@ -4,7 +4,7 @@
 >
 > 生效日期：2026-08-09。
 >
-> 最后更新：2026-09-04。
+> 最后更新：2026-09-05。
 >
 > 本文是 Gateway 拓扑、资源、连接方向、安全、可用性、跨集群传输和 S3 暴露方式的专项权威文档。
 > 当前代码已包含 Gateway 协议、Gateway Registry、管理 API、三 listener、有界 H2 tunnel、Central outbound
@@ -85,7 +85,7 @@ Central 继续权威管理：
 - EdgeCluster、StorageVolume、ArtifactPlacement、AgentInstance 和 Volume Owner generation；
 - GatewayPool、GatewayReplica、AgentRouteLease 和工作负载证书状态；
 - `OperationTask`、TaskAttempt、TaskEvent、TaskResourceLink/Relation，以及由其关联的
-  `Job`/`Assignment`、PlaygroundLease、fencing token、Decision 和审计事件；
+  `Job`/`Assignment`、WorkspaceLease、fencing token、Decision 和审计事件；
 - v2 `MaterializationJob`/`MaterializationBatch`/batch Ticket/Lease 的控制记录；v1
   `TransferRoute`/`TransferTicket`/`TransferSession` 仅保留为私有迁移/拒绝边界，不参与调度；当前只读数据面的 S3AccessPoint、
   S3Credential 和策略 generation；payload 是否可执行由 route/keyring/capability 决定。
@@ -110,7 +110,7 @@ Gateway 是区域网络与协议边界，负责：
 Gateway 不得：
 
 - 成为 Tenant、Artifact、Commit、Index、OperationTask、Job、Placement、Lease 或 Ticket 的权威；
-- 挂载 NFS/PVC/StorageVolume，或读取 Playground、journal、Agent state database；
+- 挂载 NFS/PVC/StorageVolume，或读取 Workspace、journal、Agent state database；
 - 把对象、metadata batch 或 S3 响应持久化为可恢复的业务副本；
 - 自行调度 Agent、签发 Ticket、提升 route generation 或抢占 Agent owner；
 - 修改、重新签名或降级绕过 Central/Agent 端到端签名；
@@ -134,7 +134,7 @@ Volume Owner Agent -> durability barrier -> Volume-local CAS
 Central ObjectCatalog
 ```
 
-业务 Pod 继续通过本集群 NFS/CSI 直接访问精确 Playground/SnapshotDelivery 目录，不经过 Gateway 或 Central。
+业务 Pod 继续通过本集群 NFS/CSI 直接访问精确 Workspace/SnapshotDelivery 目录，不经过 Gateway 或 Central。
 
 ## 4. Central 资源模型
 
@@ -209,8 +209,8 @@ bootstrap endpoint 在 Registry 层固化；在证书轮换交付/切换协议�
 
 Central 增加 `GatewayRegistryRepository`，InMemory 和 SQLite 必须运行同一行为契约。GatewayPool、
 GatewayReplica、activation/certificate 记录和 AgentRouteLease 写入现有 Agent Registry 数据库；该库从
-  authority 使用单一 clean-slate schema identity `application_id = 0x4e454155`、`user_version = 20`；
-  v19 及更早 authority 与当前 DDL 不兼容，必须由运维显式 reset/inventory rebuild。未知 schema 与旧的
+  authority 使用单一 clean-slate schema identity `application_id = 0x4e454155`、`user_version = 21`；
+  v20 及更早 authority 与当前 DDL 不兼容，必须由运维显式 reset/inventory rebuild。未知 schema 与旧的
   拆分数据库布局直接拒绝，不能留下半初始化 schema，也不执行隐式迁移。
 
 管理面至少提供 GatewayPool create/get/list/update/drain，以及 GatewayReplica create/list/drain/revoke。
@@ -337,6 +337,12 @@ TLS 或非 loopback Gateway listener 启动时都必须显式配置 trust domain
 private-key 引用、activation-token 引用和临时 certificate-delivery 路径，但保留 trust domain、活动
 listener key/certificate 和 CA bundle。删除 token 后不得因残留的半套 bootstrap 配置进入循环失败。
 
+Gateway 安装 workload certificate 时会在证书旁原子写入受限的
+`<certificate-file>.bootstrap-state.json`，记录原始 `request_id` 和叶证书 BLAKE3 digest，文件权限固定为
+`0600`。重启后有证书但缺少、损坏或权限过宽的 fence metadata 会 fail-closed；只有同一 request 和同一
+叶证书的精确重放保持幂等，不同 request 或证书链不能重新激活。该 sidecar 只保存激活 fence，不是凭据
+或证书来源，不能替代 Central 的 generation/CAS。
+
 Agent enrollment/status 全部经本集群 Gateway 转发。未取证 Agent 只允许在 server-auth TLS 下调用
 bootstrap/status；审批后所有 session 和业务动作必须使用 mTLS。已有已审批 Agent 使用原 Ed25519 私钥
 对 status/取证请求签名，不重复触发人工审批。
@@ -443,6 +449,15 @@ barrier 并原子发布后，Central 才能登记目标 ObjectPlacement。切换
 `(materialization_id, object_namespace_id, object_id)` 和 confirmed offset 保持不变。Agent source/target session
 与 Gateway relay 已有执行入口，但真实跨 Gateway route 配置、三 Agent/多源失败恢复和生产 E2E 仍待验收。
 禁止目标 Agent 挂载源 NFS、Agent 跨集群直连、无 Ticket 传输或 Central API payload relay。
+
+QUIC transfer listener 在 TLS 链验证之后还必须校验 workload 身份：每个连接只能携带一个 canonical
+SPIFFE URI SAN，并且 trust domain、EdgeCluster 与 Ticket 绑定一致。Target Gateway 的下一跳对端必须是
+Ticket 指定的目标 Agent；Source Gateway 的下一跳对端必须是同一目标 EdgeCluster/Pool 范围内的 Gateway
+Replica。Agent 预检同样要求本集群 Agent URI；Gateway Replica 对端还必须同时具备 `clientAuth` 与
+`serverAuth` EKU。Source Agent 在读取 v2 materialization ticket 首帧后、打开本地 backend/resolver 前，
+还会校验来访 Gateway Replica 的单一 canonical URI、trust domain、ticket 的 source EdgeCluster/Pool、合法
+Replica ID 和双向 EKU；replication 配置缺少 trust domain 直接拒绝启动。身份、角色或 scope 不匹配在读取
+manifest/对象前 fail-closed，这些检查已有协议回归测试，但尚未通过真实跨 Gateway/Agent E2E 验收。
 
 ## 10. S3 暴露（一期只读数据面）
 

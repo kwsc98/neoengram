@@ -469,7 +469,7 @@ primary/fallback。目标端已经 `Verified` 的对象保留，仍有效的 sta
      -H "NeoEngram-API-Version: 1" \
      -H "Authorization: Bearer $TOKEN" \
      -H "Content-Type: application/json" \
-     -d '{"tenant_id":"<tenant>","object_namespace_id":"<namespace>","commit_id":"<commit>","storage_volume_id":"<target-volume>","task_kind":["commit.materialize"]}'
+     -d '{"tenant_id":"<tenant>","object_namespace_id":"<namespace>","commit_id":"<commit>","storage_volume_id":"<target-volume>","intent_kind":["commit.materialize"]}'
    ```
 
 3. 使用查询到的 `task_id` 显式触发重试。重试复用原任务并创建新的 Attempt；若期间任务已变化而返回

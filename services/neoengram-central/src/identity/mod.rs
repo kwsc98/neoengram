@@ -825,10 +825,10 @@ pub enum Permission {
     ProjectRead,
     #[serde(rename = "project.create")]
     ProjectCreate,
-    #[serde(rename = "playground.read")]
-    PlaygroundRead,
-    #[serde(rename = "playground.create")]
-    PlaygroundCreate,
+    #[serde(rename = "workspace.read")]
+    WorkspaceRead,
+    #[serde(rename = "workspace.create")]
+    WorkspaceCreate,
     #[serde(rename = "snapshot.read")]
     SnapshotRead,
     #[serde(rename = "snapshot.create")]
@@ -873,8 +873,8 @@ impl Permission {
             Self::ArtifactCommitReplicate => "artifact.commit.replicate",
             Self::ProjectRead => "project.read",
             Self::ProjectCreate => "project.create",
-            Self::PlaygroundRead => "playground.read",
-            Self::PlaygroundCreate => "playground.create",
+            Self::WorkspaceRead => "workspace.read",
+            Self::WorkspaceCreate => "workspace.create",
             Self::SnapshotRead => "snapshot.read",
             Self::SnapshotCreate => "snapshot.create",
             Self::S3AccessRead => "s3.access.read",

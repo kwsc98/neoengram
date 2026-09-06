@@ -273,9 +273,9 @@ project_test_scrub_sensitive_temp() {
     "${PROJECT_TEST_TEMP_ROOT}/local-repository" \
     "${PROJECT_TEST_TEMP_ROOT}/local-export" \
     "${PROJECT_TEST_TEMP_ROOT}/volume-source/objects" \
-    "${PROJECT_TEST_TEMP_ROOT}/volume-source/playgrounds" \
+    "${PROJECT_TEST_TEMP_ROOT}/volume-source/workspaces" \
     "${PROJECT_TEST_TEMP_ROOT}/volume-target/objects" \
-    "${PROJECT_TEST_TEMP_ROOT}/volume-target/playgrounds" \
+    "${PROJECT_TEST_TEMP_ROOT}/volume-target/workspaces" \
     "${PROJECT_TEST_TEMP_ROOT}/agent-state-source" \
     "${PROJECT_TEST_TEMP_ROOT}/agent-state-target"; do
     if [[ -e "${path}" ]]; then

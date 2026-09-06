@@ -241,7 +241,7 @@ paths:
       summary: Query an authoritative Job Index page
       description: >-
         Returns one immutable page of the exact Index version authorized by the Assignment after
-        validating Agent, Job, Artifact, Playground, and Tenant scope.
+        validating Agent, Job, Artifact, Workspace, and Tenant scope.
       security: []
       x-neoengram-body-security: ApprovedAgentEd25519
       requestBody:
@@ -857,9 +857,9 @@ components:
       additionalProperties: false
       required: [tenant_id, job_id, artifact_id, index_version, page_number, max_records]
       oneOf:
-        - required: [playground_id]
+        - required: [workspace_id]
           properties:
-            playground_id: { $ref: '#/components/schemas/Id' }
+            workspace_id: { $ref: '#/components/schemas/Id' }
         - required: [snapshot_id]
           properties:
             snapshot_id: { $ref: '#/components/schemas/Id' }
@@ -867,7 +867,7 @@ components:
         tenant_id: { $ref: '#/components/schemas/Id' }
         job_id: { $ref: '#/components/schemas/Id' }
         artifact_id: { $ref: '#/components/schemas/Id' }
-        playground_id: { $ref: '#/components/schemas/Id' }
+        workspace_id: { $ref: '#/components/schemas/Id' }
         snapshot_id: { $ref: '#/components/schemas/Id' }
         index_version:
           $ref: '#/components/schemas/AgentWireIndexVersion'

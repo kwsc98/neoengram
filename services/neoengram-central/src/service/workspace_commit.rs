@@ -3,11 +3,10 @@ use std::{fmt, str::FromStr, sync::Arc};
 use std::collections::BTreeMap;
 
 use crate::{
-    canonical_commit_id_with_layout, AdvancePlaygroundCommitRequest, AuthorityStore, CentralError,
+    canonical_commit_id_with_layout, AdvanceWorkspaceCommitRequest, AuthorityStore, CentralError,
     CentralErrorCode, CentralResult, Clock, CommitRecord, ControlCatalogRepository, IndexKey,
-    IndexPublisher, JobKey, JobRepository, PlaygroundRecord, PlaygroundState,
-    PreCommitCommitRequest, PreCommitId, PreCommitKey, PreCommitRecord, PreCommitRepository,
-    PreCommitState,
+    IndexPublisher, JobKey, JobRepository, PreCommitCommitRequest, PreCommitId, PreCommitKey,
+    PreCommitRecord, PreCommitRepository, PreCommitState, WorkspaceRecord, WorkspaceState,
 };
 use fusen_rs::{Error, ErrorCategory};
 use neoengram_domain::core::{
@@ -15,8 +14,8 @@ use neoengram_domain::core::{
 };
 use neoengram_domain::protocol::{
     ArtifactId, CommitDataLayout, CommitObject, CommitObjectSet, IndexRevision, JobState,
-    ObjectEncoding, PlacementGeneration, PlaygroundId, ProjectId, RequestId, TenantId,
-    WireIndexVersion,
+    ObjectEncoding, PlacementGeneration, ProjectId, RequestId, TenantId, WireIndexVersion,
+    WorkspaceId,
 };
 use neoengram_runtime::engine::{
     build_commit_graph, BuildCommitGraphRequest, EngineError, EngineResult, IndexSnapshotReader,
@@ -25,7 +24,7 @@ use neoengram_runtime::engine::{
 use tokio::sync::Mutex;
 
 use crate::{
-    dto::{CommitPlaygroundRequest, IndexVersionBody},
+    dto::{CommitWorkspaceRequest, IndexVersionBody},
     error::{application_error, invalid_request, map_central_error},
     identity::{AuthenticatedIdentity, Permission, StaticRbacPolicy},
 };
@@ -33,7 +32,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct WorkspaceCommitResult {
     pub commit: CommitRecord,
-    pub playground: PlaygroundRecord,
+    pub workspace: WorkspaceRecord,
     pub consumed_precommit: PreCommitRecord,
     pub replayed: bool,
 }
@@ -80,22 +79,22 @@ impl WorkspaceCommitService {
         })
     }
 
-    pub async fn commit_playground(
+    pub async fn commit_workspace(
         &self,
         identity: &AuthenticatedIdentity,
-        request: CommitPlaygroundRequest,
+        request: CommitWorkspaceRequest,
     ) -> Result<WorkspaceCommitResult, Error> {
         let tenant_id = parse_id("tenant_id", request.tenant_id, TenantId::new)?;
         if !self.policy.is_allowed(
             identity.principal(),
-            Permission::PlaygroundCreate,
+            Permission::WorkspaceCreate,
             &tenant_id,
         ) {
-            return Err(resource_not_found("playground"));
+            return Err(resource_not_found("workspace"));
         }
         let project_id = parse_id("project_id", request.project_id, ProjectId::new)?;
         let artifact_id = parse_id("artifact_id", request.artifact_id, ArtifactId::new)?;
-        let playground_id = parse_id("playground_id", request.playground_id, PlaygroundId::new)?;
+        let workspace_id = parse_id("workspace_id", request.workspace_id, WorkspaceId::new)?;
         let precommit_id = parse_id("precommit_id", request.precommit_id, PreCommitId::new)?;
         let commit_request_id = parse_id(
             "commit_request_id",
@@ -134,24 +133,24 @@ impl WorkspaceCommitService {
                 "the Artifact is not active and cannot accept commits",
             ));
         }
-        let playground = self
+        let workspace = self
             .catalog
-            .get_playground(&tenant_id, &project_id, &artifact_id, &playground_id)
+            .get_workspace(&tenant_id, &project_id, &artifact_id, &workspace_id)
             .await
             .map_err(map_central_error)?
-            .ok_or_else(|| resource_not_found("playground"))?;
-        if !playground.lifecycle.is_active() {
+            .ok_or_else(|| resource_not_found("workspace"))?;
+        if !workspace.lifecycle.is_active() {
             return Err(commit_conflict(
                 "resource_not_active",
                 "RESOURCE_NOT_ACTIVE",
-                "the Playground is not active and cannot be committed",
+                "the Workspace is not active and cannot be committed",
             ));
         }
-        if playground.state != PlaygroundState::Ready {
+        if workspace.state != WorkspaceState::Ready {
             return Err(commit_conflict(
-                "playground_not_ready",
-                "PLAYGROUND_NOT_READY",
-                "only a Ready Playground can be committed",
+                "workspace_not_ready",
+                "WORKSPACE_NOT_READY",
+                "only a Ready Workspace can be committed",
             ));
         }
 
@@ -164,7 +163,7 @@ impl WorkspaceCommitService {
             .ok_or_else(|| resource_not_found("precommit"))?;
         if precommit.project_id != project_id
             || precommit.artifact_id != artifact_id
-            || precommit.playground_id != playground_id
+            || precommit.workspace_id != workspace_id
         {
             return Err(resource_not_found("precommit"));
         }
@@ -219,7 +218,7 @@ impl WorkspaceCommitService {
         if data_layout == CommitDataLayout::WholeFile {
             let volume = self
                 .catalog
-                .get_storage_volume(&tenant_id, &playground.storage_volume_id)
+                .get_storage_volume(&tenant_id, &workspace.storage_volume_id)
                 .await
                 .map_err(map_central_error)?
                 .ok_or_else(|| resource_not_found("storage volume"))?;
@@ -247,7 +246,7 @@ impl WorkspaceCommitService {
                 .map_err(map_central_error)?
                 .ok_or_else(|| internal_error("the committed Commit record is missing"))?;
             if stored.commit_request_id != commit_request_id
-                || stored.source_playground_id != playground_id
+                || stored.source_workspace_id != workspace_id
                 || stored.source_precommit_id != precommit_id
                 || !same_index_version(&stored.index_version, &expected_candidate)
                 || stored.message != request.message
@@ -272,20 +271,20 @@ impl WorkspaceCommitService {
                 .map_err(map_central_error)?
         } else {
             let frozen_head = precommit.frozen_head_commit_id.map(Into::into);
-            if playground.head_commit_id != frozen_head {
+            if workspace.head_commit_id != frozen_head {
                 return Err(commit_conflict(
                     // Preserve the published wire code while narrowing the fence to the
-                    // branch-local Playground Head.
+                    // branch-local Workspace Head.
                     "artifact_head_mismatch",
                     "ARTIFACT_HEAD_MISMATCH",
-                    "Playground Head changed after Pre-commit",
+                    "Workspace Head changed after Pre-commit",
                 ));
             }
             let index_key = IndexKey {
                 tenant_id: tenant_id.clone(),
                 project_id: project_id.clone(),
                 artifact_id: artifact_id.clone(),
-                playground_id: playground_id.clone(),
+                workspace_id: workspace_id.clone(),
             };
             let published = self
                 .indexes
@@ -296,7 +295,7 @@ impl WorkspaceCommitService {
                 return Err(commit_conflict(
                     "candidate_index_version_mismatch",
                     "CANDIDATE_INDEX_VERSION_MISMATCH",
-                    "the published Playground Index no longer matches this Pre-commit",
+                    "the published Workspace Index no longer matches this Pre-commit",
                 ));
             }
             let created_at_unix_ms = self.clock.now();
@@ -339,7 +338,7 @@ impl WorkspaceCommitService {
                         tenant_id: tenant_id.clone(),
                         project_id: project_id.clone(),
                         artifact_id: artifact_id.clone(),
-                        source_playground_id: playground_id.clone(),
+                        source_workspace_id: workspace_id.clone(),
                         source_precommit_id: precommit_id,
                         commit_request_id,
                         commit_id: canonical_commit_id_with_layout(graph.commit_id, data_layout),
@@ -363,7 +362,7 @@ impl WorkspaceCommitService {
         // namespace-scoped, verified object placements on the Workspace's Volume. This operation
         // is idempotent so a retry after a process interruption converges without changing the
         // immutable Commit record.
-        self.publish_initial_placement(&authority_outcome.commit, &playground)
+        self.publish_initial_placement(&authority_outcome.commit, &workspace)
             .await?;
 
         if authority_outcome
@@ -373,12 +372,12 @@ impl WorkspaceCommitService {
         {
             return Ok(WorkspaceCommitResult {
                 commit: authority_outcome.commit,
-                playground,
+                workspace,
                 consumed_precommit: authority_outcome.consumed_precommit,
                 replayed: true,
             });
         }
-        let (published_playground, head_replayed) = publish_committed_playground_head(
+        let (published_workspace, head_replayed) = publish_committed_workspace_head(
             self.catalog.as_ref(),
             self.precommits.as_ref(),
             &authority_outcome.commit,
@@ -396,7 +395,7 @@ impl WorkspaceCommitService {
             .map_err(map_central_error)?;
         Ok(WorkspaceCommitResult {
             commit: authority_outcome.commit,
-            playground: published_playground,
+            workspace: published_workspace,
             consumed_precommit,
             replayed: authority_outcome.replayed || head_replayed,
         })
@@ -405,7 +404,7 @@ impl WorkspaceCommitService {
     async fn publish_initial_placement(
         &self,
         commit: &CommitRecord,
-        playground: &PlaygroundRecord,
+        workspace: &WorkspaceRecord,
     ) -> Result<(), Error> {
         let Some(placement) = &self.placement else {
             // Standalone/unit compositions may intentionally omit the placement authority. The
@@ -419,7 +418,7 @@ impl WorkspaceCommitService {
                 "Commit ObjectSet digest differs from its immutable Commit identity",
             ));
         }
-        let storage_volume_id = playground.storage_volume_id.clone();
+        let storage_volume_id = workspace.storage_volume_id.clone();
         let _volume = self
             .catalog
             .get_storage_volume(&commit.tenant_id, &storage_volume_id)
@@ -650,35 +649,35 @@ async fn validate_candidate_layout(
     Ok(())
 }
 
-pub(super) async fn publish_committed_playground_head(
+pub(super) async fn publish_committed_workspace_head(
     catalog: &dyn ControlCatalogRepository,
     precommits: &dyn PreCommitRepository,
     commit: &CommitRecord,
-) -> CentralResult<(PlaygroundRecord, bool)> {
-    let current = load_commit_playground(catalog, commit).await?;
-    if playground_contains_commit(precommits, commit, &current).await? {
+) -> CentralResult<(WorkspaceRecord, bool)> {
+    let current = load_commit_workspace(catalog, commit).await?;
+    if workspace_contains_commit(precommits, commit, &current).await? {
         return Ok((current, true));
     }
 
     match catalog
-        .advance_playground_commit(AdvancePlaygroundCommitRequest {
+        .advance_workspace_commit(AdvanceWorkspaceCommitRequest {
             tenant_id: commit.tenant_id.clone(),
             project_id: commit.project_id.clone(),
             artifact_id: commit.artifact_id.clone(),
-            playground_id: commit.source_playground_id.clone(),
+            workspace_id: commit.source_workspace_id.clone(),
             expected_head_commit_id: commit.parent_commit_id.map(Into::into),
             commit_id: commit.commit_id.into(),
             updated_at_unix_ms: commit.created_at_unix_ms,
         })
         .await
     {
-        Ok(outcome) => Ok((outcome.playground, outcome.replayed)),
+        Ok(outcome) => Ok((outcome.workspace, outcome.replayed)),
         Err(error) if error.code() == CentralErrorCode::ArtifactHeadMismatch => {
-            // Another publisher may have advanced this same Playground between the observation
+            // Another publisher may have advanced this same Workspace between the observation
             // and CAS. A descendant proves this Commit was already published; never move Head
             // backwards merely to complete its recovery acknowledgement.
-            let current = load_commit_playground(catalog, commit).await?;
-            if playground_contains_commit(precommits, commit, &current).await? {
+            let current = load_commit_workspace(catalog, commit).await?;
+            if workspace_contains_commit(precommits, commit, &current).await? {
                 Ok((current, true))
             } else {
                 Err(error)
@@ -688,32 +687,32 @@ pub(super) async fn publish_committed_playground_head(
     }
 }
 
-async fn load_commit_playground(
+async fn load_commit_workspace(
     catalog: &dyn ControlCatalogRepository,
     commit: &CommitRecord,
-) -> CentralResult<PlaygroundRecord> {
+) -> CentralResult<WorkspaceRecord> {
     catalog
-        .get_playground(
+        .get_workspace(
             &commit.tenant_id,
             &commit.project_id,
             &commit.artifact_id,
-            &commit.source_playground_id,
+            &commit.source_workspace_id,
         )
         .await?
         .ok_or_else(|| {
             CentralError::new(
                 CentralErrorCode::ArtifactNotFound,
-                "committed Pre-commit source Playground no longer exists",
+                "committed Pre-commit source Workspace no longer exists",
             )
         })
 }
 
-async fn playground_contains_commit(
+async fn workspace_contains_commit(
     precommits: &dyn PreCommitRepository,
     commit: &CommitRecord,
-    playground: &PlaygroundRecord,
+    workspace: &WorkspaceRecord,
 ) -> CentralResult<bool> {
-    let Some(head) = playground.head_commit_id else {
+    let Some(head) = workspace.head_commit_id else {
         return Ok(false);
     };
     is_commit_ancestor(
@@ -752,7 +751,7 @@ async fn is_commit_ancestor(
             .ok_or_else(|| {
                 CentralError::new(
                     CentralErrorCode::Internal,
-                    "published Playground Head lost its immutable Commit row",
+                    "published Workspace Head lost its immutable Commit row",
                 )
             })?;
         let Some(parent) = commit.parent_commit_id else {
@@ -969,7 +968,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn recovery_accepts_descendant_playground_head_without_rolling_it_back() {
+    async fn recovery_accepts_descendant_workspace_head_without_rolling_it_back() {
         let target = CommitId::from_bytes([1; 32]);
         let descendant = CommitId::from_bytes([2; 32]);
         let commits = CommitLookupRepository::new([
@@ -978,18 +977,18 @@ mod tests {
         ]);
         let catalog = catalog_with_head(descendant).await;
 
-        let (playground, replayed) =
-            publish_committed_playground_head(&catalog, &commits, &commit_record(target, None))
+        let (workspace, replayed) =
+            publish_committed_workspace_head(&catalog, &commits, &commit_record(target, None))
                 .await
                 .unwrap();
 
         assert!(replayed);
-        assert_eq!(playground.head_commit_id, Some(descendant.into()));
+        assert_eq!(workspace.head_commit_id, Some(descendant.into()));
         assert_catalog_heads(&catalog, descendant).await;
     }
 
     #[tokio::test]
-    async fn recovery_rejects_an_unrelated_playground_head() {
+    async fn recovery_rejects_an_unrelated_workspace_head() {
         let target = CommitId::from_bytes([1; 32]);
         let unrelated = CommitId::from_bytes([3; 32]);
         let commits = CommitLookupRepository::new([
@@ -999,7 +998,7 @@ mod tests {
         let catalog = catalog_with_head(unrelated).await;
 
         let error =
-            publish_committed_playground_head(&catalog, &commits, &commit_record(target, None))
+            publish_committed_workspace_head(&catalog, &commits, &commit_record(target, None))
                 .await
                 .unwrap_err();
 
@@ -1019,14 +1018,14 @@ mod tests {
         let catalog = catalog_with_head(descendant).await;
 
         let error =
-            publish_committed_playground_head(&catalog, &commits, &commit_record(target, None))
+            publish_committed_workspace_head(&catalog, &commits, &commit_record(target, None))
                 .await
                 .unwrap_err();
 
         assert_eq!(error.code(), CentralErrorCode::Internal);
         assert_eq!(
             error.message(),
-            "published Playground Head lost its immutable Commit row"
+            "published Workspace Head lost its immutable Commit row"
         );
         assert_catalog_heads(&catalog, descendant).await;
     }
@@ -1044,7 +1043,7 @@ mod tests {
         let catalog = catalog_with_head(cycle_left).await;
 
         let error =
-            publish_committed_playground_head(&catalog, &commits, &commit_record(target, None))
+            publish_committed_workspace_head(&catalog, &commits, &commit_record(target, None))
                 .await
                 .unwrap_err();
 
@@ -1115,20 +1114,20 @@ mod tests {
             .await
             .unwrap();
         catalog
-            .insert_playground(PlaygroundRecord {
+            .insert_workspace(WorkspaceRecord {
                 tenant_id,
                 project_id,
                 artifact_id,
-                playground_id: playground_id(),
+                workspace_id: workspace_id(),
                 storage_volume_id: storage_volume_id(),
                 region: "local".to_owned(),
-                display_name: "Playground".to_owned(),
+                display_name: "Workspace".to_owned(),
                 base_commit_id: Some(head.into()),
                 head_commit_id: Some(head.into()),
-                state: PlaygroundState::Ready,
+                state: WorkspaceState::Ready,
                 resource_version: 1,
                 lifecycle: ResourceLifecycle::active(),
-                relative_root: "playgrounds/project-a/artifact-a/playground-a".to_owned(),
+                relative_root: "workspaces/project-a/artifact-a/workspace-a".to_owned(),
                 created_at_unix_ms: UnixMillis::new(4),
                 updated_at_unix_ms: UnixMillis::new(4),
             })
@@ -1143,18 +1142,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let playground = catalog
-            .get_playground(
-                &tenant_id(),
-                &project_id(),
-                &artifact_id(),
-                &playground_id(),
-            )
+        let workspace = catalog
+            .get_workspace(&tenant_id(), &project_id(), &artifact_id(), &workspace_id())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(artifact.head_commit_id, Some(expected.into()));
-        assert_eq!(playground.head_commit_id, Some(expected.into()));
+        assert_eq!(workspace.head_commit_id, Some(expected.into()));
     }
 
     fn commit_record(commit_id: CommitId, parent_commit_id: Option<CommitId>) -> CommitRecord {
@@ -1162,7 +1156,7 @@ mod tests {
             tenant_id: tenant_id(),
             project_id: project_id(),
             artifact_id: artifact_id(),
-            source_playground_id: playground_id(),
+            source_workspace_id: workspace_id(),
             source_precommit_id: PreCommitId::new(format!("precommit-{commit_id}")).unwrap(),
             commit_request_id: RequestId::new(format!("request-{commit_id}")).unwrap(),
             commit_id,
@@ -1195,8 +1189,8 @@ mod tests {
         ArtifactId::new("artifact-a").unwrap()
     }
 
-    fn playground_id() -> PlaygroundId {
-        PlaygroundId::new("playground-a").unwrap()
+    fn workspace_id() -> WorkspaceId {
+        WorkspaceId::new("workspace-a").unwrap()
     }
 
     fn storage_volume_id() -> StorageVolumeId {
@@ -1240,7 +1234,7 @@ mod tests {
             _tenant_id: &TenantId,
             _project_id: &ProjectId,
             _artifact_id: &ArtifactId,
-            _playground_id: &PlaygroundId,
+            _workspace_id: &WorkspaceId,
         ) -> CentralResult<Option<PreCommitRecord>> {
             Self::unused()
         }

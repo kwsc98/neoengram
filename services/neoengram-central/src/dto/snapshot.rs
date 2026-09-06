@@ -69,7 +69,8 @@ pub struct CreateSnapshotRequest {
 #[sensitive(opaque)]
 pub struct CreateSnapshotResponse {
     pub snapshot: SnapshotView,
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }

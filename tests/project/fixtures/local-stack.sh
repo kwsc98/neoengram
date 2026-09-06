@@ -36,7 +36,7 @@ project_test_start_gateway() {
 
 project_test_create_volume_fixture() {
   local root="$1" volume_marker="$2"
-  mkdir -p "${root}/objects" "${root}/playgrounds"
+  mkdir -p "${root}/objects" "${root}/workspaces"
   printf '%s\n' "${volume_marker}" >"${root}/.neoengram-volume-marker"
   chmod 700 "${root}"
 }

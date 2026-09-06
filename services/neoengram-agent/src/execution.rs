@@ -38,11 +38,11 @@ pub const MAX_AGENT_OBJECT_BYTES: u64 = 4 * 1024 * 1024;
 const VOLUME_METADATA_DIRECTORY: &str = ".neoengram";
 const VOLUME_OBJECTS_DIRECTORY: &str = "objects";
 
-/// Materializes a server-derived Playground root below one approved Volume mount.
+/// Materializes a server-derived Workspace root below one approved Volume mount.
 ///
 /// Commit and Manifest metadata arrive over the signed Agent API, while every payload object is
 /// read from the Volume-local CAS. A complete tree is staged on the same filesystem and published
-/// with an atomic no-replace rename, so a failed checkout never exposes a partial Playground.
+/// with an atomic no-replace rename, so a failed checkout never exposes a partial Workspace.
 #[derive(Debug, Clone)]
 pub struct WorkspaceMaterializer {
     mount_root: PathBuf,
@@ -156,7 +156,7 @@ impl WorkspaceMaterializer {
         })?;
         let parent_path = mount.create_dir_all(&parent).map_err(|error| {
             execution_error(format!(
-                "failed to create Playground parent directory: {error}"
+                "failed to create Workspace parent directory: {error}"
             ))
         })?;
         let destination = mount
@@ -318,7 +318,7 @@ fn path_exists(path: &Path) -> AgentResult<bool> {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(execution_error(format!(
-            "failed to inspect Playground destination: {error}"
+            "failed to inspect Workspace destination: {error}"
         ))),
     }
 }
@@ -449,11 +449,11 @@ fn verify_materialized_tree(
     files: &[WorkspaceMaterializationFile],
 ) -> AgentResult<()> {
     let metadata = fs::symlink_metadata(root).map_err(|error| {
-        execution_error(format!("failed to inspect existing Playground: {error}"))
+        execution_error(format!("failed to inspect existing Workspace: {error}"))
     })?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(execution_error(
-            "existing Playground destination is not an ordinary directory",
+            "existing Workspace destination is not an ordinary directory",
         ));
     }
 
@@ -473,42 +473,42 @@ fn verify_materialized_tree(
     let mut stack = vec![root.to_path_buf()];
     while let Some(directory) = stack.pop() {
         let entries = fs::read_dir(&directory).map_err(|error| {
-            execution_error(format!("failed to enumerate existing Playground: {error}"))
+            execution_error(format!("failed to enumerate existing Workspace: {error}"))
         })?;
         for entry in entries {
             let entry = entry.map_err(|error| {
-                execution_error(format!("failed to read existing Playground entry: {error}"))
+                execution_error(format!("failed to read existing Workspace entry: {error}"))
             })?;
             let path = entry.path();
             let relative = physical_relative_path(root, &path)?;
             let metadata = fs::symlink_metadata(&path).map_err(|error| {
                 execution_error(format!(
-                    "failed to inspect existing Playground entry: {error}"
+                    "failed to inspect existing Workspace entry: {error}"
                 ))
             })?;
             if metadata.file_type().is_symlink() {
                 return Err(execution_error(format!(
-                    "existing Playground contains symlink {relative}"
+                    "existing Workspace contains symlink {relative}"
                 )));
             }
             if metadata.is_dir() {
                 if !expected_directories.contains(&relative) {
                     return Err(execution_error(format!(
-                        "existing Playground contains unexpected directory {relative}"
+                        "existing Workspace contains unexpected directory {relative}"
                     )));
                 }
                 stack.push(path);
             } else if metadata.is_file() {
                 let expected = expected_files.get(&relative).ok_or_else(|| {
                     execution_error(format!(
-                        "existing Playground contains unexpected file {relative}"
+                        "existing Workspace contains unexpected file {relative}"
                     ))
                 })?;
                 verify_materialized_file(&path, expected)?;
                 observed_files.insert(relative);
             } else {
                 return Err(execution_error(format!(
-                    "existing Playground contains unsupported entry {relative}"
+                    "existing Workspace contains unsupported entry {relative}"
                 )));
             }
         }
@@ -521,7 +521,7 @@ fn verify_materialized_tree(
             .map(String::as_str)
             .unwrap_or("unknown");
         return Err(execution_error(format!(
-            "existing Playground is missing expected file {missing}"
+            "existing Workspace is missing expected file {missing}"
         )));
     }
     Ok(())
@@ -530,13 +530,13 @@ fn verify_materialized_tree(
 fn physical_relative_path(root: &Path, path: &Path) -> AgentResult<String> {
     let relative = path
         .strip_prefix(root)
-        .map_err(|_| execution_error("existing Playground entry escaped the destination root"))?;
+        .map_err(|_| execution_error("existing Workspace entry escaped the destination root"))?;
     let mut components = Vec::new();
     for component in relative.components() {
         let value = component
             .as_os_str()
             .to_str()
-            .ok_or_else(|| execution_error("existing Playground contains a non-UTF-8 path"))?;
+            .ok_or_else(|| execution_error("existing Workspace contains a non-UTF-8 path"))?;
         components.push(value);
     }
     Ok(components.join("/"))
@@ -831,14 +831,14 @@ impl FilesystemExecution {
     fn worktree(&self, assignment: &AddAssignment) -> AgentResult<LocalWorktree> {
         let mount = VerifiedRoot::open(&self.mount_root).map_err(AgentError::from)?;
         let relative = LogicalPath::parse(format!(
-            "playgrounds/{}/{}/{}",
-            assignment.project_id, assignment.artifact_id, assignment.playground_id
+            "workspaces/{}/{}/{}",
+            assignment.project_id, assignment.artifact_id, assignment.workspace_id
         ))
         .map_err(|error| execution_error(error.to_string()))?;
         let physical = mount.resolve_existing(&relative).map_err(|error| {
             AgentError::new(
                 AgentErrorCode::MountUnavailable,
-                format!("managed playground directory is unavailable: {error}"),
+                format!("managed workspace directory is unavailable: {error}"),
             )
         })?;
         let root = VerifiedRoot::open(physical).map_err(AgentError::from)?;
@@ -931,7 +931,7 @@ impl AddExecutor for FilesystemExecution {
                 tenant_id: assignment.tenant_id.to_string(),
                 project_id: assignment.project_id.to_string(),
                 artifact_id: assignment.artifact_id.to_string(),
-                playground_id: assignment.playground_id.to_string(),
+                workspace_id: assignment.workspace_id.to_string(),
                 job_id: assignment.job_id.to_string(),
             },
             expected_index_version: assignment.expected_index_version.clone().into(),
@@ -1075,7 +1075,7 @@ fn metadata_receipt(
         tenant_id: assignment.tenant_id.clone(),
         project_id: assignment.project_id.clone(),
         artifact_id: assignment.artifact_id.clone(),
-        playground_id: assignment.playground_id.clone(),
+        workspace_id: assignment.workspace_id.clone(),
         job_id: assignment.job_id.clone(),
         base_index_version: assignment.expected_index_version.clone(),
         extensions: Extensions::new(),
@@ -1311,9 +1311,9 @@ mod tests {
     use neoengram_domain::core::{ChunkRef, ChunkingStrategy, Manifest};
     use neoengram_domain::protocol::{
         AgentId, AgentMountId, ArtifactId, ArtifactPlacementId, AssignmentGeneration, AssignmentId,
-        EdgeClusterId, MountGeneration, OwnerGeneration, PlacementGeneration, PlaygroundId,
-        PrincipalId, PrincipalKind, PrincipalRef, ProjectId, StorageVolumeId, TenantId,
-        WireIndexVersion,
+        EdgeClusterId, Generation, MountGeneration, OwnerGeneration, PlacementGeneration,
+        PrincipalId, PrincipalKind, PrincipalRef, ProjectId, StorageVolumeId, TaskExecutionFence,
+        TaskId, TenantId, WireIndexVersion, WorkspaceId,
     };
     use tempfile::TempDir;
 
@@ -1387,10 +1387,10 @@ mod tests {
     fn real_worktree_detects_add_modify_and_delete() {
         let temporary = TempDir::new().unwrap();
         let mount = temporary.path().join("mount");
-        let playground = mount.join("playgrounds/project-a/artifact-a/playground-a");
-        fs::create_dir_all(&playground).unwrap();
-        fs::write(playground.join("added.txt"), b"added").unwrap();
-        fs::write(playground.join("modified.txt"), b"new value").unwrap();
+        let workspace = mount.join("workspaces/project-a/artifact-a/workspace-a");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("added.txt"), b"added").unwrap();
+        fs::write(workspace.join("modified.txt"), b"new value").unwrap();
 
         let mut base_records = vec![
             index_record("deleted.txt", b"deleted"),
@@ -1427,11 +1427,11 @@ mod tests {
         let temporary = TempDir::new().unwrap();
         let mount = temporary.path().join("mount");
         let state = temporary.path().join("state");
-        let playground = mount.join("playgrounds/project-a/artifact-a/playground-a");
-        fs::create_dir_all(&playground).unwrap();
+        let workspace = mount.join("workspaces/project-a/artifact-a/workspace-a");
+        fs::create_dir_all(&workspace).unwrap();
         fs::create_dir(&state).unwrap();
-        fs::write(playground.join("first.bin"), b"same payload").unwrap();
-        fs::write(playground.join("second.bin"), b"same payload").unwrap();
+        fs::write(workspace.join("first.bin"), b"same payload").unwrap();
+        fs::write(workspace.join("second.bin"), b"same payload").unwrap();
 
         let base = IndexVersion::from_snapshot(0, &[]).unwrap();
         let snapshot = AuthoritativeIndexSnapshot::new(base, Vec::new()).unwrap();
@@ -1475,9 +1475,9 @@ mod tests {
     fn transfer_rejects_a_corrupt_volume_object_before_issuing_receipts() {
         let temporary = TempDir::new().unwrap();
         let mount = temporary.path().join("mount");
-        let playground = mount.join("playgrounds/project-a/artifact-a/playground-a");
-        fs::create_dir_all(&playground).unwrap();
-        fs::write(playground.join("payload.bin"), b"same payload").unwrap();
+        let workspace = mount.join("workspaces/project-a/artifact-a/workspace-a");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("payload.bin"), b"same payload").unwrap();
 
         let base = IndexVersion::from_snapshot(0, &[]).unwrap();
         let snapshot = AuthoritativeIndexSnapshot::new(base, Vec::new()).unwrap();
@@ -1501,9 +1501,9 @@ mod tests {
     fn transfer_rejects_a_deleted_volume_object_before_issuing_receipts() {
         let temporary = TempDir::new().unwrap();
         let mount = temporary.path().join("mount");
-        let playground = mount.join("playgrounds/project-a/artifact-a/playground-a");
-        fs::create_dir_all(&playground).unwrap();
-        fs::write(playground.join("payload.bin"), b"same payload").unwrap();
+        let workspace = mount.join("workspaces/project-a/artifact-a/workspace-a");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("payload.bin"), b"same payload").unwrap();
 
         let base = IndexVersion::from_snapshot(0, &[]).unwrap();
         let snapshot = AuthoritativeIndexSnapshot::new(base, Vec::new()).unwrap();
@@ -1590,7 +1590,7 @@ mod tests {
         materializer.materialize(&assignment).unwrap();
         materializer.materialize(&assignment).unwrap();
 
-        let expected = mount.join("playgrounds/project-a/artifact-a/playground-a");
+        let expected = mount.join("workspaces/project-a/artifact-a/workspace-a");
         assert!(expected.is_dir());
     }
 
@@ -1600,7 +1600,7 @@ mod tests {
         let mount = temporary.path().join("mount");
         fs::create_dir(&mount).unwrap();
         let mut assignment = workspace_assignment(None);
-        assignment.relative_root = LogicalPath::parse("other/playground-a").unwrap();
+        assignment.relative_root = LogicalPath::parse("other/workspace-a").unwrap();
 
         let error = WorkspaceMaterializer::new(&mount)
             .materialize(&assignment)
@@ -1671,7 +1671,7 @@ mod tests {
         assert_eq!(stats.bytes, (first.len() + second.len()) as u64);
         assert_eq!(
             fs::read(
-                mount.join("playgrounds/project-a/artifact-a/playground-a/nested/materialized.txt")
+                mount.join("workspaces/project-a/artifact-a/workspace-a/nested/materialized.txt")
             )
             .unwrap(),
             [first.as_slice(), second.as_slice()].concat()
@@ -1679,7 +1679,7 @@ mod tests {
         materializer.materialize(&assignment).unwrap();
 
         fs::write(
-            mount.join("playgrounds/project-a/artifact-a/playground-a/unexpected"),
+            mount.join("workspaces/project-a/artifact-a/workspace-a/unexpected"),
             b"unexpected",
         )
         .unwrap();
@@ -1724,7 +1724,7 @@ mod tests {
         assert_eq!(error.code(), AgentErrorCode::ObjectTransferFailed);
         assert!(error.message().contains("is missing"));
         assert!(!mount
-            .join("playgrounds/project-a/artifact-a/playground-a")
+            .join("workspaces/project-a/artifact-a/workspace-a")
             .exists());
     }
 
@@ -1753,7 +1753,7 @@ mod tests {
 
         let error = materializer.materialize(&assignment).unwrap_err();
         assert_eq!(error.code(), AgentErrorCode::GenerationMismatch);
-        assert!(!mount.join("playgrounds").exists());
+        assert!(!mount.join("workspaces").exists());
     }
 
     #[cfg(unix)]
@@ -1764,7 +1764,7 @@ mod tests {
         let outside = temporary.path().join("outside");
         fs::create_dir(&mount).unwrap();
         fs::create_dir(&outside).unwrap();
-        std::os::unix::fs::symlink(&outside, mount.join("playgrounds")).unwrap();
+        std::os::unix::fs::symlink(&outside, mount.join("workspaces")).unwrap();
 
         let error = WorkspaceMaterializer::new(&mount)
             .materialize(&workspace_assignment(None))
@@ -1803,6 +1803,13 @@ mod tests {
     fn assignment(index_version: IndexVersion) -> AddAssignment {
         let mut assignment = AddAssignment {
             job_id: neoengram_domain::protocol::JobId::new("job-a").unwrap(),
+            task_fence: TaskExecutionFence::new(
+                TaskId::new("task-job-a").unwrap(),
+                Generation::new(1),
+                "scan_changes",
+                Generation::new(1),
+                Generation::new(1),
+            ),
             assignment_id: AssignmentId::new("assignment-a").unwrap(),
             assignment_generation: AssignmentGeneration::new(1),
             agent_id: AgentId::new("agent-a").unwrap(),
@@ -1814,7 +1821,7 @@ mod tests {
             tenant_id: TenantId::new("tenant-a").unwrap(),
             project_id: ProjectId::new("project-a").unwrap(),
             artifact_id: ArtifactId::new("artifact-a").unwrap(),
-            playground_id: PlaygroundId::new("playground-a").unwrap(),
+            workspace_id: WorkspaceId::new("workspace-a").unwrap(),
             edge_cluster_id: EdgeClusterId::new("cluster-a").unwrap(),
             storage_volume_id: StorageVolumeId::new("volume-a").unwrap(),
             artifact_placement_id: ArtifactPlacementId::new("placement-a").unwrap(),
@@ -1841,9 +1848,16 @@ mod tests {
     ) -> WorkspaceMaterializeAssignment {
         let project_id = ProjectId::new("project-a").unwrap();
         let artifact_id = ArtifactId::new("artifact-a").unwrap();
-        let playground_id = PlaygroundId::new("playground-a").unwrap();
+        let workspace_id = WorkspaceId::new("workspace-a").unwrap();
         let mut assignment = WorkspaceMaterializeAssignment {
             job_id: neoengram_domain::protocol::JobId::new("job-materialize-a").unwrap(),
+            task_fence: TaskExecutionFence::new(
+                TaskId::new("task-job-materialize-a").unwrap(),
+                Generation::new(1),
+                "materialize",
+                Generation::new(1),
+                Generation::new(1),
+            ),
             assignment_id: AssignmentId::new("assignment-materialize-a").unwrap(),
             assignment_generation: AssignmentGeneration::new(1),
             agent_id: AgentId::new("agent-a").unwrap(),
@@ -1855,12 +1869,12 @@ mod tests {
             tenant_id: TenantId::new("tenant-a").unwrap(),
             project_id,
             artifact_id,
-            playground_id,
+            workspace_id,
             storage_volume_id: StorageVolumeId::new("volume-a").unwrap(),
             agent_mount_id: AgentMountId::new("mount-a").unwrap(),
             mount_generation: MountGeneration::new(1),
             owner_generation: OwnerGeneration::new(1),
-            relative_root: LogicalPath::parse("playgrounds/project-a/artifact-a/playground-a")
+            relative_root: LogicalPath::parse("workspaces/project-a/artifact-a/workspace-a")
                 .unwrap(),
             base_commit_id,
             base_index_version: base_commit_id

@@ -3,6 +3,20 @@
 这份指南把一次“读代码、反推产品行为、实现变更、留下证据”的迭代固定成可复用流程。它和
 [`../AGENTS.md`](../AGENTS.md) 配合使用：`AGENTS.md` 规定仓库不变量，这里规定任务记录和产品反推方法。
 
+## 0. 默认低 Token 模式
+
+日常改造默认只读取和修改任务直接涉及的模块，不做无关重构、全仓库重复审计或重复执行同一批检查。
+每次改造完成后只自动运行一次统一全量测试脚本：
+
+```bash
+bash scripts/project-test.sh --no-install all
+```
+
+首次运行、依赖缺失或依赖锁文件变化时，使用 `bash scripts/project-test.sh all` 允许脚本安装锁定依赖。
+脚本非零退出或因平台/依赖不可用时，必须报告失败或“未运行及原因”，不能报告为通过。用户可以自行进行
+手工测试；除非用户明确要求或需要定位失败，不重复运行同一批测试。真实服务、凭据和跨节点 E2E 不由默认
+迭代自动创建或启动。
+
 ## 1. 先写任务卡
 
 开始编码前，在 issue、分支说明或 PR 描述中填完以下字段。没有证据的字段写“未知”，不要用猜测填满。
@@ -67,6 +81,7 @@
 | Central 资源/API | `services/neoengram-central/src/controller`、`service`、`mapper`、`datasource` | HTTP、权限、生命周期、placement、workspace 集成测试 |
 | Agent 数据面 | `services/neoengram-agent/src/agent_core`、`execution`、`session_*` | state_machine、persistent_adapters、central_managed_add；真实 mount 另验 |
 | Gateway 控制链 | `services/neoengram-gateway/src` | `tests/network_e2e.rs`、mTLS/forwarding/双 Replica 相关断言 |
+| 本地多 Gateway 开发编排 | `scripts/dev-stack.sh` | `bash -n`、dry-run、隔离 loopback Central/Gateway/Agent 烟测；不代表生产 HA |
 | Web 控制台 | `apps/neoengram-web/src` | API、feature、页面、router、Playwright 测试；OpenAPI 生成类型 |
 
 新增或移动能力后，更新三处：本指南的映射、`AGENTS.md` 的源码/测试表、对应专题文档的入口链接。若测试
@@ -86,7 +101,8 @@
 
 ## 5. 实现后验证
 
-先运行与改动直接对应的最小测试，再按风险扩大：
+默认验证入口是上面的统一全量脚本；普通迭代不再额外重复运行下面的分模块命令。只有在统一脚本失败、
+任务范围需要更快定位，或用户明确要求时，才选择与改动直接对应的额外检查：
 
 ```bash
 # 领域/本地 runtime/CLI

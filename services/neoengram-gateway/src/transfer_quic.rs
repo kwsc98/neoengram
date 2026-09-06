@@ -21,11 +21,17 @@ use neoengram_domain::protocol::{
     TransferFrameError, TransferTicket, MATERIALIZATION_TRANSFER_ALPN_V2, MAX_TRANSFER_FRAME_BYTES,
 };
 use quinn::{Connection, Endpoint, Incoming, RecvStream, SendStream};
+use rustls_pki_types::CertificateDer;
 use tokio::{
     sync::{watch, Semaphore},
     task::JoinSet,
 };
 use tracing::{info, warn};
+use url::Url;
+use x509_parser::{
+    extensions::GeneralName,
+    prelude::{FromDer, X509Certificate},
+};
 
 const TRANSFER_FRAME_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const TRANSFER_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
@@ -60,6 +66,8 @@ pub(crate) enum QuicTransferError {
     LegacyProtocolDisabled,
     #[error("transfer connection did not provide a peer certificate")]
     MissingPeerIdentity,
+    #[error("transfer peer certificate identity is invalid")]
+    InvalidPeerIdentity,
     #[error("transfer ticket is fenced: {0}")]
     Fenced(&'static str),
     #[error("QUIC TLS configuration is invalid: {0}")]
@@ -101,6 +109,10 @@ pub(crate) struct QuicTransferFence {
     role: TransferRelayRole,
     gateway_pool_id: GatewayPoolId,
     edge_cluster_id: EdgeClusterId,
+    /// SPIFFE trust domain used by the workload certificate identity fence. The Gateway binary
+    /// always installs it when a QUIC listener is configured (GatewayConfig rejects the missing
+    /// production setting).
+    workload_trust_domain: Option<Arc<str>>,
     state: Arc<RwLock<TransferFenceState>>,
 }
 
@@ -120,8 +132,16 @@ impl QuicTransferFence {
             role,
             gateway_pool_id,
             edge_cluster_id,
+            workload_trust_domain: None,
             state: Arc::new(RwLock::new(TransferFenceState::default())),
         }
+    }
+
+    /// Binds transfer peer certificate validation to the configured SPIFFE trust domain.
+    #[must_use]
+    pub(crate) fn with_workload_trust_domain(mut self, trust_domain: impl Into<Arc<str>>) -> Self {
+        self.workload_trust_domain = Some(trust_domain.into());
+        self
     }
 
     /// Installs the current generations for a route.  Until all three values are installed, the
@@ -969,6 +989,166 @@ pub(crate) async fn open_signed_transfer_with_fence(
     Ok(ticket)
 }
 
+/// The peer on a target Gateway hop is the target Agent.  The peer on a source Gateway hop is
+/// the target Gateway that opened the next hop toward the source.  The signed ticket carries
+/// both identities, so the TLS certificate can be checked before any ticket or manifest frame is
+/// relayed.  A source Gateway cannot require a particular Replica ID here because the target
+/// Gateway pool is independently replicated; its Central route/peer directory fences the exact
+/// Replica after the certificate's pool scope is checked.
+#[derive(Clone, Copy)]
+enum TransferPeerExpectation<'a> {
+    Agent {
+        edge_cluster_id: &'a EdgeClusterId,
+        agent_id: Option<&'a AgentId>,
+    },
+    Gateway {
+        edge_cluster_id: &'a EdgeClusterId,
+        gateway_pool_id: &'a GatewayPoolId,
+    },
+}
+
+impl<'a> TransferPeerExpectation<'a> {
+    fn from_transfer_ticket(role: TransferRelayRole, ticket: &'a TransferTicket) -> Self {
+        match role {
+            TransferRelayRole::Target => Self::Agent {
+                edge_cluster_id: &ticket.target.edge_cluster_id,
+                agent_id: Some(&ticket.target.agent_id),
+            },
+            TransferRelayRole::Source => Self::Gateway {
+                edge_cluster_id: &ticket.target.edge_cluster_id,
+                gateway_pool_id: &ticket.target.gateway_pool_id,
+            },
+        }
+    }
+
+    fn from_materialization_ticket(
+        role: TransferRelayRole,
+        ticket: &'a MaterializationBatchTicket,
+    ) -> Self {
+        match role {
+            TransferRelayRole::Target => Self::Agent {
+                edge_cluster_id: &ticket.target.edge_cluster_id,
+                agent_id: Some(&ticket.target.agent_id),
+            },
+            TransferRelayRole::Source => Self::Gateway {
+                edge_cluster_id: &ticket.target.edge_cluster_id,
+                gateway_pool_id: &ticket.target.gateway_pool_id,
+            },
+        }
+    }
+}
+
+/// Validates the workload identity carried by a QUIC peer certificate. Rustls verifies the
+/// certificate chain and validity window, but intentionally does not interpret application URI
+/// SANs or EKU. The transfer CA is shared by Agents and Gateway Replicas, so CA membership alone
+/// is insufficient: accepting an Agent as a Gateway peer (or an Agent from another route) would
+/// let a valid Central ticket reach the wrong hop.
+fn validate_transfer_peer_certificate(
+    peer_certificates: &[CertificateDer<'static>],
+    fence: &QuicTransferFence,
+    expectation: TransferPeerExpectation<'_>,
+) -> Result<(), QuicTransferError> {
+    let leaf = peer_certificates
+        .first()
+        .ok_or(QuicTransferError::MissingPeerIdentity)?;
+    let (remainder, certificate) = X509Certificate::from_der(leaf.as_ref())
+        .map_err(|_| QuicTransferError::InvalidPeerIdentity)?;
+    if !remainder.is_empty() {
+        return Err(QuicTransferError::InvalidPeerIdentity);
+    }
+
+    let eku = certificate
+        .extended_key_usage()
+        .map_err(|_| QuicTransferError::InvalidPeerIdentity)?
+        .ok_or(QuicTransferError::InvalidPeerIdentity)?;
+    if !eku.value.client_auth {
+        return Err(QuicTransferError::InvalidPeerIdentity);
+    }
+    if matches!(expectation, TransferPeerExpectation::Gateway { .. }) && !eku.value.server_auth {
+        return Err(QuicTransferError::InvalidPeerIdentity);
+    }
+
+    let san = certificate
+        .subject_alternative_name()
+        .map_err(|_| QuicTransferError::InvalidPeerIdentity)?
+        .ok_or(QuicTransferError::InvalidPeerIdentity)?;
+    let uris = san
+        .value
+        .general_names
+        .iter()
+        .filter_map(|name| match name {
+            GeneralName::URI(uri) => Some(*uri),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if uris.len() != 1 {
+        return Err(QuicTransferError::InvalidPeerIdentity);
+    }
+    let value = uris[0];
+    if value.contains(['?', '#', '%']) {
+        return Err(QuicTransferError::InvalidPeerIdentity);
+    }
+    let url = Url::parse(value).map_err(|_| QuicTransferError::InvalidPeerIdentity)?;
+    let trust_domain = fence
+        .workload_trust_domain
+        .as_deref()
+        .ok_or(QuicTransferError::InvalidPeerIdentity)?;
+    if url.scheme() != "spiffe"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.as_str() != value
+        || url.host_str() != Some(trust_domain)
+    {
+        return Err(QuicTransferError::InvalidPeerIdentity);
+    }
+    let segments = url
+        .path_segments()
+        .ok_or(QuicTransferError::InvalidPeerIdentity)?
+        .collect::<Vec<_>>();
+    match expectation {
+        TransferPeerExpectation::Agent {
+            edge_cluster_id,
+            agent_id,
+        } => {
+            if segments.len() != 5
+                || segments[0] != "workloads"
+                || segments[1] != "edge-clusters"
+                || segments[2] != edge_cluster_id.as_str()
+                || segments[3] != "agents"
+            {
+                return Err(QuicTransferError::InvalidPeerIdentity);
+            }
+            let parsed_agent =
+                AgentId::new(segments[4]).map_err(|_| QuicTransferError::InvalidPeerIdentity)?;
+            if agent_id.is_some_and(|expected| expected != &parsed_agent) {
+                return Err(QuicTransferError::InvalidPeerIdentity);
+            }
+        }
+        TransferPeerExpectation::Gateway {
+            edge_cluster_id,
+            gateway_pool_id,
+        } => {
+            if segments.len() != 7
+                || segments[0] != "workloads"
+                || segments[1] != "edge-clusters"
+                || segments[2] != edge_cluster_id.as_str()
+                || segments[3] != "gateway-pools"
+                || segments[4] != gateway_pool_id.as_str()
+                || segments[5] != "gateway-replicas"
+            {
+                return Err(QuicTransferError::InvalidPeerIdentity);
+            }
+            GatewayPoolId::new(segments[4]).map_err(|_| QuicTransferError::InvalidPeerIdentity)?;
+            neoengram_domain::protocol::GatewayReplicaId::new(segments[6])
+                .map_err(|_| QuicTransferError::InvalidPeerIdentity)?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_connection_handshake(
     connection: &Connection,
     ticket: &TransferTicket,
@@ -981,8 +1161,19 @@ fn validate_connection_handshake(
     if handshake.protocol.as_deref() != Some(alpn()) {
         return Err(QuicTransferError::Alpn);
     }
-    if connection.peer_identity().is_none() {
+    let peer_identity = connection.peer_identity();
+    let peer_certificates = peer_identity
+        .as_deref()
+        .and_then(|identity| identity.downcast_ref::<Vec<CertificateDer<'static>>>());
+    if peer_certificates.is_none() {
         return Err(QuicTransferError::MissingPeerIdentity);
+    }
+    if let Some(fence) = fence {
+        validate_transfer_peer_certificate(
+            peer_certificates.expect("peer identity was checked above"),
+            fence,
+            TransferPeerExpectation::from_transfer_ticket(fence.role, ticket),
+        )?;
     }
     if ticket.deadline_unix_ms.get() <= unix_millis_now() {
         return Err(QuicTransferError::Expired);
@@ -997,7 +1188,10 @@ fn validate_connection_handshake(
 /// opening, this probe intentionally has no Central ticket or Agent route generation to fence;
 /// it only proves that the v2 ALPN and mutual TLS policy are usable before the Agent advertises
 /// its dynamic materialization capability. Real object streams still use the ticket fence below.
-fn validate_preflight_handshake(connection: &Connection) -> Result<(), QuicTransferError> {
+fn validate_preflight_handshake(
+    connection: &Connection,
+    fence: Option<&QuicTransferFence>,
+) -> Result<(), QuicTransferError> {
     let handshake = connection
         .handshake_data()
         .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
@@ -1005,8 +1199,22 @@ fn validate_preflight_handshake(connection: &Connection) -> Result<(), QuicTrans
     if handshake.protocol.as_deref() != Some(alpn()) {
         return Err(QuicTransferError::Alpn);
     }
-    if connection.peer_identity().is_none() {
+    let peer_identity = connection.peer_identity();
+    let peer_certificates = peer_identity
+        .as_deref()
+        .and_then(|identity| identity.downcast_ref::<Vec<CertificateDer<'static>>>());
+    if peer_certificates.is_none() {
         return Err(QuicTransferError::MissingPeerIdentity);
+    }
+    if let Some(fence) = fence {
+        validate_transfer_peer_certificate(
+            peer_certificates.expect("peer identity was checked above"),
+            fence,
+            TransferPeerExpectation::Agent {
+                edge_cluster_id: &fence.edge_cluster_id,
+                agent_id: None,
+            },
+        )?;
     }
     Ok(())
 }
@@ -1023,8 +1231,19 @@ fn validate_materialization_handshake(
     if handshake.protocol.as_deref() != Some(alpn()) {
         return Err(QuicTransferError::Alpn);
     }
-    if connection.peer_identity().is_none() {
+    let peer_identity = connection.peer_identity();
+    let peer_certificates = peer_identity
+        .as_deref()
+        .and_then(|identity| identity.downcast_ref::<Vec<CertificateDer<'static>>>());
+    if peer_certificates.is_none() {
         return Err(QuicTransferError::MissingPeerIdentity);
+    }
+    if let Some(fence) = fence {
+        validate_transfer_peer_certificate(
+            peer_certificates.expect("peer identity was checked above"),
+            fence,
+            TransferPeerExpectation::from_materialization_ticket(fence.role, ticket),
+        )?;
     }
     ticket
         .validate()
@@ -1168,7 +1387,7 @@ async fn handle_incoming(
     reject_legacy_transfer(&first_frame, allow_legacy_transfer)?;
     match first_frame {
         TransferFrame::Preflight => {
-            validate_preflight_handshake(&connection)?;
+            validate_preflight_handshake(&connection, fence.as_ref())?;
             send_frame(&mut send, &TransferFrame::PreflightAck).await?;
             // The probe has no long-lived stream. Finishing after the acknowledgement gives the
             // Agent a deterministic response while keeping the Gateway free of transfer state.
@@ -1369,7 +1588,12 @@ mod tests {
 
     #[tokio::test]
     async fn dynamic_routes_fail_closed_for_unknown_agents() {
-        let (_server_tls, client_tls) = transfer_tls();
+        let (ca, ca_key) = transfer_ca();
+        let (_server_tls, client_tls) = transfer_tls(
+            "spiffe://mesh.example.test/workloads/edge-clusters/cluster-source/agents/agent-source",
+            &ca,
+            &ca_key,
+        );
         let directory = TransferUpstreamDirectory::new();
         let known = AgentId::new("agent-known").unwrap();
         let unknown = AgentId::new("agent-unknown").unwrap();
@@ -1408,7 +1632,7 @@ mod tests {
         .unwrap()
     }
 
-    fn transfer_tls() -> (Arc<ServerConfig>, Arc<ClientConfig>) {
+    fn transfer_ca() -> (rcgen::Certificate, KeyPair) {
         let ca_key = KeyPair::generate().unwrap();
         let mut ca_parameters = CertificateParams::default();
         ca_parameters.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -1417,16 +1641,25 @@ mod tests {
             KeyUsagePurpose::CrlSign,
             KeyUsagePurpose::DigitalSignature,
         ];
-        let ca = ca_parameters.self_signed(&ca_key).unwrap();
+        (ca_parameters.self_signed(&ca_key).unwrap(), ca_key)
+    }
 
+    fn transfer_tls(
+        uri: &str,
+        ca: &rcgen::Certificate,
+        ca_key: &KeyPair,
+    ) -> (Arc<ServerConfig>, Arc<ClientConfig>) {
         let workload_key = KeyPair::generate().unwrap();
         let mut workload_parameters = CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+        workload_parameters
+            .subject_alt_names
+            .push(rcgen::SanType::URI(uri.try_into().unwrap()));
         workload_parameters.extended_key_usages = vec![
             ExtendedKeyUsagePurpose::ServerAuth,
             ExtendedKeyUsagePurpose::ClientAuth,
         ];
         let workload = workload_parameters
-            .signed_by(&workload_key, &ca, &ca_key)
+            .signed_by(&workload_key, ca, ca_key)
             .unwrap();
         let chain = vec![workload.der().clone(), ca.der().clone()];
         let key = PrivatePkcs8KeyDer::from(workload_key.serialize_der());
@@ -1460,6 +1693,36 @@ mod tests {
         server.send_tls13_tickets = 0;
         server.max_tls13_tickets = 0;
         (Arc::new(server), Arc::new(client))
+    }
+
+    fn transfer_peer_certificate(uri: &str, client_auth: bool, server_auth: bool) -> Vec<u8> {
+        transfer_peer_certificate_with_uris(&[uri], client_auth, server_auth)
+    }
+
+    fn transfer_peer_certificate_with_uris(
+        uris: &[&str],
+        client_auth: bool,
+        server_auth: bool,
+    ) -> Vec<u8> {
+        use rcgen::SanType;
+
+        let mut parameters = CertificateParams::new(Vec::<String>::new()).unwrap();
+        parameters.subject_alt_names.extend(
+            uris.iter()
+                .map(|uri| SanType::URI((*uri).try_into().unwrap())),
+        );
+        parameters.extended_key_usages = [
+            (client_auth, ExtendedKeyUsagePurpose::ClientAuth),
+            (server_auth, ExtendedKeyUsagePurpose::ServerAuth),
+        ]
+        .into_iter()
+        .filter_map(|(enabled, usage)| enabled.then_some(usage))
+        .collect();
+        parameters
+            .self_signed(&KeyPair::generate().unwrap())
+            .unwrap()
+            .der()
+            .to_vec()
     }
 
     fn source_endpoint(tls: Arc<ServerConfig>) -> Endpoint {
@@ -1501,14 +1764,20 @@ mod tests {
 
     #[tokio::test]
     async fn preflight_acknowledges_mtls_without_an_active_route() {
-        let (server_tls, client_tls) = transfer_tls();
+        let (ca, ca_key) = transfer_ca();
+        let (server_tls, client_tls) = transfer_tls(
+            "spiffe://mesh.example.test/workloads/edge-clusters/cluster-target/agents/agent-target",
+            &ca,
+            &ca_key,
+        );
         let listener = QuicTransferListener::bind(
             "127.0.0.1:0".parse().unwrap(),
             server_tls,
             QuicTransferFence::new(
                 GatewayPoolId::new("gateway-target").unwrap(),
                 EdgeClusterId::new("cluster-target").unwrap(),
-            ),
+            )
+            .with_workload_trust_domain("mesh.example.test"),
         )
         .unwrap();
         let address = listener.local_addr().unwrap();
@@ -1649,10 +1918,119 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn transfer_peer_identity_requires_exact_spiffe_scope_and_eku() {
+        let ticket = ticket();
+        let fence = QuicTransferFence::for_role(
+            TransferRelayRole::Target,
+            ticket.target.gateway_pool_id.clone(),
+            ticket.target.edge_cluster_id.clone(),
+        )
+        .with_workload_trust_domain("mesh.example.test");
+        let expectation = TransferPeerExpectation::Agent {
+            edge_cluster_id: &ticket.target.edge_cluster_id,
+            agent_id: Some(&ticket.target.agent_id),
+        };
+        let valid_uri =
+            "spiffe://mesh.example.test/workloads/edge-clusters/cluster-target/agents/agent-target";
+        let valid = CertificateDer::from(transfer_peer_certificate(valid_uri, true, false));
+        assert!(validate_transfer_peer_certificate(&[valid], &fence, expectation).is_ok());
+
+        let wrong_agent_uri =
+            "spiffe://mesh.example.test/workloads/edge-clusters/cluster-target/agents/agent-other";
+        let wrong_agent =
+            CertificateDer::from(transfer_peer_certificate(wrong_agent_uri, true, false));
+        assert!(matches!(
+            validate_transfer_peer_certificate(&[wrong_agent], &fence, expectation),
+            Err(QuicTransferError::InvalidPeerIdentity)
+        ));
+
+        let wrong_cluster_uri =
+            "spiffe://mesh.example.test/workloads/edge-clusters/cluster-other/agents/agent-target";
+        let wrong_cluster =
+            CertificateDer::from(transfer_peer_certificate(wrong_cluster_uri, true, false));
+        assert!(matches!(
+            validate_transfer_peer_certificate(&[wrong_cluster], &fence, expectation),
+            Err(QuicTransferError::InvalidPeerIdentity)
+        ));
+
+        let missing_client_auth =
+            CertificateDer::from(transfer_peer_certificate(valid_uri, false, true));
+        assert!(matches!(
+            validate_transfer_peer_certificate(&[missing_client_auth], &fence, expectation),
+            Err(QuicTransferError::InvalidPeerIdentity)
+        ));
+    }
+
+    #[test]
+    fn transfer_gateway_identity_requires_pool_scope_server_auth_and_one_uri() {
+        let ticket = ticket();
+        let fence = QuicTransferFence::for_role(
+            TransferRelayRole::Source,
+            ticket.source.gateway_pool_id.clone(),
+            ticket.source.edge_cluster_id.clone(),
+        )
+        .with_workload_trust_domain("mesh.example.test");
+        let expectation = TransferPeerExpectation::Gateway {
+            edge_cluster_id: &ticket.target.edge_cluster_id,
+            gateway_pool_id: &ticket.target.gateway_pool_id,
+        };
+        let valid_uri = "spiffe://mesh.example.test/workloads/edge-clusters/cluster-target/gateway-pools/gateway-target/gateway-replicas/target-replica";
+        let valid = CertificateDer::from(transfer_peer_certificate(valid_uri, true, true));
+        assert!(validate_transfer_peer_certificate(&[valid], &fence, expectation).is_ok());
+
+        let wrong_pool_uri = "spiffe://mesh.example.test/workloads/edge-clusters/cluster-target/gateway-pools/gateway-other/gateway-replicas/target-replica";
+        let wrong_pool =
+            CertificateDer::from(transfer_peer_certificate(wrong_pool_uri, true, true));
+        assert!(matches!(
+            validate_transfer_peer_certificate(&[wrong_pool], &fence, expectation),
+            Err(QuicTransferError::InvalidPeerIdentity)
+        ));
+
+        let missing_server_auth =
+            CertificateDer::from(transfer_peer_certificate(valid_uri, true, false));
+        assert!(matches!(
+            validate_transfer_peer_certificate(&[missing_server_auth], &fence, expectation),
+            Err(QuicTransferError::InvalidPeerIdentity)
+        ));
+
+        let additional_uri =
+            "spiffe://mesh.example.test/workloads/edge-clusters/cluster-target/agents/agent-target";
+        let multiple_uris = CertificateDer::from(transfer_peer_certificate_with_uris(
+            &[valid_uri, additional_uri],
+            true,
+            true,
+        ));
+        assert!(matches!(
+            validate_transfer_peer_certificate(&[multiple_uris], &fence, expectation),
+            Err(QuicTransferError::InvalidPeerIdentity)
+        ));
+    }
+
     #[tokio::test]
     async fn configured_relays_carry_frames_through_both_gateways_without_storage() {
-        let (server_tls, client_tls) = transfer_tls();
-        let source_agent = source_endpoint(server_tls.clone());
+        let (ca, ca_key) = transfer_ca();
+        let (source_agent_tls, _source_agent_client_tls) = transfer_tls(
+            "spiffe://mesh.example.test/workloads/edge-clusters/cluster-source/agents/agent-source",
+            &ca,
+            &ca_key,
+        );
+        let (source_gateway_tls, source_gateway_client_tls) = transfer_tls(
+            "spiffe://mesh.example.test/workloads/edge-clusters/cluster-source/gateway-pools/gateway-source/gateway-replicas/source-replica",
+            &ca,
+            &ca_key,
+        );
+        let (target_gateway_tls, target_gateway_client_tls) = transfer_tls(
+            "spiffe://mesh.example.test/workloads/edge-clusters/cluster-target/gateway-pools/gateway-target/gateway-replicas/target-replica",
+            &ca,
+            &ca_key,
+        );
+        let (_target_agent_tls, target_agent_client_tls) = transfer_tls(
+            "spiffe://mesh.example.test/workloads/edge-clusters/cluster-target/agents/agent-target",
+            &ca,
+            &ca_key,
+        );
+        let source_agent = source_endpoint(source_agent_tls);
         let source_agent_address = source_agent.local_addr().unwrap();
 
         let signed = signed_ticket();
@@ -1665,13 +2043,13 @@ mod tests {
         let source_connector = QuinnTransferConnectionFactory::bind(
             source_agent_address,
             Arc::<str>::from("localhost"),
-            client_tls.clone(),
+            source_gateway_client_tls,
         )
         .unwrap();
         let source_gateway = QuicTransferListener::bind(
             "127.0.0.1:0".parse().unwrap(),
-            server_tls.clone(),
-            source_fence,
+            source_gateway_tls,
+            source_fence.with_workload_trust_domain("mesh.example.test"),
         )
         .unwrap()
         .with_legacy_transfer_for_tests()
@@ -1689,16 +2067,19 @@ mod tests {
         let target_connector = QuinnTransferConnectionFactory::bind(
             source_gateway_address,
             Arc::<str>::from("localhost"),
-            client_tls.clone(),
+            target_gateway_client_tls,
         )
         .unwrap();
-        let target_gateway =
-            QuicTransferListener::bind("127.0.0.1:0".parse().unwrap(), server_tls, target_fence)
-                .unwrap()
-                .with_legacy_transfer_for_tests()
-                .with_relay(Arc::new(ConnectedTransferRelay::new(Arc::new(
-                    target_connector,
-                ))));
+        let target_gateway = QuicTransferListener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            target_gateway_tls,
+            target_fence.with_workload_trust_domain("mesh.example.test"),
+        )
+        .unwrap()
+        .with_legacy_transfer_for_tests()
+        .with_relay(Arc::new(ConnectedTransferRelay::new(Arc::new(
+            target_connector,
+        ))));
         let target_gateway_address = target_gateway.local_addr().unwrap();
 
         let (source_shutdown, source_shutdown_receiver) = watch::channel(false);
@@ -1754,7 +2135,7 @@ mod tests {
         let target_agent = QuinnTransferConnectionFactory::bind(
             target_gateway_address,
             Arc::<str>::from("localhost"),
-            client_tls,
+            target_agent_client_tls,
         )
         .unwrap();
         let connection = target_agent.connect(&signed.ticket).await.unwrap();

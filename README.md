@@ -91,6 +91,27 @@ scripts/                 # 开发和测试脚本
 
 ## 开发与检查
 
+AI/自动化迭代的低 Token 约定见 [`docs/iteration-guide.md`](docs/iteration-guide.md)，统一项目测试脚本的
+调用、依赖和报告语义见 [`tests/project/README.md`](tests/project/README.md)。
+
+需要本地同时启动 Central 和多个 Gateway 时，可使用一键开发脚本；例如启动 3 个 Gateway，并让三个
+独立 Agent 分别管理三个本地 Volume 目录：
+
+```bash
+bash scripts/dev-stack.sh --gateways 3 \
+  --disk "$PWD/dev/volume-1" --disk "$PWD/dev/volume-2" --disk "$PWD/dev/volume-3" \
+  --auto-approve
+bash scripts/dev-stack.sh status
+bash scripts/dev-stack.sh stop
+```
+
+脚本只绑定 loopback，每个 `--disk` 目录由一个独立 Agent/Volume 管理，Gateway 不挂载或保存业务磁盘。
+`--disk-gateway` 和 `--volume-id` 可按出现顺序重复；省略时目录按 Gateway 轮询，Volume ID 自动生成。
+Agent 默认保持 `pending_approval`；本地演示可增加 `--auto-approve`。这是开发编排器，不代表生产 TLS、HA、PVC fencing
+或跨节点 E2E。停止后使用相同 `--data-dir` 再次 `start` 会恢复已保存的网关/端口/磁盘拓扑；自定义
+Central token 需要再次通过 `--central-token` 传入。源码变更后可用 `--rebuild` 强制刷新本地二进制。
+完整参数见 `bash scripts/dev-stack.sh --help`。
+
 ```bash
 cargo fmt --all -- --check
 bash .github/check-architecture.sh

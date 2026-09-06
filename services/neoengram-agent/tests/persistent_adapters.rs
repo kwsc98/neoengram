@@ -8,10 +8,10 @@ use neoengram_agent::{
 use neoengram_domain::core::ContentDigest;
 use neoengram_domain::protocol::{
     AddAssignment, AgentId, AgentMountId, ArtifactId, ArtifactPlacementId, AssignmentGeneration,
-    AssignmentId, CommitDataLayout, EdgeClusterId, Extensions, IndexRevision, JobId,
-    MountGeneration, OwnerGeneration, PlacementGeneration, PlaygroundId, PrincipalId,
-    PrincipalKind, PrincipalRef, ProjectId, StorageVolumeId, TenantId, UnixMillis,
-    WireIndexVersion,
+    AssignmentId, CommitDataLayout, EdgeClusterId, Extensions, Generation, IndexRevision, JobId,
+    MountGeneration, OwnerGeneration, PlacementGeneration, PrincipalId, PrincipalKind,
+    PrincipalRef, ProjectId, StorageVolumeId, TaskExecutionFence, TaskId, TenantId, UnixMillis,
+    WireIndexVersion, WorkspaceId,
 };
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -487,6 +487,13 @@ fn certificate(
 fn assignment(seed: u8) -> AddAssignment {
     let mut assignment = AddAssignment {
         job_id: JobId::new(format!("job-{seed}")).unwrap(),
+        task_fence: TaskExecutionFence::new(
+            TaskId::new(format!("task-{seed}")).unwrap(),
+            Generation::new(1),
+            "scan_changes",
+            Generation::new(1),
+            Generation::new(1),
+        ),
         assignment_id: AssignmentId::new(format!("assignment-{seed}")).unwrap(),
         assignment_generation: AssignmentGeneration::new(1),
         agent_id: AgentId::new("agent-a").unwrap(),
@@ -498,7 +505,7 @@ fn assignment(seed: u8) -> AddAssignment {
         tenant_id: TenantId::new("tenant-a").unwrap(),
         project_id: ProjectId::new("project-a").unwrap(),
         artifact_id: ArtifactId::new("artifact-a").unwrap(),
-        playground_id: PlaygroundId::new("playground-a").unwrap(),
+        workspace_id: WorkspaceId::new("workspace-a").unwrap(),
         edge_cluster_id: EdgeClusterId::new("cluster-a").unwrap(),
         storage_volume_id: StorageVolumeId::new("volume-a").unwrap(),
         artifact_placement_id: ArtifactPlacementId::new("placement-a").unwrap(),

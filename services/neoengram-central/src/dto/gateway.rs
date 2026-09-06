@@ -73,7 +73,8 @@ pub struct DrainGatewayPoolRequest {
 pub struct GatewayPoolResponse {
     pub gateway_pool: GatewayPoolView,
     #[sensitive(kind = "public")]
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }
@@ -161,7 +162,8 @@ pub struct CreateGatewayReplicaResponse {
     pub gateway_replica: GatewayReplicaView,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activation_token: Option<String>,
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }
@@ -171,7 +173,8 @@ pub struct CreateGatewayReplicaResponse {
 pub struct GatewayReplicaResponse {
     pub gateway_replica: GatewayReplicaView,
     #[sensitive(kind = "public")]
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }

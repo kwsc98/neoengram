@@ -596,6 +596,13 @@ fn decision_frame(session_generation: SessionGeneration, number: u64) -> Vec<u8>
         central_signature: None,
         message: AgentChannelDownstreamMessage::Decision(JobDecision {
             job_id: JobId::new(format!("job-{number}")).unwrap(),
+            task_fence: neoengram_domain::protocol::TaskExecutionFence::new(
+                neoengram_domain::protocol::TaskId::new(format!("task-{number}")).unwrap(),
+                neoengram_domain::protocol::Generation::new(1),
+                "publish_commit",
+                neoengram_domain::protocol::Generation::new(1),
+                neoengram_domain::protocol::Generation::new(1),
+            ),
             assignment_id: AssignmentId::new(format!("assignment-{number}")).unwrap(),
             assignment_generation: AssignmentGeneration::new(1),
             decision_generation: DecisionGeneration::new(1),

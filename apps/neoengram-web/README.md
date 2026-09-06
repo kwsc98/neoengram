@@ -14,8 +14,8 @@ npm run dev:mock
 
 浏览器访问 Vite 输出的 URL（默认是 `http://127.0.0.1:4173`；该端口被占用时会自动选择下一个可用端口）。Mock mode 按
 [`../../docs/product.md`](../../docs/product.md) 提供多租户切换与
-创建、StorageVolume 登记、无固定放置的 Artifact、单 Volume Playground、单区域 Snapshot、
-Pre-commit、带描述和 Tags 的 Playground Commit、单 parent Commit 图、当前版本与父版本的文件
+创建、StorageVolume 登记、无固定放置的 Artifact、单 Volume Workspace、单区域 Snapshot、
+Pre-commit、带描述和 Tags 的 Workspace Commit、单 parent Commit 图、当前版本与父版本的文件
 及元数据 Diff，以及统一 OperationTask 列表、详情、Attempt、事件、重试和取消；它不能用于生产构建。
 
 真实 API 开发模式使用 `npm run dev`，默认 Bearer token 是 `local-development-token`，需与 Server

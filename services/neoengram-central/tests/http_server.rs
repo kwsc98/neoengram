@@ -8,12 +8,12 @@ use std::{
 use fusen_rs::ServerState;
 use neoengram_central::{
     open_sqlite_authority, ArtifactInitialization, ArtifactRecord, CatalogPvcReference,
-    PlaygroundRecord, PlaygroundState, SqliteAuthorityConfig, StorageAccessMode,
-    StorageBackendType, StorageVolumeRecord, StorageVolumeState, TenantRecord,
+    SqliteAuthorityConfig, StorageAccessMode, StorageBackendType, StorageVolumeRecord,
+    StorageVolumeState, TenantRecord, WorkspaceRecord, WorkspaceState,
 };
 use neoengram_central::{AppState, Config};
 use neoengram_domain::protocol::{
-    ArtifactId, EdgeClusterId, PlaygroundId, ProjectId, StorageVolumeId, TenantId, UnixMillis,
+    ArtifactId, EdgeClusterId, ProjectId, StorageVolumeId, TenantId, UnixMillis, WorkspaceId,
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -230,7 +230,7 @@ async fn seed_job_scope(path: &Path) {
     let tenant_id = TenantId::new("tenant-a").unwrap();
     let project_id = ProjectId::new("project-a").unwrap();
     let artifact_id = ArtifactId::new("artifact-a").unwrap();
-    let playground_id = PlaygroundId::new("playground-a").unwrap();
+    let workspace_id = WorkspaceId::new("workspace-a").unwrap();
     let storage_volume_id = StorageVolumeId::new("volume-a").unwrap();
     let now = UnixMillis::new(1_000);
 
@@ -291,20 +291,20 @@ async fn seed_job_scope(path: &Path) {
         .await
         .unwrap();
     catalog
-        .insert_playground(PlaygroundRecord {
+        .insert_workspace(WorkspaceRecord {
             tenant_id,
             project_id,
             artifact_id,
-            playground_id,
+            workspace_id,
             storage_volume_id,
             region: "cn-shanghai".to_owned(),
-            display_name: "Playground A".to_owned(),
+            display_name: "Workspace A".to_owned(),
             base_commit_id: None,
             head_commit_id: None,
-            state: PlaygroundState::Ready,
+            state: WorkspaceState::Ready,
             resource_version: 1,
             lifecycle: neoengram_domain::protocol::ResourceLifecycle::active(),
-            relative_root: "playgrounds/project-a/artifact-a/playground-a".to_owned(),
+            relative_root: "workspaces/project-a/artifact-a/workspace-a".to_owned(),
             created_at_unix_ms: now,
             updated_at_unix_ms: now,
         })

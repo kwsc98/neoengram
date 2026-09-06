@@ -97,6 +97,16 @@ CREATE TABLE project_catalog_records (
     resource_version TEXT NOT NULL CHECK (
         resource_version <> '' AND resource_version NOT GLOB '*[^0-9]*'
     ),
+    lifecycle_state TEXT NOT NULL DEFAULT 'active' CHECK (
+        lifecycle_state IN ('active', 'pending_delete', 'deleting', 'restoring', 'deleted')
+    ),
+    lifecycle_generation TEXT NOT NULL DEFAULT '1' CHECK (
+        lifecycle_generation <> '' AND lifecycle_generation NOT GLOB '*[^0-9]*'
+    ),
+    active_deletion_id TEXT,
+    delete_requested_at_unix_ms INTEGER CHECK (delete_requested_at_unix_ms >= 0),
+    purge_after_unix_ms INTEGER CHECK (purge_after_unix_ms >= 0),
+    deleted_at_unix_ms INTEGER CHECK (deleted_at_unix_ms >= 0),
     created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
     updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= created_at_unix_ms),
     PRIMARY KEY (tenant_id, project_id),
@@ -210,11 +220,11 @@ CREATE INDEX storage_volume_catalog_filter_keyset
     ON storage_volume_catalog_records (
         tenant_id, region, backend_type, created_at_unix_ms DESC, storage_volume_id ASC
     );
-CREATE TABLE playground_catalog_records (
+CREATE TABLE workspace_catalog_records (
     tenant_id TEXT NOT NULL,
     project_id TEXT NOT NULL,
     artifact_id TEXT NOT NULL,
-    playground_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
     storage_volume_id TEXT NOT NULL,
     region TEXT NOT NULL,
     display_name TEXT NOT NULL,
@@ -243,20 +253,20 @@ CREATE TABLE playground_catalog_records (
     deleted_at_unix_ms INTEGER CHECK (deleted_at_unix_ms >= 0),
     created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
     updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= created_at_unix_ms),
-    PRIMARY KEY (tenant_id, project_id, artifact_id, playground_id),
+    PRIMARY KEY (tenant_id, project_id, artifact_id, workspace_id),
     FOREIGN KEY (tenant_id, project_id, artifact_id)
         REFERENCES artifact_catalog_records(tenant_id, project_id, artifact_id),
     FOREIGN KEY (tenant_id, storage_volume_id)
         REFERENCES storage_volume_catalog_records(tenant_id, storage_volume_id)
 ) STRICT;
-CREATE INDEX playground_catalog_keyset
-    ON playground_catalog_records (
-        tenant_id, created_at_unix_ms DESC, project_id ASC, artifact_id ASC, playground_id ASC
+CREATE INDEX workspace_catalog_keyset
+    ON workspace_catalog_records (
+        tenant_id, created_at_unix_ms DESC, project_id ASC, artifact_id ASC, workspace_id ASC
     );
-CREATE INDEX playground_catalog_filter_keyset
-    ON playground_catalog_records (
+CREATE INDEX workspace_catalog_filter_keyset
+    ON workspace_catalog_records (
         tenant_id, project_id, artifact_id, region, state,
-        created_at_unix_ms DESC, playground_id ASC
+        created_at_unix_ms DESC, workspace_id ASC
     );
 CREATE TABLE snapshot_catalog_records (
     tenant_id TEXT NOT NULL,
@@ -375,7 +385,7 @@ CREATE TABLE s3_access_point_records (
     storage_volume_id TEXT NOT NULL,
     edge_cluster_id TEXT NOT NULL,
     bucket_name TEXT NOT NULL UNIQUE,
-    state TEXT NOT NULL CHECK (state IN ('active', 'disabled')),
+    state TEXT NOT NULL CHECK (state IN ('active', 'disabled', 'deleted')),
     policy_generation INTEGER NOT NULL CHECK (policy_generation > 0),
     created_at_unix_ms INTEGER NOT NULL CHECK (created_at_unix_ms >= 0),
     updated_at_unix_ms INTEGER NOT NULL CHECK (updated_at_unix_ms >= created_at_unix_ms),
@@ -410,7 +420,7 @@ CREATE TABLE s3_mutation_records (
     request_id TEXT NOT NULL,
     operation TEXT NOT NULL CHECK (
         operation IN (
-            'access_point_create', 'access_point_enable', 'access_point_disable',
+            'access_point_create', 'access_point_delete', 'access_point_enable', 'access_point_disable',
             'credential_create', 'credential_revoke'
         )
     ),

@@ -82,7 +82,7 @@ impl JobService {
                         &spec.tenant_id,
                         &spec.project_id,
                         &spec.artifact_id,
-                        &spec.playground_id,
+                        &spec.workspace_id,
                     )
                     .await
                     .map_err(map_central_error)?
@@ -92,7 +92,7 @@ impl JobService {
                         fusen_rs::ErrorCategory::Conflict,
                         "precommit_already_active",
                         "PRECOMMIT_ALREADY_ACTIVE",
-                        "the Playground has an active Pre-commit",
+                        "the Workspace has an active Pre-commit",
                         false,
                     ));
                 }
@@ -201,8 +201,8 @@ fn build_add_job_spec(
         .map_err(|error| invalid_request(format!("project_id: {error}")))?;
     let artifact_id = neoengram_domain::protocol::ArtifactId::new(request.artifact_id)
         .map_err(|error| invalid_request(format!("artifact_id: {error}")))?;
-    let playground_id = neoengram_domain::protocol::PlaygroundId::new(request.playground_id)
-        .map_err(|error| invalid_request(format!("playground_id: {error}")))?;
+    let workspace_id = neoengram_domain::protocol::WorkspaceId::new(request.workspace_id)
+        .map_err(|error| invalid_request(format!("workspace_id: {error}")))?;
     let job_id = neoengram_domain::protocol::JobId::new(request.job_id)
         .map_err(|error| invalid_request(format!("job_id: {error}")))?;
     let revision = parse_canonical_u64(
@@ -235,7 +235,7 @@ fn build_add_job_spec(
         tenant_id: tenant_id.clone(),
         project_id: project_id.clone(),
         artifact_id: artifact_id.clone(),
-        playground_id: playground_id.clone(),
+        workspace_id: workspace_id.clone(),
         expected_index_version: expected_index_version.clone(),
         data_layout: neoengram_domain::protocol::CommitDataLayout::FastCdc,
         deadline_unix_ms,
@@ -252,13 +252,14 @@ fn build_add_job_spec(
         tenant_id,
         project_id,
         artifact_id,
-        playground_id,
+        workspace_id,
         expected_index_version,
         data_layout: neoengram_domain::protocol::CommitDataLayout::FastCdc,
         request_digest,
         deadline_unix_ms,
         paths,
         all: request.all,
+        operation_task_id: None,
         extensions: neoengram_domain::protocol::Extensions::new(),
     })
 }
@@ -281,7 +282,7 @@ fn job_record_to_view(job: &JobRecord) -> JobView {
         tenant_id: job.spec.tenant_id.to_string(),
         project_id: job.spec.project_id.to_string(),
         artifact_id: job.spec.artifact_id.to_string(),
-        playground_id: job.spec.playground_id.to_string(),
+        workspace_id: job.spec.workspace_id.to_string(),
         job_id: job.spec.job_id.to_string(),
         state: job_state(job.state),
         resource_version: job.resource_version.get().to_string(),
@@ -392,7 +393,7 @@ mod tests {
             tenant_id: "tenant-a".into(),
             project_id: "project-a".into(),
             artifact_id: "artifact-a".into(),
-            playground_id: "playground-a".into(),
+            workspace_id: "workspace-a".into(),
             job_id: "job-a".into(),
             expected_index_version: IndexVersionBody {
                 revision: "0".into(),

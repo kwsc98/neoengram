@@ -5,7 +5,7 @@ import { ElMessage } from 'element-plus';
 import { computed, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
-import { createPlayground, queryApiVersion, queryPlaygroundList } from '@/api/operations';
+import { createWorkspace, queryApiVersion, queryWorkspaceList } from '@/api/operations';
 import type { ArtifactView } from '@/api/types';
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
 import ResourceDeletionDialog from '@/components/ResourceDeletionDialog.vue';
@@ -16,17 +16,17 @@ import PageHeading from '@/components/PageHeading.vue';
 import StorageVolumeFilter from '@/components/StorageVolumeFilter.vue';
 import {
   supportsArtifactCommitGraph,
-  supportsPlaygroundMaterialize,
+  supportsWorkspaceMaterialize,
   supportsResourceLifecycle,
 } from '@/features/capabilities';
 import { lifecycleResourceVersion } from '@/features/lifecycle';
 import {
-  playgroundLifecycleLabel,
-  playgroundLifecycleTagType,
-  playgroundListPollInterval,
-  playgroundStorageAvailability,
-  playgroundStorageAvailabilityLabel,
-  playgroundStorageAvailabilityTagType,
+  workspaceLifecycleLabel,
+  workspaceLifecycleTagType,
+  workspaceListPollInterval,
+  workspaceStorageAvailability,
+  workspaceStorageAvailabilityLabel,
+  workspaceStorageAvailabilityTagType,
 } from '@/features/precommit/status';
 import { useTenantsStore } from '@/stores/tenants';
 import { formatTime } from '@/utils/format';
@@ -46,26 +46,26 @@ const createOpen = ref(false);
 const createError = ref('');
 const createForm = reactive({
   artifact: undefined as ArtifactView | undefined,
-  playgroundId: '',
+  workspaceId: '',
   displayName: '',
   baseCommitId: '',
   storageVolumeId: '',
 });
-const createMutation = useMutation({ mutationFn: createPlayground });
+const createMutation = useMutation({ mutationFn: createWorkspace });
 const versionQuery = useQuery({
   queryKey: ['system', 'version'],
   queryFn: queryApiVersion,
   staleTime: Number.POSITIVE_INFINITY,
 });
 const materializeEnabled = computed(() =>
-  supportsPlaygroundMaterialize(versionQuery.data.value?.data.capabilities),
+  supportsWorkspaceMaterialize(versionQuery.data.value?.data.capabilities),
 );
 const artifactCommitGraphEnabled = computed(() =>
   supportsArtifactCommitGraph(versionQuery.data.value?.data.capabilities),
 );
-const canCreatePlayground = computed(
+const canCreateWorkspace = computed(
   () =>
-    (tenants.byId(tenantId.value)?.permissions.includes('playground.create') ?? false) &&
+    (tenants.byId(tenantId.value)?.permissions.includes('workspace.create') ?? false) &&
     materializeEnabled.value,
 );
 const lifecycleEnabled = computed(
@@ -75,9 +75,9 @@ const lifecycleEnabled = computed(
       false),
 );
 
-const playgroundQuery = useQuery({
+const workspaceQuery = useQuery({
   queryKey: computed(() => [
-    'playgrounds',
+    'workspaces',
     tenantId.value,
     projectId.value,
     artifactId.value,
@@ -85,7 +85,7 @@ const playgroundQuery = useQuery({
     cursor.value ?? '',
   ]),
   queryFn: () =>
-    queryPlaygroundList({
+    queryWorkspaceList({
       tenant_id: tenantId.value,
       page_size: 50,
       ...(projectId.value ? { project_id: projectId.value } : {}),
@@ -93,7 +93,7 @@ const playgroundQuery = useQuery({
       ...(search.value ? { query: search.value } : {}),
       ...(cursor.value ? { cursor: cursor.value } : {}),
     }),
-  refetchInterval: (query) => playgroundListPollInterval(query.state.data?.data.items ?? []),
+  refetchInterval: (query) => workspaceListPollInterval(query.state.data?.data.items ?? []),
 });
 
 watch(projectId, (value, previous) => {
@@ -146,7 +146,7 @@ async function applyFilters(): Promise<void> {
 }
 
 function nextPage(): void {
-  const next = playgroundQuery.data.value?.data.next_cursor;
+  const next = workspaceQuery.data.value?.data.next_cursor;
   if (!next) return;
   cursorHistory.value.push(cursor.value ?? '');
   cursor.value = next;
@@ -159,7 +159,7 @@ function previousPage(): void {
 function openCreate(): void {
   Object.assign(createForm, {
     artifact: undefined,
-    playgroundId: '',
+    workspaceId: '',
     displayName: '',
     baseCommitId: '',
     storageVolumeId: '',
@@ -177,11 +177,11 @@ async function submitCreate(): Promise<void> {
     !artifact ||
     artifact.tenant_id !== tenantId.value ||
     (Boolean(artifact.head_commit_id) && !createForm.baseCommitId) ||
-    !resourceId.test(createForm.playgroundId) ||
+    !resourceId.test(createForm.workspaceId) ||
     !createForm.displayName.trim() ||
     !resourceId.test(createForm.storageVolumeId)
   ) {
-    createError.value = '请选择 Artifact，并填写合法的 Playground、名称和 StorageVolume';
+    createError.value = '请选择 Artifact，并填写合法的 Workspace、名称和 StorageVolume';
     return;
   }
 
@@ -191,7 +191,7 @@ async function submitCreate(): Promise<void> {
       tenant_id: tenantId.value,
       project_id: artifact.project_id,
       artifact_id: artifact.artifact_id,
-      playground_id: createForm.playgroundId,
+      workspace_id: createForm.workspaceId,
       display_name: createForm.displayName.trim(),
       storage_volume_id: createForm.storageVolumeId,
       ...(createForm.baseCommitId ? { base_commit_id: createForm.baseCommitId } : {}),
@@ -200,28 +200,24 @@ async function submitCreate(): Promise<void> {
     return;
   }
 
-  await queryClient.invalidateQueries({ queryKey: ['playgrounds', tenantId.value] });
+  await queryClient.invalidateQueries({ queryKey: ['workspaces', tenantId.value] });
   createOpen.value = false;
-  ElMessage.success(result.data.replayed ? '已返回现有 Playground' : 'Playground 已创建');
-  await openPlayground(
-    result.data.playground.project_id,
-    result.data.playground.artifact_id,
-    result.data.playground.playground_id,
+  ElMessage.success(result.data.request_replayed ? '已返回现有 Workspace' : 'Workspace 已创建');
+  await openWorkspace(
+    result.data.workspace.project_id,
+    result.data.workspace.artifact_id,
+    result.data.workspace.workspace_id,
   );
 }
 
-async function openPlayground(
-  project: string,
-  artifact: string,
-  playground: string,
-): Promise<void> {
+async function openWorkspace(project: string, artifact: string, workspace: string): Promise<void> {
   await router.push({
-    name: 'playground-detail',
+    name: 'workspace-detail',
     params: {
       tenantId: tenantId.value,
       projectId: project,
       artifactId: artifact,
-      playgroundId: playground,
+      workspaceId: workspace,
     },
   });
 }
@@ -229,9 +225,9 @@ async function openPlayground(
 
 <template>
   <div class="page">
-    <PageHeading title="工作区" :description="`${tenantId} 内可以产生数据变化的 Playground`">
-      <template v-if="canCreatePlayground" #actions>
-        <el-button type="primary" :icon="Plus" @click="openCreate">创建 Playground</el-button>
+    <PageHeading title="工作区" :description="`${tenantId} 内可以产生数据变化的 Workspace`">
+      <template v-if="canCreateWorkspace" #actions>
+        <el-button type="primary" :icon="Plus" @click="openCreate">创建 Workspace</el-button>
       </template>
     </PageHeading>
     <form class="resource-toolbar resource-toolbar--wide" @submit.prevent="applyFilters">
@@ -247,43 +243,39 @@ async function openPlayground(
         clearable
         placeholder="全部 Artifact"
       />
-      <el-input v-model="searchInput" clearable placeholder="搜索 Playground" />
+      <el-input v-model="searchInput" clearable placeholder="搜索 Workspace" />
       <el-button type="primary" native-type="submit" :icon="Search">查询</el-button>
     </form>
 
     <ApiProblemAlert
-      v-if="playgroundQuery.error.value"
-      :error="playgroundQuery.error.value"
-      :retrying="playgroundQuery.isFetching.value"
-      @retry="playgroundQuery.refetch"
+      v-if="workspaceQuery.error.value"
+      :error="workspaceQuery.error.value"
+      :retrying="workspaceQuery.isFetching.value"
+      @retry="workspaceQuery.refetch"
     />
     <section class="content-section resource-section">
-      <el-skeleton v-if="playgroundQuery.isPending.value" :rows="7" animated />
+      <el-skeleton v-if="workspaceQuery.isPending.value" :rows="7" animated />
       <el-empty
-        v-else-if="!playgroundQuery.data.value?.data.items.length"
-        description="当前筛选下没有 Playground"
+        v-else-if="!workspaceQuery.data.value?.data.items.length"
+        description="当前筛选下没有 Workspace"
         :image-size="78"
       />
       <template v-else>
         <el-table
-          :data="playgroundQuery.data.value?.data.items"
+          :data="workspaceQuery.data.value?.data.items"
           class="resource-table desktop-table"
         >
-          <el-table-column label="Playground" min-width="230">
+          <el-table-column label="Workspace" min-width="230">
             <template #default="scope">
               <button
                 class="resource-link"
                 type="button"
                 @click="
-                  openPlayground(
-                    scope.row.project_id,
-                    scope.row.artifact_id,
-                    scope.row.playground_id,
-                  )
+                  openWorkspace(scope.row.project_id, scope.row.artifact_id, scope.row.workspace_id)
                 "
               >
                 <strong>{{ scope.row.display_name }}</strong
-                ><code>{{ scope.row.playground_id }}</code>
+                ><code>{{ scope.row.workspace_id }}</code>
               </button>
             </template>
           </el-table-column>
@@ -300,16 +292,16 @@ async function openPlayground(
           <el-table-column label="生命周期 / 存储" min-width="210">
             <template #default="scope">
               <div class="state-stack">
-                <el-tag :type="playgroundLifecycleTagType(scope.row.state)" effect="plain">
-                  {{ playgroundLifecycleLabel(scope.row.state) }}
+                <el-tag :type="workspaceLifecycleTagType(scope.row.state)" effect="plain">
+                  {{ workspaceLifecycleLabel(scope.row.state) }}
                 </el-tag>
                 <el-tag
                   :type="
-                    playgroundStorageAvailabilityTagType(playgroundStorageAvailability(scope.row))
+                    workspaceStorageAvailabilityTagType(workspaceStorageAvailability(scope.row))
                   "
                   effect="plain"
                 >
-                  {{ playgroundStorageAvailabilityLabel(playgroundStorageAvailability(scope.row)) }}
+                  {{ workspaceStorageAvailabilityLabel(workspaceStorageAvailability(scope.row)) }}
                 </el-tag>
                 <el-tag v-if="scope.row.active_precommit_id" type="warning" effect="plain">
                   存在活动 Pre-commit
@@ -327,10 +319,10 @@ async function openPlayground(
                   v-if="lifecycleEnabled"
                   :tenant-id="tenantId"
                   :resource="{
-                    type: 'playground',
+                    type: 'workspace',
                     project_id: scope.row.project_id,
                     artifact_id: scope.row.artifact_id,
-                    playground_id: scope.row.playground_id,
+                    workspace_id: scope.row.workspace_id,
                   }"
                   :resource-version="lifecycleResourceVersion(scope.row)"
                   :display-name="scope.row.display_name"
@@ -338,12 +330,12 @@ async function openPlayground(
                 <el-button
                   text
                   :icon="ArrowRight"
-                  title="查看 Playground"
+                  title="查看 Workspace"
                   @click="
-                    openPlayground(
+                    openWorkspace(
                       scope.row.project_id,
                       scope.row.artifact_id,
-                      scope.row.playground_id,
+                      scope.row.workspace_id,
                     )
                   "
                 />
@@ -353,55 +345,41 @@ async function openPlayground(
         </el-table>
         <div class="mobile-resource-list">
           <div
-            v-for="playground in playgroundQuery.data.value?.data.items"
-            :key="`${playground.project_id}/${playground.artifact_id}/${playground.playground_id}`"
+            v-for="workspace in workspaceQuery.data.value?.data.items"
+            :key="`${workspace.project_id}/${workspace.artifact_id}/${workspace.workspace_id}`"
             class="mobile-resource-item"
             role="button"
             tabindex="0"
             @click="
-              openPlayground(
-                playground.project_id,
-                playground.artifact_id,
-                playground.playground_id,
-              )
+              openWorkspace(workspace.project_id, workspace.artifact_id, workspace.workspace_id)
             "
             @keydown.enter="
-              openPlayground(
-                playground.project_id,
-                playground.artifact_id,
-                playground.playground_id,
-              )
+              openWorkspace(workspace.project_id, workspace.artifact_id, workspace.workspace_id)
             "
             @keydown.space.prevent="
-              openPlayground(
-                playground.project_id,
-                playground.artifact_id,
-                playground.playground_id,
-              )
+              openWorkspace(workspace.project_id, workspace.artifact_id, workspace.workspace_id)
             "
           >
             <span
-              ><strong>{{ playground.display_name }}</strong
-              ><code>{{ playground.playground_id }}</code></span
+              ><strong>{{ workspace.display_name }}</strong
+              ><code>{{ workspace.workspace_id }}</code></span
             >
             <span
-              ><small>{{ playground.region }}</small
+              ><small>{{ workspace.region }}</small
               ><el-tag
-                :type="playgroundLifecycleTagType(playground.state)"
+                :type="workspaceLifecycleTagType(workspace.state)"
                 size="small"
                 effect="plain"
-                >{{ playgroundLifecycleLabel(playground.state) }}</el-tag
+                >{{ workspaceLifecycleLabel(workspace.state) }}</el-tag
               ><el-tag
-                :type="
-                  playgroundStorageAvailabilityTagType(playgroundStorageAvailability(playground))
-                "
+                :type="workspaceStorageAvailabilityTagType(workspaceStorageAvailability(workspace))"
                 size="small"
                 effect="plain"
                 >{{
-                  playgroundStorageAvailabilityLabel(playgroundStorageAvailability(playground))
+                  workspaceStorageAvailabilityLabel(workspaceStorageAvailability(workspace))
                 }}</el-tag
               ><el-tag
-                v-if="playground.active_precommit_id"
+                v-if="workspace.active_precommit_id"
                 type="warning"
                 size="small"
                 effect="plain"
@@ -410,28 +388,28 @@ async function openPlayground(
                 v-if="lifecycleEnabled"
                 :tenant-id="tenantId"
                 :resource="{
-                  type: 'playground',
-                  project_id: playground.project_id,
-                  artifact_id: playground.artifact_id,
-                  playground_id: playground.playground_id,
+                  type: 'workspace',
+                  project_id: workspace.project_id,
+                  artifact_id: workspace.artifact_id,
+                  workspace_id: workspace.workspace_id,
                 }"
-                :resource-version="lifecycleResourceVersion(playground)"
-                :display-name="playground.display_name" />
+                :resource-version="lifecycleResourceVersion(workspace)"
+                :display-name="workspace.display_name" />
               ><ArrowRight
             /></span>
           </div>
         </div>
         <PageCursor
           :has-previous="cursorHistory.length > 0"
-          :has-next="Boolean(playgroundQuery.data.value?.data.next_cursor)"
-          :loading="playgroundQuery.isFetching.value"
+          :has-next="Boolean(workspaceQuery.data.value?.data.next_cursor)"
+          :loading="workspaceQuery.isFetching.value"
           @previous="previousPage"
           @next="nextPage"
         />
       </template>
     </section>
 
-    <el-dialog v-model="createOpen" title="创建 Playground" width="min(580px, calc(100vw - 32px))">
+    <el-dialog v-model="createOpen" title="创建 Workspace" width="min(580px, calc(100vw - 32px))">
       <ApiProblemAlert v-if="createMutation.error.value" :error="createMutation.error.value" />
       <el-alert v-if="createError" :title="createError" type="error" :closable="false" />
       <el-form label-position="top" class="dialog-form">
@@ -454,8 +432,8 @@ async function openPlayground(
           />
         </el-form-item>
         <div class="dialog-form-grid">
-          <el-form-item label="Playground ID" required>
-            <el-input v-model="createForm.playgroundId" placeholder="review-august" />
+          <el-form-item label="Workspace ID" required>
+            <el-input v-model="createForm.workspaceId" placeholder="review-august" />
           </el-form-item>
           <el-form-item label="名称" required>
             <el-input v-model="createForm.displayName" placeholder="八月复核" />
@@ -468,7 +446,7 @@ async function openPlayground(
       <template #footer>
         <el-button @click="createOpen = false">取消</el-button>
         <el-button type="primary" :loading="createMutation.isPending.value" @click="submitCreate">
-          创建 Playground
+          创建 Workspace
         </el-button>
       </template>
     </el-dialog>

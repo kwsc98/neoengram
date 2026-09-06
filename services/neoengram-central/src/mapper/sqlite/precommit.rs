@@ -75,7 +75,7 @@ impl PreCommitRepository for SqliteAuthorityStore {
 
     async fn get(&self, key: &PreCommitKey) -> CentralResult<Option<PreCommitRecord>> {
         let row = sqlx::query(
-            "SELECT project_id, artifact_id, playground_id, precommit_request_id, \
+            "SELECT project_id, artifact_id, workspace_id, precommit_request_id, \
              current_job_id, state, attempt, resource_version, payload \
              FROM precommit_records WHERE tenant_id = ? AND precommit_id = ?",
         )
@@ -92,24 +92,24 @@ impl PreCommitRepository for SqliteAuthorityStore {
         tenant_id: &TenantId,
         project_id: &ProjectId,
         artifact_id: &ArtifactId,
-        playground_id: &neoengram_domain::protocol::PlaygroundId,
+        workspace_id: &neoengram_domain::protocol::WorkspaceId,
     ) -> CentralResult<Option<PreCommitRecord>> {
         let rows = sqlx::query(
-            "SELECT precommit_id, project_id, artifact_id, playground_id, precommit_request_id, \
+            "SELECT precommit_id, project_id, artifact_id, workspace_id, precommit_request_id, \
              current_job_id, state, attempt, resource_version, payload FROM precommit_records \
-             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND playground_id = ? \
+             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND workspace_id = ? \
              AND state IN ('running', 'ready', 'abnormal') LIMIT 2",
         )
         .bind(tenant_id.as_str())
         .bind(project_id.as_str())
         .bind(artifact_id.as_str())
-        .bind(playground_id.as_str())
+        .bind(workspace_id.as_str())
         .fetch_all(&self.pool)
         .await
         .map_err(storage_error)?;
         if rows.len() > 1 {
             return Err(storage_corruption(
-                "more than one active Pre-commit exists for a Playground",
+                "more than one active Pre-commit exists for a Workspace",
             ));
         }
         rows.into_iter()
@@ -136,7 +136,7 @@ impl PreCommitRepository for SqliteAuthorityStore {
         }
         let rows = if let Some(after) = after {
             sqlx::query(
-                "SELECT tenant_id, precommit_id, project_id, artifact_id, playground_id, \
+                "SELECT tenant_id, precommit_id, project_id, artifact_id, workspace_id, \
                  precommit_request_id, current_job_id, state, attempt, resource_version, payload \
                  FROM precommit_records WHERE state = 'running' AND \
                  (tenant_id > ? OR (tenant_id = ? AND precommit_id > ?)) \
@@ -151,7 +151,7 @@ impl PreCommitRepository for SqliteAuthorityStore {
             .map_err(storage_error)?
         } else {
             sqlx::query(
-                "SELECT tenant_id, precommit_id, project_id, artifact_id, playground_id, \
+                "SELECT tenant_id, precommit_id, project_id, artifact_id, workspace_id, \
                  precommit_request_id, current_job_id, state, attempt, resource_version, payload \
                  FROM precommit_records WHERE state = 'running' \
                  ORDER BY tenant_id, precommit_id LIMIT ?",
@@ -187,7 +187,7 @@ impl PreCommitRepository for SqliteAuthorityStore {
         }
         let rows = if let Some(after) = after {
             sqlx::query(
-                "SELECT tenant_id, precommit_id, project_id, artifact_id, playground_id, \
+                "SELECT tenant_id, precommit_id, project_id, artifact_id, workspace_id, \
                  precommit_request_id, current_job_id, state, attempt, resource_version, payload \
                  FROM precommit_records WHERE state = 'committed' AND \
                  (tenant_id > ? OR (tenant_id = ? AND precommit_id > ?)) \
@@ -201,7 +201,7 @@ impl PreCommitRepository for SqliteAuthorityStore {
             .map_err(storage_error)?
         } else {
             sqlx::query(
-                "SELECT tenant_id, precommit_id, project_id, artifact_id, playground_id, \
+                "SELECT tenant_id, precommit_id, project_id, artifact_id, workspace_id, \
                  precommit_request_id, current_job_id, state, attempt, resource_version, payload \
                  FROM precommit_records WHERE state = 'committed' \
                  ORDER BY tenant_id, precommit_id",
@@ -366,7 +366,7 @@ impl PreCommitRepository for SqliteAuthorityStore {
     ) -> CentralResult<Option<PreCommitRecord>> {
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         let row = sqlx::query(
-            "SELECT precommit_id, project_id, artifact_id, playground_id, \
+            "SELECT precommit_id, project_id, artifact_id, workspace_id, \
              precommit_request_id, current_job_id, state, attempt, resource_version, payload \
              FROM precommit_records WHERE tenant_id = ? AND current_job_id = ?",
         )
@@ -590,7 +590,7 @@ async fn load_precommit(
     key: &PreCommitKey,
 ) -> CentralResult<Option<PreCommitRecord>> {
     let row = sqlx::query(
-        "SELECT project_id, artifact_id, playground_id, precommit_request_id, current_job_id, \
+        "SELECT project_id, artifact_id, workspace_id, precommit_request_id, current_job_id, \
          state, attempt, resource_version, payload FROM precommit_records \
          WHERE tenant_id = ? AND precommit_id = ?",
     )
@@ -696,7 +696,7 @@ async fn insert_precommit(
     validate_record(record)?;
     sqlx::query(
         "INSERT INTO precommit_records \
-         (tenant_id, precommit_id, precommit_request_id, project_id, artifact_id, playground_id, \
+         (tenant_id, precommit_id, precommit_request_id, project_id, artifact_id, workspace_id, \
           current_job_id, state, attempt, resource_version, payload) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
@@ -705,7 +705,7 @@ async fn insert_precommit(
     .bind(record.precommit_request_id.as_str())
     .bind(record.project_id.as_str())
     .bind(record.artifact_id.as_str())
-    .bind(record.playground_id.as_str())
+    .bind(record.workspace_id.as_str())
     .bind(record.job_id.as_str())
     .bind(precommit_state_name(record.state))
     .bind(i64::from(record.attempt))
@@ -801,13 +801,13 @@ async fn active_precommit_exists(
 ) -> CentralResult<bool> {
     let existing: Option<String> = sqlx::query_scalar(
         "SELECT precommit_id FROM precommit_records WHERE tenant_id = ? AND project_id = ? \
-         AND artifact_id = ? AND playground_id = ? \
+         AND artifact_id = ? AND workspace_id = ? \
          AND state IN ('running', 'ready', 'abnormal') LIMIT 1",
     )
     .bind(candidate.tenant_id.as_str())
     .bind(candidate.project_id.as_str())
     .bind(candidate.artifact_id.as_str())
-    .bind(candidate.playground_id.as_str())
+    .bind(candidate.workspace_id.as_str())
     .fetch_optional(&mut **transaction)
     .await
     .map_err(storage_error)?;
@@ -833,9 +833,9 @@ fn decode_precommit_row(key: &PreCommitKey, row: &SqliteRow) -> CentralResult<Pr
             != row
                 .try_get::<String, _>("artifact_id")
                 .map_err(storage_error)?
-        || record.playground_id.as_str()
+        || record.workspace_id.as_str()
             != row
-                .try_get::<String, _>("playground_id")
+                .try_get::<String, _>("workspace_id")
                 .map_err(storage_error)?
         || record.precommit_request_id.as_str()
             != row

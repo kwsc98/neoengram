@@ -32,15 +32,15 @@ impl IndexPublisher for SqliteAuthorityStore {
         };
         let mut transaction = self.pool.begin().await.map_err(storage_error)?;
         let inserted = sqlx::query(
-            "INSERT INTO playground_indexes \
-             (tenant_id, project_id, artifact_id, playground_id, revision, digest) \
+            "INSERT INTO workspace_indexes \
+             (tenant_id, project_id, artifact_id, workspace_id, revision, digest) \
              VALUES (?, ?, ?, ?, ?, ?) \
-             ON CONFLICT (tenant_id, project_id, artifact_id, playground_id) DO NOTHING",
+             ON CONFLICT (tenant_id, project_id, artifact_id, workspace_id) DO NOTHING",
         )
         .bind(request.index_key.tenant_id.as_str())
         .bind(request.index_key.project_id.as_str())
         .bind(request.index_key.artifact_id.as_str())
-        .bind(request.index_key.playground_id.as_str())
+        .bind(request.index_key.workspace_id.as_str())
         .bind(candidate.version.revision.get().to_string())
         .bind(candidate.version.digest.as_bytes().as_slice())
         .execute(&mut *transaction)
@@ -58,22 +58,22 @@ impl IndexPublisher for SqliteAuthorityStore {
             return Err(invalid(
                 CentralErrorCode::ConcurrentUpdate,
                 format!(
-                    "Index for Playground {} is already initialized with a different snapshot",
-                    request.index_key.playground_id
+                    "Index for Workspace {} is already initialized with a different snapshot",
+                    request.index_key.workspace_id
                 ),
             ));
         }
 
         for record in candidate.records.values() {
             sqlx::query(
-                "INSERT INTO playground_index_records \
-                 (tenant_id, project_id, artifact_id, playground_id, path, manifest_id, \
+                "INSERT INTO workspace_index_records \
+                 (tenant_id, project_id, artifact_id, workspace_id, path, manifest_id, \
                   total_size, chunk_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(request.index_key.tenant_id.as_str())
             .bind(request.index_key.project_id.as_str())
             .bind(request.index_key.artifact_id.as_str())
-            .bind(request.index_key.playground_id.as_str())
+            .bind(request.index_key.workspace_id.as_str())
             .bind(record.path.as_str())
             .bind(record.manifest_id.as_bytes().as_slice())
             .bind(record.total_size.to_string())
@@ -313,42 +313,42 @@ impl IndexPublisher for SqliteAuthorityStore {
             .map_err(storage_error)?;
         }
         sqlx::query(
-            "INSERT INTO playground_indexes \
-             (tenant_id, project_id, artifact_id, playground_id, revision, digest) \
+            "INSERT INTO workspace_indexes \
+             (tenant_id, project_id, artifact_id, workspace_id, revision, digest) \
              VALUES (?, ?, ?, ?, ?, ?) \
-             ON CONFLICT (tenant_id, project_id, artifact_id, playground_id) DO UPDATE SET \
+             ON CONFLICT (tenant_id, project_id, artifact_id, workspace_id) DO UPDATE SET \
              revision = excluded.revision, digest = excluded.digest",
         )
         .bind(request.index_key.tenant_id.as_str())
         .bind(request.index_key.project_id.as_str())
         .bind(request.index_key.artifact_id.as_str())
-        .bind(request.index_key.playground_id.as_str())
+        .bind(request.index_key.workspace_id.as_str())
         .bind(version.revision.get().to_string())
         .bind(version.digest.as_bytes().as_slice())
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;
         sqlx::query(
-            "DELETE FROM playground_index_records \
-             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND playground_id = ?",
+            "DELETE FROM workspace_index_records \
+             WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND workspace_id = ?",
         )
         .bind(request.index_key.tenant_id.as_str())
         .bind(request.index_key.project_id.as_str())
         .bind(request.index_key.artifact_id.as_str())
-        .bind(request.index_key.playground_id.as_str())
+        .bind(request.index_key.workspace_id.as_str())
         .execute(&mut *transaction)
         .await
         .map_err(storage_error)?;
         for record in records.values() {
             sqlx::query(
-                "INSERT INTO playground_index_records \
-                 (tenant_id, project_id, artifact_id, playground_id, path, manifest_id, \
+                "INSERT INTO workspace_index_records \
+                 (tenant_id, project_id, artifact_id, workspace_id, path, manifest_id, \
                   total_size, chunk_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(request.index_key.tenant_id.as_str())
             .bind(request.index_key.project_id.as_str())
             .bind(request.index_key.artifact_id.as_str())
-            .bind(request.index_key.playground_id.as_str())
+            .bind(request.index_key.workspace_id.as_str())
             .bind(record.path.as_str())
             .bind(record.manifest_id.as_bytes().as_slice())
             .bind(record.total_size.to_string())
@@ -412,13 +412,13 @@ async fn load_index(
     key: &IndexKey,
 ) -> CentralResult<IndexSnapshot> {
     let header = sqlx::query(
-        "SELECT revision, digest FROM playground_indexes \
-         WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND playground_id = ?",
+        "SELECT revision, digest FROM workspace_indexes \
+         WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND workspace_id = ?",
     )
     .bind(key.tenant_id.as_str())
     .bind(key.project_id.as_str())
     .bind(key.artifact_id.as_str())
-    .bind(key.playground_id.as_str())
+    .bind(key.workspace_id.as_str())
     .fetch_optional(&mut *connection)
     .await
     .map_err(storage_error)?;
@@ -434,14 +434,14 @@ async fn load_index(
         "Index digest",
     )?;
     let rows = sqlx::query(
-        "SELECT path, manifest_id, total_size, chunk_count FROM playground_index_records \
-         WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND playground_id = ? \
+        "SELECT path, manifest_id, total_size, chunk_count FROM workspace_index_records \
+         WHERE tenant_id = ? AND project_id = ? AND artifact_id = ? AND workspace_id = ? \
          ORDER BY path",
     )
     .bind(key.tenant_id.as_str())
     .bind(key.project_id.as_str())
     .bind(key.artifact_id.as_str())
-    .bind(key.playground_id.as_str())
+    .bind(key.workspace_id.as_str())
     .fetch_all(&mut *connection)
     .await
     .map_err(storage_error)?;

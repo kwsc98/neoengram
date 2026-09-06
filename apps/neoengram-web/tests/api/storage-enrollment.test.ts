@@ -30,12 +30,13 @@ describe('storage enrollment public operations', () => {
   it('creates a replayable one-time token without simulating Agent bootstrap', async () => {
     const request = tokenRequest('token');
     const created = await createStorageEnrollmentToken(request);
-    expect(created.data).toMatchObject({ replayed: false });
+    expect(created.data).toMatchObject({ request_replayed: false });
     expect(created.data.bootstrap_token).toMatch(/^ngenr_v1_/);
 
-    const replayed = await createStorageEnrollmentToken(request);
-    expect(replayed.data).toMatchObject({
-      replayed: true,
+    const request_replayed = await createStorageEnrollmentToken(request);
+    expect(request_replayed.data).toMatchObject({
+      request_replayed: true,
+      execution_reused: false,
       token_id: created.data.token_id,
       bootstrap_token: created.data.bootstrap_token,
     });
@@ -80,7 +81,7 @@ describe('storage enrollment public operations', () => {
     expect(direct.data.storage_volume.state).toBe('unavailable');
 
     const token = await createStorageEnrollmentToken(request);
-    expect(token.data).toMatchObject({ replayed: false });
+    expect(token.data).toMatchObject({ request_replayed: false });
     expect(token.data.bootstrap_token).toMatch(/^ngenr_v1_/);
   });
 
@@ -110,14 +111,15 @@ describe('storage enrollment public operations', () => {
     ).rejects.toMatchObject({ status: 409, code: 'STORAGE_ENROLLMENT_VERSION_CONFLICT' });
     const approved = await approveStorageEnrollment(approval);
     expect(approved.data).toMatchObject({
-      replayed: false,
+      request_replayed: false,
+      execution_reused: false,
       enrollment: { state: 'approved' },
       storage_volume: { state: 'unavailable' },
     });
     expect(
       (await queryStorageVolume('tenant-a', pending.storage_volume_id)).data.storage_volume.state,
     ).toBe('unavailable');
-    expect((await approveStorageEnrollment(approval)).data.replayed).toBe(true);
+    expect((await approveStorageEnrollment(approval)).data.request_replayed).toBe(true);
     await expect(
       approveStorageEnrollment({ ...approval, confirm_replacement: true }),
     ).rejects.toMatchObject({ status: 409 });
@@ -156,7 +158,8 @@ describe('storage enrollment public operations', () => {
       confirm_replacement: false,
     });
     expect(approved.data).toMatchObject({
-      replayed: false,
+      request_replayed: false,
+      execution_reused: false,
       enrollment: { state: 'approved', registration_kind: 'initial' },
       storage_volume: {
         storage_volume_id: 'volume-review-pvc',

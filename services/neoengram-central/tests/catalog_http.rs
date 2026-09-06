@@ -25,8 +25,9 @@ async fn tenant_and_storage_action_apis_are_authoritative_and_redacted() {
     )
     .await;
     assert_eq!(create_tenant.0, StatusCode::OK);
-    assert_eq!(create_tenant.1["replayed"], false);
-    assert_eq!(create_tenant.1["task"]["task_kind"], "catalog.lifecycle");
+    assert_eq!(create_tenant.1["request_replayed"], false);
+    assert_eq!(create_tenant.1["execution_reused"], false);
+    assert_eq!(create_tenant.1["task"]["intent_kind"], "project.create");
     assert_eq!(create_tenant.1["task"]["state"], "succeeded");
     let tenant_task_id = create_tenant.1["task"]["task_id"].clone();
     let replay = post(
@@ -41,7 +42,8 @@ async fn tenant_and_storage_action_apis_are_authoritative_and_redacted() {
     )
     .await;
     assert_eq!(replay.0, StatusCode::OK);
-    assert_eq!(replay.1["replayed"], true);
+    assert_eq!(replay.1["request_replayed"], true);
+    assert_eq!(replay.1["execution_reused"], false);
     assert_eq!(replay.1["task"]["task_id"], tenant_task_id);
 
     let volume = post(
@@ -64,8 +66,11 @@ async fn tenant_and_storage_action_apis_are_authoritative_and_redacted() {
     )
     .await;
     assert_eq!(volume.0, StatusCode::OK);
-    assert_eq!(volume.1["task"]["task_kind"], "storage.lifecycle");
-    assert_eq!(volume.1["task"]["storage_volume_id"], "volume-nfs");
+    assert_eq!(volume.1["task"]["intent_kind"], "storage_volume.create");
+    assert_eq!(
+        volume.1["task"]["primary_resource"]["resource_id"],
+        "volume-nfs"
+    );
     let public = &volume.1["storage_volume"];
     assert_eq!(public["state"], "unavailable");
     assert!(public.get("nfs_reference").is_none());
@@ -96,9 +101,13 @@ async fn tenant_and_storage_action_apis_are_authoritative_and_redacted() {
     .await;
     assert_eq!(artifact.0, StatusCode::OK);
     assert_eq!(artifact.1["artifact"]["initialization"]["mode"], "empty");
-    assert_eq!(artifact.1["replayed"], false);
-    assert_eq!(artifact.1["task"]["task_kind"], "catalog.lifecycle");
-    assert_eq!(artifact.1["task"]["artifact_id"], "artifact-a");
+    assert_eq!(artifact.1["request_replayed"], false);
+    assert_eq!(artifact.1["execution_reused"], false);
+    assert_eq!(artifact.1["task"]["intent_kind"], "artifact.create");
+    assert_eq!(
+        artifact.1["task"]["primary_resource"]["resource_id"],
+        "artifact-a"
+    );
     let artifact_replay = post(
         &client,
         &base,
@@ -113,7 +122,8 @@ async fn tenant_and_storage_action_apis_are_authoritative_and_redacted() {
     )
     .await;
     assert_eq!(artifact_replay.0, StatusCode::OK);
-    assert_eq!(artifact_replay.1["replayed"], true);
+    assert_eq!(artifact_replay.1["request_replayed"], true);
+    assert_eq!(artifact_replay.1["execution_reused"], false);
 
     let artifact_query = post(
         &client,
@@ -161,7 +171,7 @@ async fn tenant_and_storage_action_apis_are_authoritative_and_redacted() {
             "tenant_id": "tenant-a",
             "project_id": "project-a",
             "artifact_id": "artifact-a",
-            "playground_id": "workspace-missing",
+            "workspace_id": "workspace-missing",
             "job_id": "job-missing-scope",
             "expected_index_version": {
                 "revision": "0",
@@ -206,12 +216,12 @@ async fn tenant_and_storage_action_apis_are_authoritative_and_redacted() {
     let missing_artifact = post(
         &client,
         &base,
-        "/api/playground/create",
+        "/api/workspace/create",
         json!({
             "tenant_id": "tenant-a",
             "project_id": "project-a",
             "artifact_id": "artifact-missing",
-            "playground_id": "workspace-missing",
+            "workspace_id": "workspace-missing",
             "storage_volume_id": "volume-nfs",
             "display_name": "Missing Artifact"
         }),
@@ -223,12 +233,12 @@ async fn tenant_and_storage_action_apis_are_authoritative_and_redacted() {
     let malformed_base_commit = post(
         &client,
         &base,
-        "/api/playground/create",
+        "/api/workspace/create",
         json!({
             "tenant_id": "tenant-a",
             "project_id": "project-a",
             "artifact_id": "artifact-a",
-            "playground_id": "workspace-malformed-commit",
+            "workspace_id": "workspace-malformed-commit",
             "storage_volume_id": "volume-nfs",
             "display_name": "Malformed base",
             "base_commit_id": "not-a-commit"
@@ -241,12 +251,12 @@ async fn tenant_and_storage_action_apis_are_authoritative_and_redacted() {
     let missing_base_commit = post(
         &client,
         &base,
-        "/api/playground/create",
+        "/api/workspace/create",
         json!({
             "tenant_id": "tenant-a",
             "project_id": "project-a",
             "artifact_id": "artifact-a",
-            "playground_id": "workspace-mismatch",
+            "workspace_id": "workspace-mismatch",
             "storage_volume_id": "volume-nfs",
             "display_name": "Mismatched base",
             "base_commit_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -256,22 +266,22 @@ async fn tenant_and_storage_action_apis_are_authoritative_and_redacted() {
     assert_eq!(missing_base_commit.0, StatusCode::NOT_FOUND);
     assert_eq!(missing_base_commit.1["code"], "RESOURCE_NOT_FOUND");
 
-    let playground = post(
+    let workspace = post(
         &client,
         &base,
-        "/api/playground/create",
+        "/api/workspace/create",
         json!({
             "tenant_id": "tenant-a",
             "project_id": "project-a",
             "artifact_id": "artifact-a",
-            "playground_id": "workspace-a",
+            "workspace_id": "workspace-a",
             "storage_volume_id": "volume-nfs",
             "display_name": "Workspace"
         }),
     )
     .await;
-    assert_eq!(playground.0, StatusCode::CONFLICT);
-    assert_eq!(playground.1["code"], "STORAGE_VOLUME_NOT_READY");
+    assert_eq!(workspace.0, StatusCode::CONFLICT);
+    assert_eq!(workspace.1["code"], "STORAGE_VOLUME_NOT_READY");
 
     running.handle().shutdown().await.unwrap();
     state.close().await;

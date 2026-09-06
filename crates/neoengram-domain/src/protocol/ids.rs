@@ -90,7 +90,7 @@ resource_id!(ArtifactId, "artifact ID");
 // namespace per Artifact, but the namespace is deliberately carried independently on every v2
 // placement and transfer contract.
 resource_id!(ObjectNamespaceId, "object namespace ID");
-resource_id!(PlaygroundId, "playground ID");
+resource_id!(WorkspaceId, "workspace ID");
 resource_id!(SnapshotId, "snapshot ID");
 resource_id!(EdgeClusterId, "edge cluster ID");
 resource_id!(ComputeNodeId, "compute node ID");
@@ -139,7 +139,6 @@ resource_id!(TransferId, "transfer ID");
 resource_id!(MaterializationId, "materialization ID");
 resource_id!(MaterializationBatchId, "materialization batch ID");
 resource_id!(IntegrityScanId, "integrity scan ID");
-resource_id!(WorkspaceId, "workspace ID");
 // Unified operation/audit identities. These remain opaque resource identifiers so Central can
 // choose an implementation-specific format while every wire boundary applies the same grammar.
 resource_id!(TaskId, "operation task ID");

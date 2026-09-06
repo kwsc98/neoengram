@@ -8,7 +8,7 @@ Run it from the repository root:
 
 ```text
 scripts/project-test.sh bootstrap
-scripts/project-test.sh module <domain|runtime|agent|central|gateway|cli|openapi|web|web-e2e|manifests|quality>
+scripts/project-test.sh module <domain|runtime|agent|central|gateway|dev-stack|cli|openapi|web|web-e2e|manifests|quality|gaps>
 scripts/project-test.sh modules
 scripts/project-test.sh full-flow
 scripts/project-test.sh all
@@ -24,6 +24,25 @@ Options can appear before the command:
 --keep-temp    retain the isolated temporary directory after a successful run
 --verbose      print each step log while it runs
 ```
+
+## Default iteration policy
+
+For routine AI or automation iterations, run the full project suite once after
+the change:
+
+```bash
+bash scripts/project-test.sh --no-install all
+```
+
+Use `bash scripts/project-test.sh all` on the first run, when dependencies are
+missing, or when a lockfile changes so the runner can install its pinned npm
+dependencies. `--no-install` assumes that the existing `node_modules` trees
+are usable; it does not hide missing dependencies. A non-zero exit or an
+unavailable platform/dependency must be reported as a failure or an explicit
+not-run reason, together with the preserved log path. Do not rerun the same
+suite solely for confirmation; rerun a focused check only to diagnose a
+failure or when the user asks for it. Manual testing may be performed by the
+user separately.
 
 ## Prerequisites
 
@@ -83,6 +102,22 @@ supports `PROJECT_TEST_AGENT_SUITE` (`all`, `state_machine`,
 `persistent_adapters`, `central_managed_add`, or `mount-probe`). Domain and the
 other modules have analogous package-specific suite selectors documented in the
 script source.
+
+## Coverage-gap module (`gaps`)
+
+The `gaps` module runs the checks the base modules deliberately do not cover:
+all-features workspace tests, doc tests, schema regeneration determinism,
+crates.io package verification, the `local-gateway` web build mode, runner
+self-test, and a bundled-OpenAPI collision audit. It is registered but **not**
+part of the default `modules`/`all` run yet: the bundle-collision audit
+currently fails on nine known schema name collisions between the agent OpenAPI
+component wrappers and the external schema `$defs` (redocly renames the
+conflicting components to `X-2` in `target/openapi/neoengram-agent-api.json`).
+Run it explicitly with `scripts/project-test.sh module gaps`, and promote it
+into `run_modules` in `scripts/project-test.sh` once the collisions are
+resolved. Focused suites are available through `PROJECT_TEST_GAPS_SUITE`
+(`all`, `all-features`, `doc`, `schema`, `package`, `web-build`, `self-test`,
+or `bundle-audit`).
 
 ## Mount probe boundary
 

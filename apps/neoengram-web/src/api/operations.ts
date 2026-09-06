@@ -6,12 +6,10 @@ import type {
   ApproveStorageEnrollmentResponse,
   CancelPreCommitRequest,
   CancelPreCommitResponse,
-  CommitPlaygroundRequest,
-  CommitPlaygroundResponse,
+  CommitWorkspaceRequest,
+  CommitWorkspaceResponse,
   CreateArtifactRequest,
   CreateArtifactResponse,
-  CreatePlaygroundRequest,
-  CreatePlaygroundResponse,
   CreateProjectRequest,
   CreateProjectResponse,
   CreateSnapshotRequest,
@@ -30,18 +28,18 @@ import type {
   QueryArtifactResponse,
   QueryGatewayPoolListRequest,
   QueryGatewayPoolListResponse,
-  QueryPlaygroundListRequest,
-  QueryPlaygroundListResponse,
-  QueryPlaygroundChangeListRequest,
-  QueryPlaygroundChangeListResponse,
-  QueryPlaygroundDatasetProfileRequest,
-  QueryPlaygroundDatasetProfileResponse,
-  QueryPlaygroundFileListRequest,
-  QueryPlaygroundFileListResponse,
-  QueryPlaygroundFileMetadataRequest,
-  QueryPlaygroundFileMetadataResponse,
+  QueryWorkspaceListRequest,
+  QueryWorkspaceListResponse,
+  QueryWorkspaceChangeListRequest,
+  QueryWorkspaceChangeListResponse,
+  QueryWorkspaceDatasetProfileRequest,
+  QueryWorkspaceDatasetProfileResponse,
+  QueryWorkspaceFileListRequest,
+  QueryWorkspaceFileListResponse,
+  QueryWorkspaceFileMetadataRequest,
+  QueryWorkspaceFileMetadataResponse,
   QueryPreCommitResponse,
-  QueryPlaygroundResponse,
+  QueryWorkspaceResponse,
   QueryProjectListRequest,
   QueryProjectListResponse,
   QuerySnapshotListRequest,
@@ -371,135 +369,135 @@ export async function queryArtifactCommitDiff(
   );
 }
 
-export async function queryPlaygroundList(
-  request: QueryPlaygroundListRequest,
-): Promise<ApiResult<QueryPlaygroundListResponse>> {
+export async function queryWorkspaceList(
+  request: QueryWorkspaceListRequest,
+): Promise<ApiResult<QueryWorkspaceListResponse>> {
   return unwrap(
-    await apiClient.POST('/api/playground/list/query', { body: request, params: versionHeader }),
-  ) as ApiResult<QueryPlaygroundListResponse>;
+    await apiClient.POST('/api/workspace/list/query', { body: request, params: versionHeader }),
+  ) as ApiResult<QueryWorkspaceListResponse>;
 }
 
-export async function queryPlayground(
+export async function queryWorkspace(
   tenantId: string,
   projectId: string,
   artifactId: string,
-  playgroundId: string,
-): Promise<ApiResult<QueryPlaygroundResponse>> {
+  workspaceId: string,
+): Promise<ApiResult<QueryWorkspaceResponse>> {
   return unwrap(
-    await apiClient.POST('/api/playground/query', {
+    await apiClient.POST('/api/workspace/query', {
       body: {
         tenant_id: tenantId,
         project_id: projectId,
         artifact_id: artifactId,
-        playground_id: playgroundId,
+        workspace_id: workspaceId,
       },
       params: versionHeader,
     }),
-  ) as ApiResult<QueryPlaygroundResponse>;
+  ) as ApiResult<QueryWorkspaceResponse>;
 }
 
-export async function createPlayground(
-  request: CreatePlaygroundRequest,
-): Promise<ApiResult<CreatePlaygroundResponse>> {
+export async function createWorkspace(
+  request: CreateWorkspaceRequest,
+): Promise<ApiResult<CreateWorkspaceResponse>> {
   return unwrap(
-    await apiClient.POST('/api/playground/create', { body: request, params: versionHeader }),
-  ) as ApiResult<CreatePlaygroundResponse>;
+    await apiClient.POST('/api/workspace/create', { body: request, params: versionHeader }),
+  ) as ApiResult<CreateWorkspaceResponse>;
 }
 
-export async function startPlaygroundPreCommit(
+export async function startWorkspacePreCommit(
   request: StartPreCommitRequest,
 ): Promise<ApiResult<StartPreCommitResponse>> {
   return unwrap(
-    await apiClient.POST('/api/playground/precommit/start', {
+    await apiClient.POST('/api/workspace/precommit/start', {
       body: request,
       params: versionHeader,
     }),
   );
 }
 
-export async function queryPlaygroundPreCommit(
+export async function queryWorkspacePreCommit(
   tenantId: string,
   precommitId: string,
 ): Promise<ApiResult<QueryPreCommitResponse>> {
   return unwrap(
-    await apiClient.POST('/api/playground/precommit/query', {
+    await apiClient.POST('/api/workspace/precommit/query', {
       body: { tenant_id: tenantId, precommit_id: precommitId },
       params: versionHeader,
     }),
   );
 }
 
-export async function restartPlaygroundPreCommit(
+export async function restartWorkspacePreCommit(
   request: RestartPreCommitRequest,
 ): Promise<ApiResult<RestartPreCommitResponse>> {
   return unwrap(
-    await apiClient.POST('/api/playground/precommit/restart', {
+    await apiClient.POST('/api/workspace/precommit/restart', {
       body: request,
       params: versionHeader,
     }),
   );
 }
 
-export async function cancelPlaygroundPreCommit(
+export async function cancelWorkspacePreCommit(
   request: CancelPreCommitRequest,
 ): Promise<ApiResult<CancelPreCommitResponse>> {
   return unwrap(
-    await apiClient.POST('/api/playground/precommit/cancel', {
+    await apiClient.POST('/api/workspace/precommit/cancel', {
       body: request,
       params: versionHeader,
     }),
   );
 }
 
-export async function commitPlayground(
-  request: CommitPlaygroundRequest,
-): Promise<ApiResult<CommitPlaygroundResponse>> {
+export async function commitWorkspace(
+  request: CommitWorkspaceRequest,
+): Promise<ApiResult<CommitWorkspaceResponse>> {
   return unwrap(
-    await apiClient.POST('/api/playground/commit/create', {
+    await apiClient.POST('/api/workspace/commit/create', {
       body: request,
       params: versionHeader,
     }),
-  ) as ApiResult<CommitPlaygroundResponse>;
+  ) as ApiResult<CommitWorkspaceResponse>;
 }
 
-export async function queryPlaygroundFileList(
-  request: QueryPlaygroundFileListRequest,
-): Promise<ApiResult<QueryPlaygroundFileListResponse>> {
+export async function queryWorkspaceFileList(
+  request: QueryWorkspaceFileListRequest,
+): Promise<ApiResult<QueryWorkspaceFileListResponse>> {
   return unwrap(
-    await apiClient.POST('/api/playground/file/list/query', {
-      body: request,
-      params: versionHeader,
-    }),
-  );
-}
-
-export async function queryPlaygroundChangeList(
-  request: QueryPlaygroundChangeListRequest,
-): Promise<ApiResult<QueryPlaygroundChangeListResponse>> {
-  return unwrap(
-    await apiClient.POST('/api/playground/change/list/query', {
+    await apiClient.POST('/api/workspace/file/list/query', {
       body: request,
       params: versionHeader,
     }),
   );
 }
 
-export async function queryPlaygroundFileMetadata(
-  request: QueryPlaygroundFileMetadataRequest,
-): Promise<ApiResult<QueryPlaygroundFileMetadataResponse>> {
+export async function queryWorkspaceChangeList(
+  request: QueryWorkspaceChangeListRequest,
+): Promise<ApiResult<QueryWorkspaceChangeListResponse>> {
   return unwrap(
-    await apiClient.POST('/api/playground/file/metadata/query', {
+    await apiClient.POST('/api/workspace/change/list/query', {
       body: request,
       params: versionHeader,
     }),
   );
 }
 
-export async function queryPlaygroundDatasetProfile(
-  request: QueryPlaygroundDatasetProfileRequest,
-): Promise<ApiResult<QueryPlaygroundDatasetProfileResponse>> {
+export async function queryWorkspaceFileMetadata(
+  request: QueryWorkspaceFileMetadataRequest,
+): Promise<ApiResult<QueryWorkspaceFileMetadataResponse>> {
   return unwrap(
-    await apiClient.POST('/api/playground/dataset/profile/query', {
+    await apiClient.POST('/api/workspace/file/metadata/query', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function queryWorkspaceDatasetProfile(
+  request: QueryWorkspaceDatasetProfileRequest,
+): Promise<ApiResult<QueryWorkspaceDatasetProfileResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/workspace/dataset/profile/query', {
       body: request,
       params: versionHeader,
     }),
@@ -566,14 +564,6 @@ export async function queryCommitAvailabilityV2(
       body: request,
       params: versionHeader,
     }),
-  );
-}
-
-export async function createWorkspace(
-  request: CreateWorkspaceRequest,
-): Promise<ApiResult<CreateWorkspaceResponse>> {
-  return unwrap(
-    await apiClient.POST('/api/workspace/create', { body: request, params: versionHeader }),
   );
 }
 
@@ -694,6 +684,17 @@ export async function disableS3AccessPoint(
 ): Promise<ApiResult<UpdateS3AccessPointResponse>> {
   return unwrap(
     await apiClient.POST('/api/s3/access-point/disable', {
+      body: request,
+      params: versionHeader,
+    }),
+  );
+}
+
+export async function deleteS3AccessPoint(
+  request: UpdateS3AccessPointRequest,
+): Promise<ApiResult<UpdateS3AccessPointResponse>> {
+  return unwrap(
+    await apiClient.POST('/api/s3/access-point/delete', {
       body: request,
       params: versionHeader,
     }),

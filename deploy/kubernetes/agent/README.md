@@ -57,7 +57,7 @@ or durability barriers.
   is acceptable only for a same-node POC with enforced co-scheduling; it limits nodes, not application writers.
 - The business volume is a filesystem volume. For NFS, validate NFSv4.1/4.2, hard-mount, locking, rename,
   fsync, permissions, stale-handle, and failover behavior before using it for data.
-- The business PVC must have capacity and inode headroom for both Playground files and immutable Chunk data.
+- The business PVC must have capacity and inode headroom for both Workspace files and immutable Chunk data.
   A Commit verifies and atomically publishes Chunks into `/volume/.neoengram/objects`; the state PVC is not a
   payload cache or fallback object store.
 - UID/GID `65532:65532` can traverse and write the prepared business root. The state volume root is owned by

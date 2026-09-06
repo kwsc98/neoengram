@@ -178,7 +178,7 @@ async function restore(deletion: DeletionOperationView): Promise<void> {
     const result = await restoreMutation.mutateAsync(request);
     restoreRequests.delete(deletion.deletion_id);
     await invalidate(deletion.deletion_id);
-    ElMessage.success(result.data.replayed ? '已返回原恢复任务' : '资源恢复已开始');
+    ElMessage.success(result.data.request_replayed ? '已返回原恢复任务' : '资源恢复已开始');
   } catch {
     return;
   }
@@ -198,7 +198,7 @@ async function retry(deletion: DeletionOperationView): Promise<void> {
     const result = await retryMutation.mutateAsync(request);
     retryRequests.delete(deletion.deletion_id);
     await invalidate(deletion.deletion_id);
-    ElMessage.success(result.data.replayed ? '已返回原重试任务' : '删除任务已重新排队');
+    ElMessage.success(result.data.request_replayed ? '已返回原重试任务' : '删除任务已重新排队');
   } catch {
     return;
   }
@@ -229,7 +229,7 @@ async function createHold(): Promise<void> {
   holdForm.reason = '';
   holdForm.expiresAt = undefined;
   await invalidate(deletion.deletion_id);
-  ElMessage.success(result.data.replayed ? '已返回原保留锁' : '保留锁已创建');
+  ElMessage.success(result.data.request_replayed ? '已返回原保留锁' : '保留锁已创建');
 }
 
 async function releaseHold(hold: RetentionHoldView): Promise<void> {
@@ -254,7 +254,7 @@ async function releaseHold(hold: RetentionHoldView): Promise<void> {
   }
   releaseHoldRequests.delete(requestKey);
   await invalidate(deletion.deletion_id);
-  ElMessage.success(result.data.replayed ? '已返回原释放结果' : '保留锁已释放');
+  ElMessage.success(result.data.request_replayed ? '已返回原释放结果' : '保留锁已释放');
 }
 </script>
 

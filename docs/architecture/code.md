@@ -6,14 +6,14 @@ Central 进程入口，Gateway 与 Web 保持独立部署边界。
 当前仍以本地仓库格式 9 工作流为主要产品；`neoengram-central` 同时承载 authority、HTTP API 和 Gateway
 composition，已提供后端无关
 `AuthorityStore` 和默认 SQLite 单节点权威后端。它通过 Fusen 0.9.0 暴露当前 Central descriptor 中的
-system、Tenant、Project、StorageVolume、Enrollment、Artifact/Commit graph/diff、Playground、
+system、Tenant、Project、StorageVolume、Enrollment、Artifact/Commit graph/diff、Workspace、
 Snapshot/SnapshotDelivery、v2 Materialization/Coverage/Availability、OperationTask、S3、lifecycle 和 Gateway Registry action API；旧
 Job/replication/materialization 查询与控制路径已从公开 registry 移除，仅 Snapshot file/activity/
 dataset-profile 三条公开路径保留为 contract-only。Central 不再提供独立 Agent listener。Agent 控制链只通过 Gateway 建立 HTTP/2 全双工 control
 channel；当前 `neoengram-agent` 已改为 Gateway-only 配置，Gateway 控制面、运行时 mTLS、下行命令签名
 和一跳 peer forwarding 已接入。Vue 3 Web
 控制台可通过 MSW 运行多租户资源浏览、
-StorageVolume 登记与放置选择、Artifact/Playground/Snapshot 创建、SnapshotDelivery、Playground Commit 与 Managed
+StorageVolume 登记与放置选择、Artifact/Workspace/Snapshot 创建、SnapshotDelivery、Workspace Commit 与 Managed
 Add/OperationTask 流程，并可查看 Commit 描述、Tags、父 Commit 信息和文件 Diff，但尚未
 覆盖完整真实中心数据面。这不代表 derived Artifact 执行、Snapshot contract-only 查询、PostgreSQL、生产凭据签发/轮换、跨 Volume 数据路由或 HA 已经完成。能力状态和后续路线统一见
 [`../roadmap.md`](../roadmap.md)。

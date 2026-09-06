@@ -24,20 +24,20 @@ const deletion: DeletionOperationView = {
   deletion_id: 'deletion-a',
   tenant_id: 'tenant-a',
   root: {
-    type: 'playground',
+    type: 'workspace',
     project_id: 'project-a',
     artifact_id: 'artifact-a',
-    playground_id: 'review-a',
+    workspace_id: 'review-a',
   },
   state: 'recoverable',
   resource_version: '2',
   targets: [
     {
       resource: {
-        type: 'playground',
+        type: 'workspace',
         project_id: 'project-a',
         artifact_id: 'artifact-a',
-        playground_id: 'review-a',
+        workspace_id: 'review-a',
       },
       resource_version: '4',
       lifecycle_generation: '2',

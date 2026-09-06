@@ -1496,8 +1496,9 @@ mod tests {
         AgentMountId, ArtifactId, AssignmentGeneration, AssignmentId, AssignmentOperation,
         CertificateGeneration, ContentDigest, DecisionGeneration, Ed25519PublicKeySpki,
         Ed25519Signature, JobAssignment, JobDecision, JobState, MountGeneration, OwnerGeneration,
-        PlaygroundId, PrincipalId, PrincipalKind, PrincipalRef, ProjectId, PublishDecision,
-        RequestId, ResourceVersion, StorageVolumeId, TenantId, WorkspaceMaterializeAssignment,
+        PrincipalId, PrincipalKind, PrincipalRef, ProjectId, PublishDecision, RequestId,
+        ResourceVersion, StorageVolumeId, TaskExecutionFence, TaskId, TenantId, WorkspaceId,
+        WorkspaceMaterializeAssignment,
     };
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
@@ -1579,15 +1580,22 @@ mod tests {
     fn test_assignment() -> JobAssignment {
         let project_id = ProjectId::new("project-command-test").unwrap();
         let artifact_id = ArtifactId::new("artifact-command-test").unwrap();
-        let playground_id = PlaygroundId::new("playground-command-test").unwrap();
+        let workspace_id = WorkspaceId::new("workspace-command-test").unwrap();
         let relative_root = WorkspaceMaterializeAssignment::canonical_relative_root(
             &project_id,
             &artifact_id,
-            &playground_id,
+            &workspace_id,
         )
         .unwrap();
         let mut assignment = WorkspaceMaterializeAssignment {
             job_id: neoengram_domain::protocol::JobId::new("job-command-test").unwrap(),
+            task_fence: TaskExecutionFence::new(
+                TaskId::new("task-job-command-test").unwrap(),
+                neoengram_domain::protocol::Generation::new(1),
+                "materialize",
+                neoengram_domain::protocol::Generation::new(1),
+                neoengram_domain::protocol::Generation::new(1),
+            ),
             assignment_id: AssignmentId::new("assignment-command-test").unwrap(),
             assignment_generation: AssignmentGeneration::new(1),
             agent_id: AgentId::new("agent-test").unwrap(),
@@ -1599,7 +1607,7 @@ mod tests {
             tenant_id: TenantId::new("tenant-command-test").unwrap(),
             project_id,
             artifact_id,
-            playground_id,
+            workspace_id,
             storage_volume_id: StorageVolumeId::new("volume-command-test").unwrap(),
             agent_mount_id: AgentMountId::new("mount-command-test").unwrap(),
             mount_generation: MountGeneration::new(1),
@@ -1624,6 +1632,13 @@ mod tests {
     fn test_decision() -> JobDecision {
         JobDecision {
             job_id: neoengram_domain::protocol::JobId::new("job-command-test").unwrap(),
+            task_fence: TaskExecutionFence::new(
+                TaskId::new("task-job-command-test").unwrap(),
+                neoengram_domain::protocol::Generation::new(1),
+                "materialize",
+                neoengram_domain::protocol::Generation::new(1),
+                neoengram_domain::protocol::Generation::new(1),
+            ),
             assignment_id: AssignmentId::new("assignment-command-test").unwrap(),
             assignment_generation: AssignmentGeneration::new(1),
             decision_generation: DecisionGeneration::new(1),
@@ -1984,6 +1999,13 @@ mod tests {
                 )
                 .unwrap(),
                 tenant_id: TenantId::new("tenant-legacy-test").unwrap(),
+                task_fence: TaskExecutionFence::new(
+                    TaskId::new("task-replication-legacy-test").unwrap(),
+                    neoengram_domain::protocol::Generation::new(1),
+                    "transfer",
+                    neoengram_domain::protocol::Generation::new(1),
+                    neoengram_domain::protocol::Generation::new(1),
+                ),
                 attempt: 1,
                 state: neoengram_domain::protocol::ReplicationState::Queued,
                 completed_objects: 0,

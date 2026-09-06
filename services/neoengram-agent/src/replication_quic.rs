@@ -15,19 +15,24 @@ use std::{
 };
 
 use neoengram_domain::protocol::{
-    BatchManifest, BatchManifestPage, CommitObjectSet, MaterializationBatch,
-    MaterializationBatchId, MaterializationBatchTicket, MaterializationId,
-    MaterializationManifestSource, MaterializationObjectPlacement, MaterializationObjectReceipt,
-    MountGeneration, ObjectChunk, ObjectPlacementState, ObjectProof, ObjectReceiptId, ObjectRef,
-    ObjectRequest, ObjectSet, PlacementId, SignedMaterializationBatchTicket, SignedTransferTicket,
-    StorageVolumeId, TransferFrame, TransferFrameError, TransferTicket, UnixMillis,
-    MAX_TRANSFER_CHUNK_BYTES,
+    BatchManifest, BatchManifestPage, CommitObjectSet, EdgeClusterId, GatewayPoolId,
+    GatewayReplicaId, MaterializationBatch, MaterializationBatchId, MaterializationBatchTicket,
+    MaterializationId, MaterializationManifestSource, MaterializationObjectPlacement,
+    MaterializationObjectReceipt, MountGeneration, ObjectChunk, ObjectPlacementState, ObjectProof,
+    ObjectReceiptId, ObjectRef, ObjectRequest, ObjectSet, PlacementId,
+    SignedMaterializationBatchTicket, SignedTransferTicket, StorageVolumeId, TransferFrame,
+    TransferFrameError, TransferTicket, UnixMillis, MAX_TRANSFER_CHUNK_BYTES,
 };
 use neoengram_domain::TenantId;
 use neoengram_domain::{Generation, ObjectId};
 use neoengram_runtime::{ObjectBackend, ObjectRange};
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
-use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{pem::PemObject, CertificateDer};
+use url::Url;
+use x509_parser::{
+    extensions::GeneralName,
+    prelude::{FromDer, X509Certificate},
+};
 
 use crate::{
     CentralCommandTrustBundle, InMemoryPlacementInventory, LocalPlacementInventory,
@@ -219,6 +224,8 @@ pub enum QuicTransferError {
     Io(#[from] io::Error),
     #[error("QUIC TLS configuration failed: {0}")]
     Tls(String),
+    #[error("QUIC peer certificate identity rejected: {0}")]
+    PeerIdentity(String),
     #[error("Gateway QUIC preflight timed out")]
     PreflightTimeout,
 }
@@ -259,6 +266,10 @@ pub struct QuicTransferNetwork {
     endpoint: Arc<Endpoint>,
     gateway_endpoint: Option<SocketAddr>,
     server_name: Arc<str>,
+    /// Trust domain used to bind source-listener peers to Gateway workload identities. This is
+    /// configured through [`Self::with_gateway_workload_trust_domain`] so the existing public
+    /// network config struct remains source-compatible for embedded callers.
+    gateway_workload_trust_domain: Option<Arc<str>>,
 }
 
 impl QuicTransferNetwork {
@@ -346,7 +357,18 @@ impl QuicTransferNetwork {
             endpoint: Arc::new(endpoint),
             gateway_endpoint: config.gateway_endpoint,
             server_name: Arc::from(config.server_name.as_str()),
+            gateway_workload_trust_domain: None,
         })
+    }
+
+    /// Binds the SPIFFE trust domain used by the source listener's Gateway peer fence. The
+    /// runtime supplies the same value used by the HTTPS Gateway verifier. Keeping this as a
+    /// builder avoids adding a required field to [`QuicTransferNetworkConfig`], whose struct
+    /// literal is part of the embedded API.
+    #[must_use]
+    pub fn with_gateway_workload_trust_domain(mut self, trust_domain: impl Into<Arc<str>>) -> Self {
+        self.gateway_workload_trust_domain = Some(trust_domain.into());
+        self
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, QuicTransferError> {
@@ -489,6 +511,7 @@ impl QuicTransferNetwork {
             let local_tenant_id = local_tenant_id.clone();
             let local_agent_id = local_agent_id.clone();
             let local_storage_volume_id = local_storage_volume_id.clone();
+            let gateway_workload_trust_domain = self.gateway_workload_trust_domain.clone();
             let session_fence = session_fence.clone();
             let execution = Arc::clone(&execution);
             let source_resolver = Arc::clone(&source_resolver);
@@ -496,6 +519,14 @@ impl QuicTransferNetwork {
                 let result = async {
                     let connection = incoming.await?;
                     let (send, recv) = connection.accept_bi().await?;
+                    // `peer_identity` is a boxed `dyn Any` and is not `Send`; consume it now and
+                    // retain only the owned certificate chain across the spawned stream future.
+                    let peer_certificates = connection
+                        .peer_identity()
+                        .and_then(|identity| {
+                            identity.downcast::<Vec<CertificateDer<'static>>>().ok()
+                        })
+                        .map(|certificates| *certificates);
                     let current_session = session_fence
                         .get()
                         .map_err(|error| QuicTransferError::Protocol(error.to_string()))?;
@@ -547,6 +578,8 @@ impl QuicTransferNetwork {
                         &trust_bundle,
                         current_unix_millis(),
                         Some(identity),
+                        peer_certificates.as_deref(),
+                        gateway_workload_trust_domain.as_deref(),
                         source_resolver,
                     )
                     .await
@@ -1732,6 +1765,127 @@ async fn serve_quic_materialization_source_stream_with_factory_from_first(
     }
 }
 
+/// Validates the Gateway workload certificate on the Agent source hop. Rustls has already
+/// checked the chain against the configured CA, but the CA is shared by Agents and Gateways and
+/// therefore does not prove workload role or route scope. The signed materialization ticket gives
+/// us the source EdgeCluster and GatewayPool expected for this connection; checking them here
+/// binds the peer identity before any source backend is opened.
+fn validate_gateway_source_peer_certificate(
+    peer_certificates: Option<&[CertificateDer<'static>]>,
+    trust_domain: &str,
+    expected_edge_cluster_id: &EdgeClusterId,
+    expected_gateway_pool_id: &GatewayPoolId,
+) -> Result<(), QuicTransferError> {
+    let certificates = peer_certificates.ok_or_else(|| {
+        QuicTransferError::PeerIdentity("Gateway did not present a workload certificate".to_owned())
+    })?;
+    let leaf = certificates.first().ok_or_else(|| {
+        QuicTransferError::PeerIdentity("Gateway certificate chain is empty".to_owned())
+    })?;
+    let (remainder, certificate) = X509Certificate::from_der(leaf.as_ref()).map_err(|_| {
+        QuicTransferError::PeerIdentity("Gateway workload certificate is invalid DER".to_owned())
+    })?;
+    if !remainder.is_empty() {
+        return Err(QuicTransferError::PeerIdentity(
+            "Gateway workload certificate contains trailing DER data".to_owned(),
+        ));
+    }
+
+    let eku = certificate
+        .extended_key_usage()
+        .map_err(|_| {
+            QuicTransferError::PeerIdentity(
+                "Gateway workload certificate EKU is invalid".to_owned(),
+            )
+        })?
+        .ok_or_else(|| {
+            QuicTransferError::PeerIdentity("Gateway workload certificate has no EKU".to_owned())
+        })?;
+    if !eku.value.client_auth || !eku.value.server_auth {
+        return Err(QuicTransferError::PeerIdentity(
+            "Gateway workload certificate must allow client and server authentication".to_owned(),
+        ));
+    }
+
+    let san = certificate
+        .subject_alternative_name()
+        .map_err(|_| {
+            QuicTransferError::PeerIdentity(
+                "Gateway workload certificate SAN is invalid".to_owned(),
+            )
+        })?
+        .ok_or_else(|| {
+            QuicTransferError::PeerIdentity("Gateway workload certificate has no SAN".to_owned())
+        })?;
+    let uris = san
+        .value
+        .general_names
+        .iter()
+        .filter_map(|name| match name {
+            GeneralName::URI(uri) => Some(*uri),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if uris.len() != 1 {
+        return Err(QuicTransferError::PeerIdentity(
+            "Gateway workload certificate must contain exactly one URI SAN".to_owned(),
+        ));
+    }
+    let uri = uris[0];
+    if uri.contains(['?', '#', '%']) {
+        return Err(QuicTransferError::PeerIdentity(
+            "Gateway workload URI SAN is not canonical".to_owned(),
+        ));
+    }
+    let parsed = Url::parse(uri).map_err(|_| {
+        QuicTransferError::PeerIdentity("Gateway workload URI SAN is invalid".to_owned())
+    })?;
+    if parsed.scheme() != "spiffe"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.as_str() != uri
+        || parsed.host_str() != Some(trust_domain)
+    {
+        return Err(QuicTransferError::PeerIdentity(
+            "Gateway workload URI SAN trust domain is not expected".to_owned(),
+        ));
+    }
+    let segments = parsed
+        .path_segments()
+        .ok_or_else(|| {
+            QuicTransferError::PeerIdentity("Gateway workload URI SAN has no path".to_owned())
+        })?
+        .collect::<Vec<_>>();
+    if segments.len() != 7
+        || segments[0] != "workloads"
+        || segments[1] != "edge-clusters"
+        || segments[2] != expected_edge_cluster_id.as_str()
+        || segments[3] != "gateway-pools"
+        || segments[5] != "gateway-replicas"
+    {
+        return Err(QuicTransferError::PeerIdentity(
+            "Gateway workload URI SAN is outside the source EdgeCluster".to_owned(),
+        ));
+    }
+    let pool_id = GatewayPoolId::new(segments[4]).map_err(|_| {
+        QuicTransferError::PeerIdentity("Gateway workload URI SAN has an invalid pool".to_owned())
+    })?;
+    if pool_id != *expected_gateway_pool_id {
+        return Err(QuicTransferError::PeerIdentity(
+            "Gateway workload URI SAN does not identify the source GatewayPool".to_owned(),
+        ));
+    }
+    GatewayReplicaId::new(segments[6]).map_err(|_| {
+        QuicTransferError::PeerIdentity(
+            "Gateway workload URI SAN has an invalid replica".to_owned(),
+        )
+    })?;
+    Ok(())
+}
+
 /// Dispatches one accepted source stream after inspecting its first bounded frame.  The production
 /// Agent listener is v2-only: legacy whole-Commit frames are rejected even if a peer manages to
 /// negotiate the v2 ALPN, so an old client cannot bypass the protocol boundary by changing only
@@ -1746,6 +1900,8 @@ async fn serve_quic_unified_source_connection<F1, F2>(
     trust_bundle: &CentralCommandTrustBundle,
     now_unix_ms: u64,
     identity: Option<QuicTransferIdentity>,
+    peer_certificates: Option<&[CertificateDer<'static>]>,
+    gateway_workload_trust_domain: Option<&str>,
     source_resolver: Arc<dyn SourcePlacementResolver>,
 ) -> Result<(), QuicTransferError>
 where
@@ -1757,6 +1913,29 @@ where
     let first = read_frame(&mut recv).await?;
     match first {
         frame @ TransferFrame::OpenMaterializationSigned(_) => {
+            // Materialization is a production v2 path and must never fall back to the legacy
+            // identity-free behavior. Rustls authenticates the transport certificate, while this
+            // application fence binds the Gateway workload to the ticket's source scope before
+            // the backend/resolver factories are called.
+            let peer_certificates = peer_certificates.ok_or_else(|| {
+                QuicTransferError::PeerIdentity(
+                    "Gateway did not present a workload certificate".to_owned(),
+                )
+            })?;
+            let trust_domain = gateway_workload_trust_domain.ok_or_else(|| {
+                QuicTransferError::PeerIdentity(
+                    "Gateway workload trust domain is not configured".to_owned(),
+                )
+            })?;
+            let TransferFrame::OpenMaterializationSigned(signed) = &frame else {
+                unreachable!("source frame was matched above")
+            };
+            validate_gateway_source_peer_certificate(
+                Some(peer_certificates),
+                trust_domain,
+                &signed.ticket.source.edge_cluster_id,
+                &signed.ticket.source.gateway_pool_id,
+            )?;
             serve_quic_materialization_source_stream_with_factory_from_first(
                 send,
                 recv,
@@ -2238,6 +2417,9 @@ mod tests {
             operation_task_id: TaskId::new("task-materialization-source-placement").unwrap(),
             task_attempt_id: TaskAttemptId::new("task-materialization-source-placement-attempt-1")
                 .unwrap(),
+            task_attempt: Generation::new(1),
+            stage_key: "transfer".to_owned(),
+            stage_attempt: Generation::new(1),
             materialization_id: MaterializationId::new("materialization-source-placement").unwrap(),
             batch_id: MaterializationBatchId::new("batch-source-placement").unwrap(),
             plan_revision: Generation::new(1),
@@ -2297,6 +2479,108 @@ mod tests {
             state: ObjectPlacementState::Verified,
             failure_domain: "volume:volume-source-v2".to_owned(),
         }
+    }
+
+    fn gateway_peer_certificate(
+        uris: &[&str],
+        client_auth: bool,
+        server_auth: bool,
+    ) -> CertificateDer<'static> {
+        use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, SanType};
+
+        let mut parameters = CertificateParams::new(vec!["gateway.example.test".to_owned()])
+            .expect("valid test DNS SAN");
+        for uri in uris {
+            parameters.subject_alt_names.push(SanType::URI(
+                (*uri).try_into().expect("test URI SAN must be IA5"),
+            ));
+        }
+        parameters.extended_key_usages = [
+            client_auth.then_some(ExtendedKeyUsagePurpose::ClientAuth),
+            server_auth.then_some(ExtendedKeyUsagePurpose::ServerAuth),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let key = KeyPair::generate().expect("test key");
+        CertificateDer::from(
+            parameters
+                .self_signed(&key)
+                .expect("test certificate")
+                .der()
+                .to_vec(),
+        )
+    }
+
+    #[test]
+    fn source_listener_requires_gateway_workload_identity_and_both_ekus() {
+        let edge_cluster_id = EdgeClusterId::new("edge-source").unwrap();
+        let gateway_pool_id = GatewayPoolId::new("pool-source").unwrap();
+        let uri = "spiffe://mesh.example.test/workloads/edge-clusters/edge-source/gateway-pools/pool-source/gateway-replicas/replica-source";
+        let certificate = gateway_peer_certificate(&[uri], true, true);
+        let chain = vec![certificate];
+        validate_gateway_source_peer_certificate(
+            Some(&chain),
+            "mesh.example.test",
+            &edge_cluster_id,
+            &gateway_pool_id,
+        )
+        .unwrap();
+
+        assert!(validate_gateway_source_peer_certificate(
+            None,
+            "mesh.example.test",
+            &edge_cluster_id,
+            &gateway_pool_id,
+        )
+        .is_err());
+
+        for (client_auth, server_auth) in [(false, true), (true, false), (false, false)] {
+            let certificate = gateway_peer_certificate(&[uri], client_auth, server_auth);
+            let chain = vec![certificate];
+            assert!(validate_gateway_source_peer_certificate(
+                Some(&chain),
+                "mesh.example.test",
+                &edge_cluster_id,
+                &gateway_pool_id,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn source_listener_binds_gateway_identity_to_ticket_cluster_and_pool() {
+        let edge_cluster_id = EdgeClusterId::new("edge-source").unwrap();
+        let gateway_pool_id = GatewayPoolId::new("pool-source").unwrap();
+        let valid_uri = "spiffe://mesh.example.test/workloads/edge-clusters/edge-source/gateway-pools/pool-source/gateway-replicas/replica-source";
+        let invalid_uris = [
+            "spiffe://mesh.example.test/workloads/edge-clusters/edge-other/gateway-pools/pool-source/gateway-replicas/replica-source",
+            "spiffe://mesh.example.test/workloads/edge-clusters/edge-source/gateway-pools/pool-other/gateway-replicas/replica-source",
+            "spiffe://other.example.test/workloads/edge-clusters/edge-source/gateway-pools/pool-source/gateway-replicas/replica-source",
+        ];
+        for uri in invalid_uris {
+            let certificate = gateway_peer_certificate(&[uri], true, true);
+            let chain = vec![certificate];
+            assert!(validate_gateway_source_peer_certificate(
+                Some(&chain),
+                "mesh.example.test",
+                &edge_cluster_id,
+                &gateway_pool_id,
+            )
+            .is_err());
+        }
+
+        let second_uri =
+            "spiffe://mesh.example.test/workloads/edge-clusters/edge-source/gateway-pools/pool-source/gateway-replicas/replica-other";
+        let certificate = gateway_peer_certificate(&[valid_uri, second_uri], true, true);
+        let chain = vec![certificate];
+        assert!(validate_gateway_source_peer_certificate(
+            Some(&chain),
+            "mesh.example.test",
+            &edge_cluster_id,
+            &gateway_pool_id,
+        )
+        .is_err());
     }
 
     #[test]

@@ -12,13 +12,14 @@ use neoengram_domain::protocol::{
     DeletionProofId, DeletionProofResult, Envelope, EnvelopeHeader, ErrorCode, Extensions,
     Generation, IndexRevision, JobAssignment, JobDecision, JobFinalized, JobState, LifecycleEvent,
     LifecycleEventId, LifecycleEventKind, MessageId, MountGeneration, ObjectNamespaceId, ObjectSet,
-    ObjectTicketId, PlacementGeneration, PrincipalKind, PublishDecision, ReplicationAssignment,
-    ReplicationObjectState, ReplicationProgressReport, ReplicationState, RequestId,
-    ResourceLifecycleReport, ResourceLifecycleReportState, ResourceVersion, RouteGeneration,
-    SessionGeneration, SignedTransferTicket, SnapshotDeliveryAssignment, SnapshotDeliveryState,
-    TaskActor, TaskIssue, TaskProgressSummary, TaskState, TraceId, TransferEndpoint,
-    TransferTicket, UnixMillis, WireIndexVersion, WorkspaceMaterializeAssignment,
-    AGENT_JOB_ASSIGNMENT_ACTION, AGENT_JOB_DECISION_ACTION, AGENT_LIFECYCLE_ASSIGNMENT_ACTION,
+    ObjectTicketId, PlacementGeneration, PrincipalId, PrincipalKind, PrincipalRef, PublishDecision,
+    ReplicationAssignment, ReplicationObjectState, ReplicationProgressReport, ReplicationState,
+    RequestId, ResourceLifecycleReport, ResourceLifecycleReportState, ResourceVersion,
+    RouteGeneration, SessionGeneration, SignedTransferTicket, SnapshotDeliveryAssignment,
+    SnapshotDeliveryState, StageState, TaskActor, TaskExecutionFence, TaskId, TaskIssue,
+    TaskProgressSummary, TaskState, TenantId, TraceId, TransferEndpoint, TransferTicket,
+    UnixMillis, WireIndexVersion, WorkspaceMaterializeAssignment, AGENT_JOB_ASSIGNMENT_ACTION,
+    AGENT_JOB_DECISION_ACTION, AGENT_LIFECYCLE_ASSIGNMENT_ACTION,
     AGENT_MATERIALIZATION_ASSIGNMENT_ACTION, CURRENT_WIRE_VERSION,
 };
 
@@ -52,6 +53,111 @@ use crate::service::{
 };
 
 const CONTROL_ERROR_MESSAGE_LIMIT: usize = 4096;
+
+/// Derive the stable execution fence used by the legacy Job ledger while all deliveries are
+/// being migrated to the unified OperationTask protocol. The Job records do not yet persist a
+/// separate task identity, so the deterministic Job/Replication identity is used as the root
+/// task key. Every report and decision copies the fence from its persisted assignment.
+fn execution_fence(
+    source_id: &str,
+    attempt: u64,
+    stage_key: &'static str,
+) -> CentralResult<TaskExecutionFence> {
+    Ok(TaskExecutionFence::new(
+        TaskId::new(format!("task-{source_id}"))?,
+        Generation::new(attempt.max(1)),
+        stage_key,
+        Generation::new(1),
+        Generation::new(1),
+    ))
+}
+
+fn operation_task_fence_fallback(
+    operation_task_id: Option<&TaskId>,
+    source_id: &str,
+    attempt: u64,
+    stage_key: &'static str,
+) -> CentralResult<TaskExecutionFence> {
+    let task_id = operation_task_id
+        .cloned()
+        .unwrap_or(TaskId::new(format!("task-{source_id}"))?);
+    Ok(TaskExecutionFence::new(
+        task_id,
+        Generation::new(attempt.max(1)),
+        stage_key,
+        Generation::new(1),
+        Generation::new(1),
+    ))
+}
+
+/// Loads the authoritative root-task and stage generations for a control assignment. The
+/// operation task is the fencing source of truth after a retry; the legacy Job row must never
+/// manufacture a new `attempt` or `stage_attempt` from a hard-coded value. Focused Job-only
+/// compositions may omit the coordinator, in which case the deterministic fallback remains
+/// available for tests that deliberately exercise the pre-task control surface.
+async fn operation_task_fence(
+    coordinator: Option<&TaskCoordinator>,
+    operation_task_id: Option<&TaskId>,
+    tenant_id: &TenantId,
+    source_id: &str,
+    fallback_attempt: u64,
+    stage_key: &'static str,
+) -> CentralResult<TaskExecutionFence> {
+    let Some(operation_task_id) = operation_task_id else {
+        // A Job can still be exercised through the lower-level managed-Add port without a
+        // public operation root (for example while validating the delivery ledger in isolation).
+        // Once a root is attached, the branch below is intentionally strict and reads every
+        // generation from that root.  The deterministic fallback keeps these internal jobs
+        // replay-safe without pretending they are user-visible operation tasks.
+        return operation_task_fence_fallback(None, source_id, fallback_attempt, stage_key);
+    };
+    let Some(coordinator) = coordinator else {
+        return operation_task_fence_fallback(
+            Some(operation_task_id),
+            source_id,
+            fallback_attempt,
+            stage_key,
+        );
+    };
+    let repository = coordinator.repository();
+    let Some(task) = repository.get(tenant_id, operation_task_id).await? else {
+        return Err(invalid(
+            CentralErrorCode::ResourceNotFound,
+            format!(
+                "operation task {operation_task_id} for {source_id} is not present in the authority"
+            ),
+        ));
+    };
+    let stage = task
+        .stages
+        .iter()
+        .find(|stage| stage.stage_key == stage_key)
+        .ok_or_else(|| {
+            invalid(
+                CentralErrorCode::InvalidState,
+                format!(
+                    "operation task {} has no stage {}",
+                    operation_task_id, stage_key
+                ),
+            )
+        })?;
+    Ok(TaskExecutionFence::new(
+        task.task_id,
+        task.attempt,
+        stage.stage_key.clone(),
+        stage.stage_attempt,
+        Generation::new(1),
+    ))
+}
+
+fn task_attempt_generation(value: &neoengram_domain::protocol::TaskAttemptId) -> Generation {
+    value
+        .as_str()
+        .rsplit_once("-attempt-")
+        .and_then(|(_, suffix)| suffix.parse::<u64>().ok())
+        .map(Generation::new)
+        .unwrap_or_else(|| Generation::new(1))
+}
 
 fn task_text(value: &str) -> String {
     const LIMIT: usize = neoengram_domain::protocol::MAX_TASK_TEXT_BYTES;
@@ -446,6 +552,13 @@ async fn validate_replication_report_binding(
     current: &ReplicationRecord,
     report: &ReplicationProgressReport,
 ) -> CentralResult<()> {
+    let expected = execution_fence(current.replication_id.as_str(), current.attempt, "transfer")?;
+    if report.task_fence() != &expected {
+        return Err(invalid(
+            CentralErrorCode::GenerationMismatch,
+            "replication report carries a stale task execution fence",
+        ));
+    }
     match report {
         ReplicationProgressReport::State {
             state,
@@ -703,6 +816,513 @@ impl ControlPlane {
         }
     }
 
+    /// Mirrors the materialization aggregate into the explicit v2 stage DAG. The Job remains the
+    /// source of truth for batches and object receipts; these transitions only expose the coarse
+    /// user-facing milestones on the single `commit.materialize` task.
+    async fn sync_materialization_stages(
+        &self,
+        job: &MaterializationJob,
+        issue: Option<&TaskIssue>,
+    ) -> CentralResult<()> {
+        let Some(coordinator) = &self.task_coordinator else {
+            return Ok(());
+        };
+        let repository = coordinator.repository();
+        let stages = repository
+            .stages(&job.key.tenant_id, &job.operation_task_id)
+            .await?;
+        if stages.is_empty() {
+            return Ok(());
+        }
+
+        // A successful Job has crossed every materialization barrier. Intermediate Job states
+        // deliberately leave downstream stages pending, so a root task cannot complete early.
+        let targets: &[(&str, StageState)] = match job.state {
+            MaterializationJobState::Queued => &[],
+            MaterializationJobState::Planning => &[
+                ("validate", StageState::Succeeded),
+                ("plan", StageState::Running),
+            ],
+            MaterializationJobState::WaitingForSources => &[
+                ("validate", StageState::Succeeded),
+                ("plan", StageState::Succeeded),
+                ("transfer", StageState::Waiting),
+            ],
+            MaterializationJobState::Materializing => &[
+                ("validate", StageState::Succeeded),
+                ("plan", StageState::Succeeded),
+                ("transfer", StageState::Running),
+            ],
+            MaterializationJobState::Verifying => &[
+                ("validate", StageState::Succeeded),
+                ("plan", StageState::Succeeded),
+                ("transfer", StageState::Succeeded),
+                ("verify", StageState::Verifying),
+            ],
+            MaterializationJobState::Complete => &[
+                ("validate", StageState::Succeeded),
+                ("plan", StageState::Succeeded),
+                ("transfer", StageState::Succeeded),
+                ("verify", StageState::Succeeded),
+                ("publish_coverage", StageState::Succeeded),
+                ("finalize", StageState::Succeeded),
+            ],
+            MaterializationJobState::Stalled => &[
+                ("validate", StageState::Succeeded),
+                ("plan", StageState::Succeeded),
+                ("transfer", StageState::Stalled),
+            ],
+            MaterializationJobState::Failed => &[
+                ("validate", StageState::Succeeded),
+                ("plan", StageState::Succeeded),
+                ("transfer", StageState::Failed),
+            ],
+            MaterializationJobState::Cancelled => &[],
+        };
+
+        for (stage_key, target) in targets {
+            let current = repository
+                .stages(&job.key.tenant_id, &job.operation_task_id)
+                .await?
+                .into_iter()
+                .find(|stage| stage.stage_key == *stage_key);
+            let Some(current) = current else {
+                continue;
+            };
+            if current.state.is_success() && *target == StageState::Succeeded {
+                continue;
+            }
+            // A later aggregate observation must never regress a stage that already crossed its
+            // durability barrier. This can happen when a stale Job snapshot reports `stalled`
+            // after the final receipt committed the transfer stage.
+            if current.state.is_success() && *target != StageState::Succeeded {
+                continue;
+            }
+            let stage_issue = if matches!(target, StageState::Stalled | StageState::Failed) {
+                issue.cloned()
+            } else {
+                None
+            };
+
+            // The stage state machine intentionally requires active states before a terminal
+            // success/failure. Drive each transition through the legal path and let the
+            // repository CAS turn a concurrent report into an idempotent retry.
+            if *target == StageState::Succeeded {
+                if current.state == StageState::Pending {
+                    coordinator
+                        .transition_stage(
+                            &job.operation_task_id,
+                            &job.key.tenant_id,
+                            stage_key,
+                            StageState::Ready,
+                            None,
+                        )
+                        .await
+                        .map(|_| ())?;
+                }
+                let current = repository
+                    .stages(&job.key.tenant_id, &job.operation_task_id)
+                    .await?
+                    .into_iter()
+                    .find(|stage| stage.stage_key == *stage_key);
+                if let Some(current) = current {
+                    if !current.state.is_success() && current.state != StageState::Running {
+                        coordinator
+                            .transition_stage(
+                                &job.operation_task_id,
+                                &job.key.tenant_id,
+                                stage_key,
+                                StageState::Running,
+                                None,
+                            )
+                            .await
+                            .map(|_| ())?;
+                    }
+                }
+                let current = repository
+                    .stages(&job.key.tenant_id, &job.operation_task_id)
+                    .await?
+                    .into_iter()
+                    .find(|stage| stage.stage_key == *stage_key);
+                if let Some(current) = current {
+                    if !current.state.is_success() {
+                        coordinator
+                            .transition_stage(
+                                &job.operation_task_id,
+                                &job.key.tenant_id,
+                                stage_key,
+                                StageState::Succeeded,
+                                None,
+                            )
+                            .await
+                            .map(|_| ())?;
+                    }
+                }
+            } else if *target == StageState::Waiting || *target == StageState::Verifying {
+                let mut current = current;
+                if current.state == StageState::Pending {
+                    current = coordinator
+                        .transition_stage(
+                            &job.operation_task_id,
+                            &job.key.tenant_id,
+                            stage_key,
+                            StageState::Ready,
+                            None,
+                        )
+                        .await?;
+                }
+                if current.state == StageState::Ready || current.state == StageState::Stalled {
+                    current = coordinator
+                        .transition_stage(
+                            &job.operation_task_id,
+                            &job.key.tenant_id,
+                            stage_key,
+                            StageState::Running,
+                            None,
+                        )
+                        .await?;
+                }
+                if current.state != *target {
+                    coordinator
+                        .transition_stage(
+                            &job.operation_task_id,
+                            &job.key.tenant_id,
+                            stage_key,
+                            *target,
+                            stage_issue,
+                        )
+                        .await
+                        .map(|_| ())?;
+                }
+            } else if *target == StageState::Running {
+                let mut current = current;
+                if current.state == StageState::Pending {
+                    current = coordinator
+                        .transition_stage(
+                            &job.operation_task_id,
+                            &job.key.tenant_id,
+                            stage_key,
+                            StageState::Ready,
+                            None,
+                        )
+                        .await?;
+                }
+                if current.state != StageState::Running && !current.state.is_success() {
+                    coordinator
+                        .transition_stage(
+                            &job.operation_task_id,
+                            &job.key.tenant_id,
+                            stage_key,
+                            StageState::Running,
+                            None,
+                        )
+                        .await
+                        .map(|_| ())?;
+                }
+            } else if *target == StageState::Stalled || *target == StageState::Failed {
+                let mut current = current;
+                if current.state == StageState::Pending {
+                    current = coordinator
+                        .transition_stage(
+                            &job.operation_task_id,
+                            &job.key.tenant_id,
+                            stage_key,
+                            StageState::Ready,
+                            None,
+                        )
+                        .await?;
+                }
+                if current.state == StageState::Ready {
+                    current = coordinator
+                        .transition_stage(
+                            &job.operation_task_id,
+                            &job.key.tenant_id,
+                            stage_key,
+                            StageState::Running,
+                            None,
+                        )
+                        .await?;
+                }
+                if current.state != *target {
+                    coordinator
+                        .transition_stage(
+                            &job.operation_task_id,
+                            &job.key.tenant_id,
+                            stage_key,
+                            *target,
+                            stage_issue,
+                        )
+                        .await
+                        .map(|_| ())?;
+                }
+            }
+        }
+
+        if job.state == MaterializationJobState::Cancelled {
+            // Cancellation is a convergence point. Mark every still-active stage cancelled only
+            // after the durable Job has reached Cancelled; no new stage is started afterwards.
+            for current in repository
+                .stages(&job.key.tenant_id, &job.operation_task_id)
+                .await?
+            {
+                if current.state.is_success() || current.state == StageState::Cancelled {
+                    continue;
+                }
+                if current.state != StageState::Cancelling {
+                    coordinator
+                        .transition_stage(
+                            &job.operation_task_id,
+                            &job.key.tenant_id,
+                            &current.stage_key,
+                            StageState::Cancelling,
+                            None,
+                        )
+                        .await?;
+                }
+                coordinator
+                    .transition_stage(
+                        &job.operation_task_id,
+                        &job.key.tenant_id,
+                        &current.stage_key,
+                        StageState::Cancelled,
+                        None,
+                    )
+                    .await
+                    .map(|_| ())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Projects one control-plane Job used by Workspace/Snapshot flows onto its owning root task.
+    /// The Job remains the source of truth for assignment and Agent observations; this projection
+    /// only advances the user-visible stage DAG and root state. A missing task is allowed for
+    /// standalone Job compositions, while a present task is never replaced by a second task.
+    async fn sync_control_job_task(
+        &self,
+        job: &JobRecord,
+        issue: Option<TaskIssue>,
+    ) -> CentralResult<()> {
+        let Some(operation_task_id) = job.spec.operation_task_id.as_ref() else {
+            return Ok(());
+        };
+        let Some(coordinator) = &self.task_coordinator else {
+            return Ok(());
+        };
+        let Some(task) = coordinator
+            .repository()
+            .get(&job.spec.tenant_id, operation_task_id)
+            .await?
+        else {
+            return Ok(());
+        };
+
+        // A SnapshotDelivery Job can also be used for a physical delete. That operation is
+        // owned by a deletion saga and has a different five-stage plan, so leave it to the
+        // ResourceLifecycleCoordinator rather than trying to force it into SnapshotCreate's DAG.
+        let (stage_keys, root_state) = match job.operation {
+            JobOperation::WorkspaceMaterialize => {
+                let keys = match job.state {
+                    JobState::Queued => vec![
+                        ("validate", StageState::Succeeded),
+                        ("persist", StageState::Succeeded),
+                    ],
+                    JobState::Assigned | JobState::Accepted | JobState::Running => vec![
+                        ("validate", StageState::Succeeded),
+                        ("persist", StageState::Succeeded),
+                        ("materialize", StageState::Running),
+                    ],
+                    JobState::Succeeded => vec![
+                        ("validate", StageState::Succeeded),
+                        ("persist", StageState::Succeeded),
+                        ("materialize", StageState::Succeeded),
+                        ("verify", StageState::Succeeded),
+                        ("publish", StageState::Succeeded),
+                    ],
+                    JobState::RecoveryRequired => vec![
+                        ("validate", StageState::Succeeded),
+                        ("persist", StageState::Succeeded),
+                        ("materialize", StageState::Stalled),
+                    ],
+                    JobState::Failed | JobState::Rejected | JobState::TimedOut => vec![
+                        ("validate", StageState::Succeeded),
+                        ("persist", StageState::Succeeded),
+                        ("materialize", StageState::Failed),
+                    ],
+                    JobState::CancelRequested | JobState::Cancelled => Vec::new(),
+                    JobState::Prepared | JobState::Publishing | JobState::Conflicted => vec![
+                        ("validate", StageState::Succeeded),
+                        ("persist", StageState::Succeeded),
+                        ("materialize", StageState::Running),
+                    ],
+                    JobState::Unknown => Vec::new(),
+                };
+                (keys, control_job_root_state(job.state))
+            }
+            JobOperation::SnapshotDelivery
+                if task.intent_kind == neoengram_domain::protocol::TaskIntent::SnapshotCreate =>
+            {
+                let keys = match job.state {
+                    JobState::Queued => vec![
+                        ("validate", StageState::Succeeded),
+                        ("persist", StageState::Succeeded),
+                    ],
+                    JobState::Assigned | JobState::Accepted | JobState::Running => vec![
+                        ("validate", StageState::Succeeded),
+                        ("persist", StageState::Succeeded),
+                        ("delivery_materialize", StageState::Running),
+                    ],
+                    JobState::Succeeded => vec![
+                        ("validate", StageState::Succeeded),
+                        ("persist", StageState::Succeeded),
+                        ("delivery_materialize", StageState::Succeeded),
+                        ("verify", StageState::Succeeded),
+                        ("publish", StageState::Succeeded),
+                    ],
+                    JobState::RecoveryRequired => vec![
+                        ("validate", StageState::Succeeded),
+                        ("persist", StageState::Succeeded),
+                        ("delivery_materialize", StageState::Stalled),
+                    ],
+                    JobState::Failed | JobState::Rejected | JobState::TimedOut => vec![
+                        ("validate", StageState::Succeeded),
+                        ("persist", StageState::Succeeded),
+                        ("delivery_materialize", StageState::Failed),
+                    ],
+                    JobState::CancelRequested | JobState::Cancelled => Vec::new(),
+                    JobState::Prepared | JobState::Publishing | JobState::Conflicted => vec![
+                        ("validate", StageState::Succeeded),
+                        ("persist", StageState::Succeeded),
+                        ("delivery_materialize", StageState::Running),
+                    ],
+                    JobState::Unknown => Vec::new(),
+                };
+                (keys, control_job_root_state(job.state))
+            }
+            _ => return Ok(()),
+        };
+
+        for (stage_key, desired) in stage_keys {
+            drive_control_job_stage(
+                coordinator,
+                &job.spec.tenant_id,
+                operation_task_id,
+                stage_key,
+                desired,
+                issue.clone(),
+            )
+            .await?;
+        }
+
+        let current = coordinator
+            .repository()
+            .get(&job.spec.tenant_id, operation_task_id)
+            .await?
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "operation task disappeared",
+                )
+            })?;
+
+        if matches!(job.state, JobState::CancelRequested | JobState::Cancelled) {
+            if current.state.is_terminal() {
+                return Ok(());
+            }
+            if current.state != TaskState::Cancelling {
+                coordinator
+                    .transition(
+                        operation_task_id,
+                        &job.spec.tenant_id,
+                        TaskState::Cancelling,
+                        control_job_actor(),
+                        Some("control Job cancellation converged".to_owned()),
+                    )
+                    .await?;
+            }
+            for stage in coordinator
+                .repository()
+                .stages(&job.spec.tenant_id, operation_task_id)
+                .await?
+            {
+                if stage.state.is_success() || stage.state == StageState::Cancelled {
+                    continue;
+                }
+                drive_control_job_stage(
+                    coordinator,
+                    &job.spec.tenant_id,
+                    operation_task_id,
+                    &stage.stage_key,
+                    StageState::Cancelled,
+                    None,
+                )
+                .await?;
+            }
+            let latest = coordinator
+                .repository()
+                .get(&job.spec.tenant_id, operation_task_id)
+                .await?
+                .ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::ResourceNotFound,
+                        "operation task disappeared",
+                    )
+                })?;
+            if latest.state == TaskState::Cancelling {
+                coordinator
+                    .repository()
+                    .complete_cancellation(
+                        &job.spec.tenant_id,
+                        operation_task_id,
+                        latest.resource_version,
+                        control_job_actor(),
+                        self.clock.now(),
+                    )
+                    .await?;
+            }
+            return Ok(());
+        }
+
+        if current.state.is_terminal() {
+            return Ok(());
+        }
+        let desired = root_state;
+        if desired == TaskState::Succeeded && current.state == TaskState::Queued {
+            coordinator
+                .transition(
+                    operation_task_id,
+                    &job.spec.tenant_id,
+                    TaskState::Running,
+                    control_job_actor(),
+                    Some("control Job completed".to_owned()),
+                )
+                .await?;
+        }
+        let latest = coordinator
+            .repository()
+            .get(&job.spec.tenant_id, operation_task_id)
+            .await?
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    "operation task disappeared",
+                )
+            })?;
+        if latest.state != desired {
+            coordinator
+                .transition_with_issue(
+                    operation_task_id,
+                    &job.spec.tenant_id,
+                    desired,
+                    control_job_actor(),
+                    issue,
+                    Some(format!("control Job state: {:?}", job.state)),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Mirrors the durable materialization aggregate into its unified operation task. The
     /// materialization repository remains authoritative for object/Batch facts; this helper only
     /// updates the coarse task state and latest progress summary used by operations screens.
@@ -729,6 +1349,8 @@ impl ControlPlane {
             );
             return Ok(());
         };
+        self.sync_materialization_stages(job, issue.as_ref())
+            .await?;
         let desired = Self::materialization_task_state(job.state);
         if current.state.is_terminal() && current.state != desired {
             // A cancelled/succeeded task is an explicit operator decision or completed history;
@@ -743,18 +1365,99 @@ impl ControlPlane {
             return Ok(());
         }
 
+        if desired == TaskState::Cancelled {
+            // A cancelled materialization is only terminal after the root task has entered its
+            // explicit convergence state. The Job's durable Cancelled state is the evidence that
+            // Agent work and leases have drained, so it is safe to close the root now.
+            // Re-read after stage projection: stage transitions update the root navigation
+            // pointer under their own CAS and may therefore advance the task resource version.
+            let latest = repository
+                .get(&job.key.tenant_id, &job.operation_task_id)
+                .await?
+                .ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::ResourceNotFound,
+                        "operation task disappeared",
+                    )
+                })?;
+            if latest.state.is_terminal() {
+                return Ok(());
+            }
+            if latest.state != TaskState::Cancelling {
+                match coordinator
+                    .transition_with_issue(
+                        &job.operation_task_id,
+                        &job.key.tenant_id,
+                        TaskState::Cancelling,
+                        actor.clone(),
+                        None,
+                        Some("materialization cancellation converged".to_owned()),
+                    )
+                    .await
+                {
+                    Ok(updated) if updated.state.is_terminal() => return Ok(()),
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.code(),
+                            CentralErrorCode::ConcurrentUpdate
+                                | CentralErrorCode::ResourceNotFound
+                                | CentralErrorCode::InvalidState
+                        ) =>
+                    {
+                        return Ok(())
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            // The cancellation completion API owns the final fence. It verifies the current
+            // task Attempt and every stage are already at the cancellation barrier, then updates
+            // all three projections atomically. Never use a normal state transition here.
+            let latest = repository
+                .get(&job.key.tenant_id, &job.operation_task_id)
+                .await?
+                .ok_or_else(|| {
+                    invalid(
+                        CentralErrorCode::ResourceNotFound,
+                        "operation task disappeared",
+                    )
+                })?;
+            if latest.state == TaskState::Cancelling {
+                match repository
+                    .complete_cancellation(
+                        &job.key.tenant_id,
+                        &job.operation_task_id,
+                        latest.resource_version,
+                        actor,
+                        self.clock.now(),
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.code(),
+                            CentralErrorCode::ConcurrentUpdate
+                                | CentralErrorCode::ResourceNotFound
+                                | CentralErrorCode::InvalidState
+                        ) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            return Ok(());
+        }
         let mut task_state = current.state;
         // The domain state machine intentionally requires an active state before success or
         // verification. A reconnected Agent may deliver the final receipt while the task still
         // says queued/stalled, so advance through Running before the terminal/verification state.
-        let requires_running = (desired == TaskState::Succeeded
-            && matches!(
-                task_state,
-                TaskState::Queued | TaskState::Waiting | TaskState::Stalled
-            ))
-            || (desired == TaskState::Verifying
-                && matches!(task_state, TaskState::Queued | TaskState::Stalled))
-            || (desired == TaskState::Waiting && task_state == TaskState::Stalled);
+        let requires_running = (matches!(
+            desired,
+            TaskState::Succeeded | TaskState::Verifying | TaskState::Failed | TaskState::Stalled
+        ) && matches!(
+            task_state,
+            TaskState::Queued | TaskState::Waiting | TaskState::Stalled
+        )) || (desired == TaskState::Waiting
+            && task_state == TaskState::Stalled);
         if requires_running {
             let resumed = match coordinator
                 .transition_with_issue(
@@ -1575,6 +2278,9 @@ impl ControlPlane {
             ticket_id,
             operation_task_id: job.operation_task_id.clone(),
             task_attempt_id: job.task_attempt_id.clone(),
+            task_attempt: task_attempt_generation(&job.task_attempt_id),
+            stage_key: "transfer".to_owned(),
+            stage_attempt: batch.batch_attempt,
             materialization_id: batch.materialization_id.clone(),
             batch_id: batch.batch_id.clone(),
             plan_revision: batch.plan_revision,
@@ -1599,6 +2305,9 @@ impl ControlPlane {
         let assignment = neoengram_domain::protocol::MaterializationAssignment {
             operation_task_id: job.operation_task_id.clone(),
             task_attempt_id: job.task_attempt_id.clone(),
+            task_attempt: task_attempt_generation(&job.task_attempt_id),
+            stage_key: "transfer".to_owned(),
+            stage_attempt: batch.batch_attempt,
             signed_ticket,
             batch: batch.clone(),
             manifest,
@@ -1686,13 +2395,21 @@ impl ControlPlane {
                 "materialization report target fence differs from the durable Batch",
             ));
         }
-        if batch.plan_revision != report.plan_revision()
+        // Reports must match every identity fence copied from the assignment. In particular,
+        // `task_attempt_id` alone is insufficient: an implementation could forge an ID with the
+        // same textual suffix while targeting an older stage execution. The transfer stage is the
+        // only data-plane stage that emits object reports, and its stage attempt is the Batch
+        // attempt that was signed into the ticket.
+        if report.task_attempt() != task_attempt_generation(&job.task_attempt_id)
+            || report.stage_key() != "transfer"
+            || report.stage_attempt() != batch.batch_attempt
+            || batch.plan_revision != report.plan_revision()
             || batch.batch_attempt != report.batch_attempt()
             || batch.target.object_namespace_id != *report.object_namespace_id()
         {
             return Err(invalid(
                 CentralErrorCode::ConcurrentUpdate,
-                "materialization report does not match the active Batch fence",
+                "materialization report does not match the active task/stage Batch fence",
             ));
         }
 
@@ -2492,7 +3209,12 @@ impl ControlPlane {
             .await
             .map_err(|error| invalid(CentralErrorCode::Internal, error.to_string()))?;
         let assignment = ReplicationAssignment {
-            replication_id: record.replication_id,
+            replication_id: record.replication_id.clone(),
+            task_fence: execution_fence(
+                record.replication_id.as_str(),
+                record.attempt,
+                "transfer",
+            )?,
             tenant_id: record.tenant_id,
             artifact_id,
             commit_id: neoengram_domain::CommitId::from_digest(record.commit_id),
@@ -3141,7 +3863,7 @@ impl ControlPlane {
         Ok(CreateAddJobResult { job, replayed })
     }
 
-    /// Creates the durable infrastructure Job used to materialize a Playground directory.
+    /// Creates the durable infrastructure Job used to materialize a Workspace directory.
     ///
     /// The record is intentionally stored in the same Job table as managed Add so the existing
     /// assignment outbox foreign key and recovery scanner cover both operations. Its operation
@@ -3154,7 +3876,7 @@ impl ControlPlane {
         let canonical = WorkspaceMaterializeAssignment::canonical_relative_root(
             &spec.project_id,
             &spec.artifact_id,
-            &spec.playground_id,
+            &spec.workspace_id,
         )?;
         if spec.relative_root != canonical {
             return Err(invalid(
@@ -3183,7 +3905,7 @@ impl ControlPlane {
             tenant_id: spec.tenant_id.clone(),
             project_id: spec.project_id.clone(),
             artifact_id: spec.artifact_id.clone(),
-            playground_id: spec.playground_id.clone(),
+            workspace_id: spec.workspace_id.clone(),
             expected_index_version: WireIndexVersion {
                 revision: IndexRevision::new(0),
                 digest: neoengram_domain::core::ContentDigest::from_bytes([0; 32]),
@@ -3194,6 +3916,7 @@ impl ControlPlane {
             deadline_unix_ms: spec.deadline_unix_ms,
             paths: Vec::new(),
             all: true,
+            operation_task_id: spec.operation_task_id.clone(),
             extensions: Extensions::new(),
         };
         job_scope.request_digest = job_scope.computed_request_digest()?;
@@ -3230,6 +3953,7 @@ impl ControlPlane {
                 (existing, true)
             }
         };
+        self.sync_control_job_task(&job, None).await?;
         self.audit(&job, AuditKind::JobCreated, "materialize-create")
             .await?;
         Ok(CreateWorkspaceMaterializationResult { job, replayed })
@@ -3262,6 +3986,15 @@ impl ControlPlane {
         let relative_root = spec.relative_root.clone();
         let assignment = WorkspaceMaterializeAssignment {
             job_id: spec.job_id.clone(),
+            task_fence: operation_task_fence(
+                self.task_coordinator.as_deref(),
+                spec.operation_task_id.as_ref(),
+                &spec.tenant_id,
+                spec.job_id.as_str(),
+                1,
+                "materialize",
+            )
+            .await?,
             assignment_id: request.target.assignment_id.clone(),
             assignment_generation: request.target.assignment_generation,
             agent_id: request.target.agent_id.clone(),
@@ -3269,7 +4002,7 @@ impl ControlPlane {
             tenant_id: spec.tenant_id.clone(),
             project_id: spec.project_id.clone(),
             artifact_id: spec.artifact_id.clone(),
-            playground_id: spec.playground_id.clone(),
+            workspace_id: spec.workspace_id.clone(),
             storage_volume_id: spec.storage_volume_id.clone(),
             agent_mount_id: request.target.agent_mount_id.clone(),
             mount_generation: request.target.mount_generation,
@@ -3300,6 +4033,7 @@ impl ControlPlane {
             }
             let _ = self.outbox.reserve(envelope.clone()).await?;
             let _ = self.outbox.publish(envelope.clone()).await?;
+            self.sync_control_job_task(&job, None).await?;
             return Ok(AssignWorkspaceMaterializationResult {
                 job,
                 assignment: envelope,
@@ -3326,6 +4060,7 @@ impl ControlPlane {
                 }
                 let _ = self.outbox.reserve(envelope.clone()).await?;
                 let _ = self.outbox.publish(envelope.clone()).await?;
+                self.sync_control_job_task(&persisted, None).await?;
                 return Ok(AssignWorkspaceMaterializationResult {
                     job: persisted,
                     assignment: envelope,
@@ -3335,6 +4070,7 @@ impl ControlPlane {
             Err(error) => return Err(error),
         };
         let _ = self.outbox.publish(envelope.clone()).await?;
+        self.sync_control_job_task(&job, None).await?;
         self.audit(&job, AuditKind::AssignmentQueued, "materialize-assignment")
             .await?;
         Ok(AssignWorkspaceMaterializationResult {
@@ -3363,15 +4099,15 @@ impl ControlPlane {
                 "SnapshotDelivery deadline has elapsed",
             ));
         }
-        let playground_id =
-            neoengram_domain::protocol::PlaygroundId::new(spec.snapshot_id.as_str().to_owned())?;
+        let workspace_id =
+            neoengram_domain::protocol::WorkspaceId::new(spec.snapshot_id.as_str().to_owned())?;
         let mut job_scope = AddJobSpec {
             job_id: spec.job_id.clone(),
             principal: spec.principal.clone(),
             tenant_id: spec.tenant_id.clone(),
             project_id: spec.project_id.clone(),
             artifact_id: spec.artifact_id.clone(),
-            playground_id,
+            workspace_id,
             expected_index_version: WireIndexVersion {
                 revision: neoengram_domain::protocol::IndexRevision::new(0),
                 digest: neoengram_domain::core::ContentDigest::from_bytes([0; 32]),
@@ -3382,6 +4118,7 @@ impl ControlPlane {
             deadline_unix_ms: spec.deadline_unix_ms,
             paths: Vec::new(),
             all: true,
+            operation_task_id: spec.operation_task_id.clone(),
             extensions: Extensions::new(),
         };
         job_scope.request_digest = job_scope.computed_request_digest()?;
@@ -3418,6 +4155,7 @@ impl ControlPlane {
                 (existing, true)
             }
         };
+        self.sync_control_job_task(&job, None).await?;
         self.audit(&job, AuditKind::JobCreated, "snapshot-delivery-create")
             .await?;
         Ok(CreateSnapshotDeliveryResult { job, replayed })
@@ -3449,6 +4187,15 @@ impl ControlPlane {
         }
         let assignment = SnapshotDeliveryAssignment {
             job_id: spec.job_id.clone(),
+            task_fence: operation_task_fence(
+                self.task_coordinator.as_deref(),
+                spec.operation_task_id.as_ref(),
+                &spec.tenant_id,
+                spec.job_id.as_str(),
+                1,
+                "delivery_materialize",
+            )
+            .await?,
             assignment_id: request.target.assignment_id.clone(),
             assignment_generation: request.target.assignment_generation,
             agent_id: request.target.agent_id.clone(),
@@ -3489,6 +4236,7 @@ impl ControlPlane {
             if existing == &assignment {
                 let _ = self.outbox.reserve(envelope.clone()).await?;
                 let _ = self.outbox.reactivate(envelope.clone()).await?;
+                self.sync_control_job_task(&job, None).await?;
                 return Ok(AssignSnapshotDeliveryResult {
                     job,
                     assignment: envelope,
@@ -3528,6 +4276,7 @@ impl ControlPlane {
                 }
                 let _ = self.outbox.reserve(envelope.clone()).await?;
                 let _ = self.outbox.publish(envelope.clone()).await?;
+                self.sync_control_job_task(&persisted, None).await?;
                 return Ok(AssignSnapshotDeliveryResult {
                     job: persisted,
                     assignment: envelope,
@@ -3537,6 +4286,7 @@ impl ControlPlane {
             Err(error) => return Err(error),
         };
         let _ = self.outbox.publish(envelope.clone()).await?;
+        self.sync_control_job_task(&job, None).await?;
         self.audit(
             &job,
             AuditKind::AssignmentQueued,
@@ -3550,7 +4300,7 @@ impl ControlPlane {
         })
     }
 
-    /// Marks an elapsed materialization terminal and exposes the failed lifecycle on Playground.
+    /// Marks an elapsed materialization terminal and exposes the failed lifecycle on Workspace.
     pub async fn expire_workspace_materialization(
         &self,
         tenant_id: &neoengram_domain::protocol::TenantId,
@@ -3564,6 +4314,7 @@ impl ControlPlane {
             ));
         }
         if job.state == JobState::TimedOut {
+            self.sync_control_job_task(&job, None).await?;
             return Ok(job);
         }
         if job.spec.deadline_unix_ms.get() > self.clock.now().get() {
@@ -3586,19 +4337,20 @@ impl ControlPlane {
                     "ControlPlane has no control catalog for materialization state",
                 )
             })?
-            .transition_playground_state(
+            .transition_workspace_state(
                 &spec.tenant_id,
                 &spec.project_id,
                 &spec.artifact_id,
-                &spec.playground_id,
-                crate::PlaygroundState::Creating,
-                crate::PlaygroundState::Abnormal,
+                &spec.workspace_id,
+                crate::WorkspaceState::Creating,
+                crate::WorkspaceState::Abnormal,
                 self.clock.now(),
             )
             .await?;
         let previous = job.resource_version.get();
         job.state = JobState::TimedOut;
         job = self.replace(previous, job).await?;
+        self.sync_control_job_task(&job, None).await?;
         if let Some(assignment) = &job.workspace_assignment {
             let _ = self
                 .outbox
@@ -3609,7 +4361,7 @@ impl ControlPlane {
     }
 
     /// Converges the Job side of the lifecycle publication after a crash between the catalog
-    /// lifecycle CAS and the Job CAS. No success or failure is fabricated while the Playground
+    /// lifecycle CAS and the Job CAS. No success or failure is fabricated while the Workspace
     /// remains Creating.
     pub async fn recover_workspace_materialization(
         &self,
@@ -3626,7 +4378,7 @@ impl ControlPlane {
                 "WorkspaceMaterialize Job lost its immutable spec",
             )
         })?;
-        let playground = self
+        let workspace = self
             .catalog
             .as_ref()
             .ok_or_else(|| {
@@ -3635,27 +4387,28 @@ impl ControlPlane {
                     "ControlPlane has no control catalog for materialization state",
                 )
             })?
-            .get_playground(
+            .get_workspace(
                 &spec.tenant_id,
                 &spec.project_id,
                 &spec.artifact_id,
-                &spec.playground_id,
+                &spec.workspace_id,
             )
             .await?
             .ok_or_else(|| {
                 invalid(
                     CentralErrorCode::JobNotFound,
-                    "materialization Playground no longer exists",
+                    "materialization Workspace no longer exists",
                 )
             })?;
-        let recovered_state = match playground.state {
-            crate::PlaygroundState::Creating => return Ok(job),
-            crate::PlaygroundState::Ready => JobState::Succeeded,
-            crate::PlaygroundState::Abnormal => JobState::RecoveryRequired,
+        let recovered_state = match workspace.state {
+            crate::WorkspaceState::Creating => return Ok(job),
+            crate::WorkspaceState::Ready => JobState::Succeeded,
+            crate::WorkspaceState::Abnormal => JobState::RecoveryRequired,
         };
         let previous = job.resource_version.get();
         job.state = recovered_state;
         job = self.replace(previous, job).await?;
+        self.sync_control_job_task(&job, None).await?;
         if let Some(assignment) = &job.workspace_assignment {
             let _ = self
                 .outbox
@@ -3691,6 +4444,15 @@ impl ControlPlane {
         .await?;
         let assignment = neoengram_domain::protocol::AddAssignment {
             job_id: job.spec.job_id.clone(),
+            task_fence: operation_task_fence(
+                self.task_coordinator.as_deref(),
+                job.spec.operation_task_id.as_ref(),
+                &job.spec.tenant_id,
+                job.spec.job_id.as_str(),
+                1,
+                "scan_changes",
+            )
+            .await?,
             assignment_id: request.target.assignment_id.clone(),
             assignment_generation: request.target.assignment_generation,
             agent_id: request.target.agent_id.clone(),
@@ -3698,7 +4460,7 @@ impl ControlPlane {
             tenant_id: job.spec.tenant_id.clone(),
             project_id: job.spec.project_id.clone(),
             artifact_id: job.spec.artifact_id.clone(),
-            playground_id: job.spec.playground_id.clone(),
+            workspace_id: job.spec.workspace_id.clone(),
             edge_cluster_id: request.target.edge_cluster_id.clone(),
             storage_volume_id: request.target.storage_volume_id.clone(),
             artifact_placement_id: request.target.artifact_placement_id.clone(),
@@ -3851,6 +4613,7 @@ impl ControlPlane {
                     &report.job_id,
                     &report.assignment_id,
                     report.assignment_generation,
+                    &report.task_fence,
                 )?;
                 if report.request_digest != assignment.request_digest {
                     return Err(invalid(
@@ -3886,6 +4649,7 @@ impl ControlPlane {
                     &report.job_id,
                     &report.assignment_id,
                     report.assignment_generation,
+                    &report.task_fence,
                 )?;
                 if report.state != JobState::Running {
                     return Err(invalid(
@@ -3937,6 +4701,7 @@ impl ControlPlane {
                     &report.job_id,
                     &report.assignment_id,
                     report.assignment_generation,
+                    &report.task_fence,
                 )?;
                 let finalized = job.finalized.as_ref().ok_or_else(|| {
                     invalid(
@@ -3979,6 +4744,7 @@ impl ControlPlane {
                     &report.job_id,
                     &report.assignment_id,
                     report.assignment_generation,
+                    &report.task_fence,
                 )?;
                 validate_terminal_state(report.final_state)?;
                 if job.state == JobState::Publishing {
@@ -4006,6 +4772,7 @@ impl ControlPlane {
                     let decision_generation = DecisionGeneration::new(1);
                     let decision = JobDecision {
                         job_id: assignment.job_id.clone(),
+                        task_fence: assignment.task_fence.clone(),
                         assignment_id: assignment.assignment_id.clone(),
                         assignment_generation: assignment.assignment_generation,
                         decision_generation,
@@ -4018,6 +4785,7 @@ impl ControlPlane {
                     };
                     let finalized = JobFinalized {
                         job_id: assignment.job_id.clone(),
+                        task_fence: assignment.task_fence.clone(),
                         assignment_id: assignment.assignment_id.clone(),
                         assignment_generation: assignment.assignment_generation,
                         decision_generation,
@@ -4083,6 +4851,7 @@ impl ControlPlane {
                     &report.job_id,
                     &report.assignment_id,
                     report.assignment_generation,
+                    &report.task_fence,
                 )?;
                 if report.request_digest != assignment.request_digest {
                     return Err(invalid(
@@ -4115,6 +4884,7 @@ impl ControlPlane {
                     &report.job_id,
                     &report.assignment_id,
                     report.assignment_generation,
+                    &report.task_fence,
                 )?;
                 if job.progress.as_ref() == Some(&report) {
                     replayed = true;
@@ -4167,13 +4937,13 @@ impl ControlPlane {
                                 }
                             }
                             catalog
-                                .transition_playground_state(
+                                .transition_workspace_state(
                                     &assignment.tenant_id,
                                     &assignment.project_id,
                                     &assignment.artifact_id,
-                                    &assignment.playground_id,
-                                    crate::PlaygroundState::Creating,
-                                    crate::PlaygroundState::Ready,
+                                    &assignment.workspace_id,
+                                    crate::WorkspaceState::Creating,
+                                    crate::WorkspaceState::Ready,
                                     self.clock.now(),
                                 )
                                 .await?;
@@ -4200,6 +4970,7 @@ impl ControlPlane {
                     &report.job_id,
                     &report.assignment_id,
                     report.assignment_generation,
+                    &report.task_fence,
                 )?;
                 validate_terminal_state(report.final_state)?;
                 if job.failure.as_ref() == Some(&report) {
@@ -4212,13 +4983,13 @@ impl ControlPlane {
                         ));
                     }
                     catalog
-                        .transition_playground_state(
+                        .transition_workspace_state(
                             &assignment.tenant_id,
                             &assignment.project_id,
                             &assignment.artifact_id,
-                            &assignment.playground_id,
-                            crate::PlaygroundState::Creating,
-                            crate::PlaygroundState::Abnormal,
+                            &assignment.workspace_id,
+                            crate::WorkspaceState::Creating,
+                            crate::WorkspaceState::Abnormal,
                             self.clock.now(),
                         )
                         .await?;
@@ -4241,6 +5012,13 @@ impl ControlPlane {
                 .retire(&request.tenant_id, &assignment_id)
                 .await?;
         }
+        let task_issue = job.failure.as_ref().map(|failure| TaskIssue {
+            code: failure.error.code.as_str().to_owned(),
+            message: failure.error.message.clone(),
+            retryable: failure.error.retryable,
+            detail: None,
+        });
+        self.sync_control_job_task(&job, task_issue).await?;
         self.audit(&job, AuditKind::ReportReceived, "materialize-report")
             .await?;
         Ok(ReceiveReportResult { job, replayed })
@@ -4295,6 +5073,7 @@ impl ControlPlane {
                     &report.job_id,
                     &report.assignment_id,
                     report.assignment_generation,
+                    &report.task_fence,
                 )?;
                 if report.request_digest != assignment.request_digest {
                     return Err(invalid(
@@ -4339,6 +5118,7 @@ impl ControlPlane {
                     &report.job_id,
                     &report.assignment_id,
                     report.assignment_generation,
+                    &report.task_fence,
                 )?;
                 if job.progress.as_ref() == Some(&report) {
                     replayed = true;
@@ -4462,6 +5242,7 @@ impl ControlPlane {
                     &report.job_id,
                     &report.assignment_id,
                     report.assignment_generation,
+                    &report.task_fence,
                 )?;
                 validate_terminal_state(report.final_state)?;
                 if job.failure.as_ref() == Some(&report) {
@@ -4520,6 +5301,13 @@ impl ControlPlane {
                 .retire(&request.tenant_id, &assignment_id)
                 .await?;
         }
+        let task_issue = job.failure.as_ref().map(|failure| TaskIssue {
+            code: failure.error.code.as_str().to_owned(),
+            message: failure.error.message.clone(),
+            retryable: failure.error.retryable,
+            detail: None,
+        });
+        self.sync_control_job_task(&job, task_issue).await?;
         self.audit(&job, AuditKind::ReportReceived, "snapshot-delivery-report")
             .await?;
         let _ = delivery;
@@ -4635,6 +5423,7 @@ impl ControlPlane {
                         &decision.job_id,
                         &decision.assignment_id,
                         decision.assignment_generation,
+                        &decision.task_fence,
                     )?;
                     if !matches!(decision.decision, PublishDecision::Reject { .. })
                         || decision.final_state != JobState::TimedOut
@@ -4705,6 +5494,7 @@ impl ControlPlane {
                 let decision_generation = DecisionGeneration::new(1);
                 let decision = JobDecision {
                     job_id: assignment.job_id.clone(),
+                    task_fence: assignment.task_fence.clone(),
                     assignment_id: assignment.assignment_id.clone(),
                     assignment_generation: assignment.assignment_generation,
                     decision_generation,
@@ -4723,6 +5513,7 @@ impl ControlPlane {
                 };
                 let finalized = JobFinalized {
                     job_id: assignment.job_id.clone(),
+                    task_fence: assignment.task_fence.clone(),
                     assignment_id: assignment.assignment_id.clone(),
                     assignment_generation: assignment.assignment_generation,
                     decision_generation,
@@ -5067,6 +5858,7 @@ impl ControlPlane {
         };
         let decision = JobDecision {
             job_id: assignment.job_id.clone(),
+            task_fence: assignment.task_fence.clone(),
             assignment_id: assignment.assignment_id.clone(),
             assignment_generation: assignment.assignment_generation,
             decision_generation,
@@ -5076,6 +5868,7 @@ impl ControlPlane {
         };
         let finalized = JobFinalized {
             job_id: assignment.job_id.clone(),
+            task_fence: assignment.task_fence.clone(),
             assignment_id: assignment.assignment_id.clone(),
             assignment_generation: assignment.assignment_generation,
             decision_generation,
@@ -5132,7 +5925,7 @@ impl ControlPlane {
                 action,
                 tenant_id: spec.tenant_id.clone(),
                 artifact_id: spec.artifact_id.clone(),
-                playground_id: spec.playground_id.clone(),
+                workspace_id: spec.workspace_id.clone(),
                 job_id: spec.job_id.clone(),
             })
             .await
@@ -5154,6 +5947,160 @@ impl ControlPlane {
     }
 }
 
+fn control_job_root_state(state: JobState) -> TaskState {
+    match state {
+        JobState::Queued
+        | JobState::Assigned
+        | JobState::Accepted
+        | JobState::Running
+        | JobState::Prepared
+        | JobState::Publishing
+        | JobState::Conflicted
+        | JobState::Unknown => TaskState::Running,
+        JobState::Succeeded => TaskState::Succeeded,
+        JobState::RecoveryRequired => TaskState::Stalled,
+        JobState::Failed | JobState::Rejected | JobState::TimedOut => TaskState::Failed,
+        JobState::CancelRequested | JobState::Cancelled => TaskState::Cancelled,
+    }
+}
+
+fn control_job_actor() -> TaskActor {
+    TaskActor::Principal(PrincipalRef {
+        kind: PrincipalKind::System,
+        id: PrincipalId::new("control-job-projector")
+            .expect("static control Job projector principal is valid"),
+        extensions: Extensions::new(),
+    })
+}
+
+/// Drives one stage through the legal state-machine path to a desired projection. Every read is
+/// followed by a fenced transition so concurrent Agent/recovery reports remain idempotent.
+async fn drive_control_job_stage(
+    coordinator: &TaskCoordinator,
+    tenant_id: &TenantId,
+    task_id: &TaskId,
+    stage_key: &str,
+    desired: StageState,
+    issue: Option<TaskIssue>,
+) -> CentralResult<()> {
+    loop {
+        let current = coordinator
+            .repository()
+            .stages(tenant_id, task_id)
+            .await?
+            .into_iter()
+            .find(|stage| stage.stage_key == stage_key)
+            .ok_or_else(|| {
+                invalid(
+                    CentralErrorCode::ResourceNotFound,
+                    format!("operation task stage {stage_key} not found"),
+                )
+            })?;
+        if current.state == desired {
+            return Ok(());
+        }
+        if current.state.is_success() {
+            // A successful stage is an irreversible publication barrier for this attempt. A
+            // stale Job observation may not regress it to a waiting/running projection.
+            return Ok(());
+        }
+        let next = match desired {
+            StageState::Succeeded => match current.state {
+                StageState::Pending => StageState::Ready,
+                StageState::Ready
+                | StageState::Waiting
+                | StageState::Verifying
+                | StageState::Stalled => StageState::Running,
+                StageState::Running => StageState::Succeeded,
+                StageState::Failed | StageState::Cancelling | StageState::Cancelled => {
+                    return Err(invalid(
+                        CentralErrorCode::InvalidState,
+                        format!(
+                            "stage {stage_key} cannot reach succeeded from {:?}",
+                            current.state
+                        ),
+                    ));
+                }
+                StageState::Skipped | StageState::NoOp | StageState::Succeeded => unreachable!(),
+            },
+            StageState::Running => match current.state {
+                StageState::Pending => StageState::Ready,
+                StageState::Ready
+                | StageState::Waiting
+                | StageState::Verifying
+                | StageState::Stalled => StageState::Running,
+                StageState::Running => return Ok(()),
+                StageState::Failed | StageState::Cancelling | StageState::Cancelled => {
+                    return Err(invalid(
+                        CentralErrorCode::InvalidState,
+                        format!(
+                            "stage {stage_key} cannot reach running from {:?}",
+                            current.state
+                        ),
+                    ));
+                }
+                StageState::Skipped | StageState::NoOp | StageState::Succeeded => return Ok(()),
+            },
+            StageState::Waiting | StageState::Verifying => match current.state {
+                StageState::Pending => StageState::Ready,
+                StageState::Ready
+                | StageState::Stalled
+                | StageState::Waiting
+                | StageState::Verifying => StageState::Running,
+                StageState::Running => desired,
+                StageState::Failed | StageState::Cancelling | StageState::Cancelled => {
+                    return Err(invalid(
+                        CentralErrorCode::InvalidState,
+                        format!(
+                            "stage {stage_key} cannot reach {desired:?} from {:?}",
+                            current.state
+                        ),
+                    ));
+                }
+                StageState::Skipped | StageState::NoOp | StageState::Succeeded => return Ok(()),
+            },
+            StageState::Stalled | StageState::Failed => match current.state {
+                StageState::Pending => StageState::Ready,
+                StageState::Ready => StageState::Running,
+                StageState::Running | StageState::Waiting | StageState::Verifying => desired,
+                StageState::Stalled if desired == StageState::Failed => StageState::Failed,
+                StageState::Failed if desired == StageState::Stalled => StageState::Stalled,
+                StageState::Stalled | StageState::Failed => return Ok(()),
+                StageState::Cancelling | StageState::Cancelled => {
+                    return Err(invalid(
+                        CentralErrorCode::InvalidState,
+                        format!(
+                            "stage {stage_key} cannot reach {desired:?} from {:?}",
+                            current.state
+                        ),
+                    ));
+                }
+                StageState::Skipped | StageState::NoOp | StageState::Succeeded => return Ok(()),
+            },
+            StageState::Cancelled => match current.state {
+                StageState::Pending
+                | StageState::Ready
+                | StageState::Running
+                | StageState::Waiting
+                | StageState::Verifying
+                | StageState::Stalled
+                | StageState::Failed => StageState::Cancelling,
+                StageState::Cancelling => StageState::Cancelled,
+                StageState::Skipped | StageState::NoOp | StageState::Succeeded => return Ok(()),
+                StageState::Cancelled => unreachable!(),
+            },
+            StageState::Pending
+            | StageState::Ready
+            | StageState::Skipped
+            | StageState::NoOp
+            | StageState::Cancelling => desired,
+        };
+        coordinator
+            .transition_stage(task_id, tenant_id, stage_key, next, issue.clone())
+            .await?;
+    }
+}
+
 fn job_not_found(job_id: &neoengram_domain::protocol::JobId) -> crate::CentralError {
     invalid(
         CentralErrorCode::JobNotFound,
@@ -5166,6 +6113,7 @@ fn validate_workspace_report_identity(
     job_id: &neoengram_domain::protocol::JobId,
     assignment_id: &neoengram_domain::protocol::AssignmentId,
     generation: neoengram_domain::protocol::AssignmentGeneration,
+    task_fence: &TaskExecutionFence,
 ) -> CentralResult<()> {
     if job_id != &assignment.job_id || assignment_id != &assignment.assignment_id {
         return Err(invalid(
@@ -5179,6 +6127,12 @@ fn validate_workspace_report_identity(
             "materialization report carries a stale assignment generation",
         ));
     }
+    if task_fence != &assignment.task_fence {
+        return Err(invalid(
+            CentralErrorCode::GenerationMismatch,
+            "materialization report carries a stale task execution fence",
+        ));
+    }
     Ok(())
 }
 
@@ -5187,6 +6141,7 @@ fn validate_delivery_report_identity(
     job_id: &neoengram_domain::protocol::JobId,
     assignment_id: &neoengram_domain::protocol::AssignmentId,
     generation: neoengram_domain::protocol::AssignmentGeneration,
+    task_fence: &TaskExecutionFence,
 ) -> CentralResult<()> {
     if job_id != &assignment.job_id || assignment_id != &assignment.assignment_id {
         return Err(invalid(
@@ -5198,6 +6153,12 @@ fn validate_delivery_report_identity(
         return Err(invalid(
             CentralErrorCode::GenerationMismatch,
             "SnapshotDelivery report carries a stale assignment generation",
+        ));
+    }
+    if task_fence != &assignment.task_fence {
+        return Err(invalid(
+            CentralErrorCode::GenerationMismatch,
+            "SnapshotDelivery report carries a stale task execution fence",
         ));
     }
     Ok(())
@@ -5248,11 +6209,11 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        action_envelope, bounded_control_error_message, materialization_assignment_message_id,
-        materialization_ticket_window, reconnected_replication_report_matches_route,
-        replication_delivery_can_wait_for_next_tick, target_volume_coverage_complete,
-        ReplicationRouteGenerations, AGENT_JOB_ASSIGNMENT_ACTION, CONTROL_ERROR_MESSAGE_LIMIT,
-        MAX_CENTRAL_COMMAND_TTL_MS,
+        action_envelope, bounded_control_error_message, execution_fence,
+        materialization_assignment_message_id, materialization_ticket_window,
+        reconnected_replication_report_matches_route, replication_delivery_can_wait_for_next_tick,
+        target_volume_coverage_complete, ReplicationRouteGenerations, AGENT_JOB_ASSIGNMENT_ACTION,
+        CONTROL_ERROR_MESSAGE_LIMIT, MAX_CENTRAL_COMMAND_TTL_MS,
     };
     use neoengram_domain::core::{CommitId, ContentDigest, ObjectId};
     use neoengram_domain::protocol::materialization::{ObjectPlacement, ObjectPlacementState};
@@ -5624,6 +6585,12 @@ mod tests {
                 ReplicationProgressReport::State {
                     replication_id: fixture.replication.replication_id.clone(),
                     tenant_id: fixture.tenant_id.clone(),
+                    task_fence: execution_fence(
+                        fixture.replication.replication_id.as_str(),
+                        1,
+                        "transfer",
+                    )
+                    .unwrap(),
                     attempt: 1,
                     state: ReplicationState::Failed,
                     completed_objects: 0,
@@ -5666,6 +6633,12 @@ mod tests {
                 ReplicationProgressReport::State {
                     replication_id: fixture.replication.replication_id.clone(),
                     tenant_id: fixture.tenant_id.clone(),
+                    task_fence: execution_fence(
+                        fixture.replication.replication_id.as_str(),
+                        2,
+                        "transfer",
+                    )
+                    .unwrap(),
                     attempt: 2,
                     state: ReplicationState::Transferring,
                     completed_objects: 0,
@@ -5704,6 +6677,12 @@ mod tests {
                 ReplicationProgressReport::State {
                     replication_id: fixture.replication.replication_id.clone(),
                     tenant_id: fixture.tenant_id.clone(),
+                    task_fence: execution_fence(
+                        fixture.replication.replication_id.as_str(),
+                        fixture.replication.attempt,
+                        "transfer",
+                    )
+                    .unwrap(),
                     attempt: fixture.replication.attempt,
                     state: ReplicationState::Failed,
                     completed_objects: 0,
@@ -5781,6 +6760,12 @@ mod tests {
                 ReplicationProgressReport::Published {
                     replication_id: fixture.replication.replication_id.clone(),
                     tenant_id: fixture.tenant_id.clone(),
+                    task_fence: execution_fence(
+                        fixture.replication.replication_id.as_str(),
+                        fixture.replication.attempt,
+                        "transfer",
+                    )
+                    .unwrap(),
                     attempt: fixture.replication.attempt,
                     commit_id: fixture.object_set.commit_id,
                     object_set_digest: fixture.object_set.object_set.object_set_digest,

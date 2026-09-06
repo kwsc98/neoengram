@@ -305,7 +305,7 @@ pub struct PreCommitRecord {
     pub tenant_id: TenantId,
     pub project_id: ProjectId,
     pub artifact_id: ArtifactId,
-    pub playground_id: neoengram_domain::protocol::PlaygroundId,
+    pub workspace_id: neoengram_domain::protocol::WorkspaceId,
     pub precommit_id: PreCommitId,
     pub precommit_request_id: RequestId,
     pub attempt: u32,
@@ -324,8 +324,8 @@ pub struct PreCommitRecord {
     pub diff_summary: Option<CommitDiffSummary>,
     pub issue: Option<PreCommitNotice>,
     pub committed_commit_id: Option<CommitId>,
-    /// Recovery acknowledgement written after the source Playground Head and the Artifact's
-    /// convenience Head have published this Commit. Only the Playground Head is the branch-local
+    /// Recovery acknowledgement written after the source Workspace Head and the Artifact's
+    /// convenience Head have published this Commit. Only the Workspace Head is the branch-local
     /// concurrency fence.
     pub head_published_at_unix_ms: Option<UnixMillis>,
     pub frozen_head_commit_id: Option<CommitId>,
@@ -347,7 +347,7 @@ pub struct PreCommitStartRequest {
     pub tenant_id: TenantId,
     pub project_id: ProjectId,
     pub artifact_id: ArtifactId,
-    pub playground_id: neoengram_domain::protocol::PlaygroundId,
+    pub workspace_id: neoengram_domain::protocol::WorkspaceId,
     /// Server-proposed identity. A replay is resolved by `precommit_request_id` and may return a
     /// different, previously persisted ID.
     pub precommit_id: PreCommitId,
@@ -388,7 +388,7 @@ pub struct CommitRecord {
     pub tenant_id: TenantId,
     pub project_id: ProjectId,
     pub artifact_id: ArtifactId,
-    pub source_playground_id: neoengram_domain::protocol::PlaygroundId,
+    pub source_workspace_id: neoengram_domain::protocol::WorkspaceId,
     pub source_precommit_id: PreCommitId,
     pub commit_request_id: RequestId,
     pub commit_id: CommitId,
@@ -401,7 +401,7 @@ pub struct CommitRecord {
     /// Immutable data layout for every file Manifest in this Commit.
     pub data_layout: CommitDataLayout,
     /// Immutable, canonical-path-ordered snapshot. Commit reads must never follow a mutable
-    /// Playground Index pointer to reconstruct historical content.
+    /// Workspace Index pointer to reconstruct historical content.
     pub records: Vec<FileRecord>,
     pub message: String,
     pub description: Option<String>,
@@ -446,7 +446,7 @@ pub(crate) fn build_started(request: &PreCommitStartRequest) -> CentralResult<Pr
         tenant_id: request.tenant_id.clone(),
         project_id: request.project_id.clone(),
         artifact_id: request.artifact_id.clone(),
-        playground_id: request.playground_id.clone(),
+        workspace_id: request.workspace_id.clone(),
         precommit_id: request.precommit_id.clone(),
         precommit_request_id: request.precommit_request_id.clone(),
         attempt: 1,
@@ -567,7 +567,7 @@ pub(crate) fn apply_job_sync(
     }
     if record.project_id != job.spec.project_id
         || record.artifact_id != job.spec.artifact_id
-        || record.playground_id != job.spec.playground_id
+        || record.workspace_id != job.spec.workspace_id
         || !same_index_version(
             &record.source_index_version,
             &job.spec.expected_index_version,
@@ -714,7 +714,7 @@ pub(crate) fn apply_commit(
         || record.tenant_id != request.commit.tenant_id
         || record.project_id != request.commit.project_id
         || record.artifact_id != request.commit.artifact_id
-        || record.playground_id != request.commit.source_playground_id
+        || record.workspace_id != request.commit.source_workspace_id
         || record.precommit_id != request.commit.source_precommit_id
         || record.data_layout != request.data_layout
         || request.commit.data_layout != request.data_layout
@@ -774,7 +774,7 @@ pub(crate) fn same_start_request(
     left.tenant_id == right.tenant_id
         && left.project_id == right.project_id
         && left.artifact_id == right.artifact_id
-        && left.playground_id == right.playground_id
+        && left.workspace_id == right.workspace_id
         && left.precommit_request_id == right.precommit_request_id
         && left.data_layout == right.data_layout
         && same_index_version(&left.source_index_version, &right.source_index_version)
@@ -805,7 +805,7 @@ pub(crate) fn same_commit_request(
         && left.commit.tenant_id == right.commit.tenant_id
         && left.commit.project_id == right.commit.project_id
         && left.commit.artifact_id == right.commit.artifact_id
-        && left.commit.source_playground_id == right.commit.source_playground_id
+        && left.commit.source_workspace_id == right.commit.source_workspace_id
         && left.commit.source_precommit_id == right.commit.source_precommit_id
         && left.commit.object_set_digest == right.commit.object_set_digest
         && same_index_version(

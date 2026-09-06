@@ -82,6 +82,9 @@ OpenAPI 路由已注册不等于数据面已经可用：Web 必须按 `/api/syst
 - 服务端使用认证后的 PrincipalRef 和完整写操作计算 request digest；它与 OperationTask ID 形成业务
   幂等边界，参考 Temporal 等开源工作流系统的稳定 execution identity，不叠加另一套通用
   idempotency key，也不要求浏览器复制 canonical digest 实现。
+- 每次用户写操作只创建一个 OperationTask 根任务；`TaskView` 通过 `intent_kind`、`purpose`、主资源、
+  当前阶段和阶段列表表达执行进度，MaterializationBatch/对象等仍是领域明细。相同请求身份返回
+  `request_replayed=true`，不同请求但语义执行复用返回 `execution_reused=true`，两个标记彼此独立。
 - `resource_version`、generation 和 CAS 语义借鉴 Kubernetes 的版本化并发控制，但公开路径不是
   Kubernetes 风格的资源 CRUD API。
 - 方法式 HTTP 调用参考 Connect RPC 的明确 procedure 边界，但不使用 Protobuf、gRPC 或 Connect
@@ -93,7 +96,7 @@ OpenAPI 路由已注册不等于数据面已经可用：Web 必须按 `/api/syst
 token，并从验证后的 issuer/sub 导出 `PrincipalRef`；tenant scope 只能由启动时加载的服务端 RBAC
 策略授予。JWT 中的 tenant、role、group 只作审计提示，客户端不能通过 token 或请求 body 覆盖授权。
 
-Tenant、StorageVolume、Artifact、Commit、Playground、Snapshot 与 `OperationTask` 均为脱敏视图。
+Tenant、StorageVolume、Artifact、Commit、Workspace、Snapshot 与 `OperationTask` 均为脱敏视图。
 StorageVolume 的稳定逻辑 ID、region、EdgeCluster 和公开 PVC reference 可用于放置与运维识别；
 不得包含 Assignment target、Agent/Mount identity、generation、fencing token、NFS export、凭据、
 PublicationCandidate、Manifest、IndexDelta、物理路径或数据库信息。跨租户查询按
@@ -101,7 +104,7 @@ PublicationCandidate、Manifest、IndexDelta、物理路径或数据库信息。
 view 包含创建时固定的 `edge_cluster_id`、`storage_volume_id`、`delivery_mode` 和唯一 `delivery_id`，
 但不暴露内部 mount/generation。Snapshot 的数据健康由对象级 Verified Placement 和 Volume Coverage 动态解析。
 
-只有 `state=ready` 的 StorageVolume 可以承接新的 Playground、Workspace 或 Snapshot（及其原子生成的
+只有 `state=ready` 的 StorageVolume 可以承接新的 Workspace 或 Snapshot（及其原子生成的
 SnapshotDelivery）；`degraded` 和
 `unavailable` 均拒绝新的物化或复制目标，但已有资源的公开元数据仍可查询。P0 Dashboard 只展示当前 Tenant、
 系统健康和资源导航；资源数量、关注项、区域统计、最近版本与跨资源活动依赖 P1 聚合接口。
@@ -125,14 +128,14 @@ probe 才能推进到 `enrolled` 和 `ready`；拒绝进入终态 `rejected`。
 资源 mutation 同样只接受公开 DTO：StorageVolume 登记已有 PVC/NFS，不负责创建底层存储资源。
 Artifact 创建通过 discriminator 表达空初始化或从同 Tenant 另一 Artifact 的明确 Commit 派生，派生来源显式
 携带来源 Project；当前 Central 只执行空初始化，`derived` 请求返回
-`409 ARTIFACT_DERIVED_INITIALIZATION_UNSUPPORTED`。Playground/Workspace 选择一个同 Tenant Volume；
+`409 ARTIFACT_DERIVED_INITIALIZATION_UNSUPPORTED`。Workspace 选择一个同 Tenant Volume；
 Snapshot create 同时选择同 Tenant 的 EdgeCluster、StorageVolume 和 delivery mode，并原子生成唯一 Delivery。
 
-Playground 继续使用完整资源 identity 幂等创建。Snapshot create 使用稳定 request identity，一次性提交
+Workspace 继续使用完整资源 identity 幂等创建。Snapshot create 使用稳定 request identity，一次性提交
 `snapshot_id + commit_id + edge_cluster_id + storage_volume_id + delivery_mode`，并原子写入 Snapshot
 和唯一 SnapshotDelivery。创建后的目标和模式不可变；Delivery 只能通过 retry/delete 等状态 mutation
 推进或结束，不存在公开的第二个 Delivery create 或目标切换流程。
-Playground 的主状态仅为 Creating、Ready、Abnormal；扫描、哈希、上传和校验属于独立 Pre-commit。
+Workspace 的主状态仅为 Creating、Ready、Abnormal；扫描、哈希、上传和校验属于独立 Pre-commit。
 Pre-commit start 创建新的 `precommit_id`，并在服务端内部冻结当前 Head；running/ready 的重新检测
 使用 cancel 后 start，abnormal/cancelled 的失败重试才使用 restart，在同一 ID 上令 `attempt + 1`。
 可提交结果固定为 `state=ready, phase=idle`；`Blocked` 是 `state=abnormal, phase=idle` 且 blockers
@@ -144,12 +147,12 @@ Pre-commit start 创建新的 `precommit_id`，并在服务端内部冻结当前
 父 Commit 和 Tags，不要求调用方理解 Ref。Commit Diff 默认比较目标 Commit 与其单一 parent，根
 Commit 与空基线比较；公开结果只包含 Commit 视图、逻辑路径、变更类型和大小统计。
 
-Playground 文件、变更、文件元数据和 Dataset Profile 使用拆分分页方法；Snapshot 提供独立详情和
+Workspace 文件、变更、文件元数据和 Dataset Profile 使用拆分分页方法；Snapshot 提供独立详情和
 SnapshotDelivery 交付重试。Snapshot 文件清单、活动记录和 Dataset Profile 的三条路径目前只冻结了
 OpenAPI/Web Mock 形状，尚无 Central handler（contract-only）。上述 DTO 仅包含逻辑路径、Schema、统计、
 质量和 freshness，不公开 Manifest ID、对象位置、凭据或物理路径。
 
-Dataset Profile 的目标语义是 Playground/Snapshot 派生的只读元数据，不是 Snapshot 创建参数；当前 Snapshot
+Dataset Profile 的目标语义是 Workspace/Snapshot 派生的只读元数据，不是 Snapshot 创建参数；当前 Snapshot
 Profile 路径仍为 contract-only。用途、保留策略、
 Lease/Mount、容量与底层诊断、Agent/assignment、fencing、Manifest/Chunk、文件内容 digest、对象分布
 和物理路径均不属于 P0 普通用户契约；后续能力必须通过独立 P1 或 operator API 与相应 RBAC 暴露。

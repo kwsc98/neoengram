@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use fusen_rs::ErrorCategory;
 use neoengram_central::{
-    canonical_commit_id_with_layout, AddJobSpec, AdvancePlaygroundCommitRequest,
+    canonical_commit_id_with_layout, AddJobSpec, AdvanceWorkspaceCommitRequest,
     ArtifactInitialization, ArtifactRecord, CatalogPvcReference, Clock, CommitRecord,
     ControlCatalogRepository, ControlPlane, InMemoryComponents, IndexKey, IndexPublishOutcome,
     IndexPublishRequest, IndexPublisher, JobInsertOutcome, JobKey, JobOperation, JobRecord,
@@ -12,9 +12,9 @@ use neoengram_central::{
 };
 use neoengram_central::{
     dto::{
-        CommitPlaygroundRequest, CreatePlaygroundRequest, CreateSnapshotRequest, DataLayout,
-        IndexVersionBody, QueryArtifactCommitGraphRequest, QueryPlaygroundChangeListRequest,
-        QueryStorageVolumeRequest,
+        CommitWorkspaceRequest, CreateSnapshotRequest, CreateWorkspaceRequest, DataLayout,
+        IndexVersionBody, QueryArtifactCommitGraphRequest, QueryStorageVolumeRequest,
+        QueryWorkspaceChangeListRequest,
     },
     identity::{AuthenticatedIdentity, Permission, StaticRbacPolicy},
     service::{CatalogService, JobCoordinator, WorkspaceCommitService},
@@ -25,9 +25,10 @@ use neoengram_domain::core::{
 };
 use neoengram_domain::protocol::{
     ArtifactId, AssignmentGeneration, AssignmentId, CommitDataLayout, DecimalU64,
-    DecisionGeneration, EdgeClusterId, Extensions, IndexDeltaRecord, JobDecision, JobId, JobState,
-    PlaygroundId, PrincipalId, PrincipalKind, PrincipalRef, ProjectId, PublishDecision, RequestId,
-    ResourceVersion, StorageVolumeId, TenantId, UnixMillis,
+    DecisionGeneration, EdgeClusterId, Extensions, Generation, IndexDeltaRecord, JobDecision,
+    JobId, JobState, PrincipalId, PrincipalKind, PrincipalRef, ProjectId, PublishDecision,
+    RequestId, ResourceVersion, StorageVolumeId, TaskExecutionFence, TaskId, TenantId, UnixMillis,
+    WorkspaceId,
 };
 
 mod support;
@@ -39,20 +40,20 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
     let tenant_id = TenantId::new("tenant-a").unwrap();
     let project_id = ProjectId::new("project-a").unwrap();
     let artifact_id = ArtifactId::new("artifact-a").unwrap();
-    let playground_id = PlaygroundId::new("playground-a").unwrap();
+    let workspace_id = WorkspaceId::new("workspace-a").unwrap();
     seed_catalog(
         &components,
         &tenant_id,
         &project_id,
         &artifact_id,
-        &playground_id,
+        &workspace_id,
     )
     .await;
     let index_key = IndexKey {
         tenant_id: tenant_id.clone(),
         project_id: project_id.clone(),
         artifact_id: artifact_id.clone(),
-        playground_id: playground_id.clone(),
+        workspace_id: workspace_id.clone(),
     };
     let initial_files = [("dataset/delete.bin", 11, 20), ("dataset/keep.bin", 12, 10)];
     let initial_records = file_records(&initial_files);
@@ -72,7 +73,7 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
             tenant_id: tenant_id.clone(),
             project_id: project_id.clone(),
             artifact_id: artifact_id.clone(),
-            playground_id: playground_id.clone(),
+            workspace_id: workspace_id.clone(),
             precommit_id: precommit_id.clone(),
             precommit_request_id: RequestId::new("precommit-request-a").unwrap(),
             source_index_version: source.clone(),
@@ -90,7 +91,7 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
                 tenant_id.clone(),
                 project_id.clone(),
                 artifact_id.clone(),
-                playground_id.clone(),
+                workspace_id.clone(),
                 job_id,
                 source.clone(),
             ))
@@ -105,8 +106,8 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
             [tenant_id.to_string()],
             [
                 Permission::ArtifactRead,
-                Permission::PlaygroundCreate,
-                Permission::PlaygroundRead,
+                Permission::WorkspaceCreate,
+                Permission::WorkspaceRead,
                 Permission::SnapshotCreate,
             ],
         )
@@ -120,11 +121,11 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
     .unwrap();
     let identity =
         AuthenticatedIdentity::new("user-a", PrincipalKind::User, "test", "subject-a").unwrap();
-    let request = CommitPlaygroundRequest {
+    let request = CommitWorkspaceRequest {
         tenant_id: tenant_id.to_string(),
         project_id: project_id.to_string(),
         artifact_id: artifact_id.to_string(),
-        playground_id: playground_id.to_string(),
+        workspace_id: workspace_id.to_string(),
         commit_request_id: "commit-request-a".to_owned(),
         precommit_id: precommit_id.to_string(),
         expected_candidate_index_version: IndexVersionBody {
@@ -138,7 +139,7 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
     };
 
     let committed = service
-        .commit_playground(&identity, request.clone())
+        .commit_workspace(&identity, request.clone())
         .await
         .unwrap();
     assert!(!committed.replayed);
@@ -160,15 +161,15 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
         .await
         .unwrap()
         .unwrap();
-    let playground = components
+    let workspace = components
         .control_catalog
-        .get_playground(&tenant_id, &project_id, &artifact_id, &playground_id)
+        .get_workspace(&tenant_id, &project_id, &artifact_id, &workspace_id)
         .await
         .unwrap()
         .unwrap();
     let commit_digest: ContentDigest = committed.commit.commit_id.into();
     assert_eq!(artifact.head_commit_id, Some(commit_digest));
-    assert_eq!(playground.head_commit_id, Some(commit_digest));
+    assert_eq!(workspace.head_commit_id, Some(commit_digest));
     let placement_repository = components.placement.clone();
     let object_set = placement_repository
         .get_commit_object_set(&tenant_id, &commit_digest)
@@ -228,27 +229,27 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
     .with_precommits(components.precommits.clone())
     .with_coordinator(coordinator)
     .with_storage_availability_provider(Arc::new(ReadyStorageAvailability));
-    let derived_request = CreatePlaygroundRequest {
+    let derived_request = CreateWorkspaceRequest {
         tenant_id: tenant_id.to_string(),
         project_id: project_id.to_string(),
         artifact_id: artifact_id.to_string(),
-        playground_id: "playground-derived".to_owned(),
+        workspace_id: "workspace-derived".to_owned(),
         storage_volume_id: "volume-a".to_owned(),
-        display_name: "Derived Playground".to_owned(),
+        display_name: "Derived Workspace".to_owned(),
         base_commit_id: None,
     };
     let derived = catalog
-        .create_playground(&identity, derived_request.clone())
+        .create_workspace(&identity, derived_request.clone())
         .await
         .unwrap();
-    assert!(!derived.replayed);
-    assert_eq!(derived.playground.state, "creating");
+    assert!(!derived.request_replayed);
+    assert_eq!(derived.workspace.state, "creating");
     assert_eq!(
-        derived.playground.base_commit_id,
+        derived.workspace.base_commit_id,
         Some(commit_digest.to_string())
     );
     assert_eq!(
-        derived.playground.index_version.revision,
+        derived.workspace.index_version.revision,
         committed.commit.index_version.revision.to_string()
     );
     assert_eq!(
@@ -258,7 +259,7 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
                 tenant_id: tenant_id.clone(),
                 project_id: project_id.clone(),
                 artifact_id: artifact_id.clone(),
-                playground_id: PlaygroundId::new("playground-derived").unwrap(),
+                workspace_id: WorkspaceId::new("workspace-derived").unwrap(),
             })
             .await
             .unwrap()
@@ -271,7 +272,7 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
         .unwrap()
         .into_iter()
         .find(|job| job.operation == JobOperation::WorkspaceMaterialize)
-        .expect("derived Playground materialization Job");
+        .expect("derived Workspace materialization Job");
     let materialization_spec = materialization.workspace_spec.unwrap();
     assert_eq!(materialization_spec.base_commit_id, Some(commit_digest));
     assert_eq!(
@@ -279,11 +280,11 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
         Some(committed.commit.index_version.clone())
     );
 
-    let change_request = QueryPlaygroundChangeListRequest {
+    let change_request = QueryWorkspaceChangeListRequest {
         tenant_id: tenant_id.to_string(),
         project_id: project_id.to_string(),
         artifact_id: artifact_id.to_string(),
-        playground_id: playground_id.to_string(),
+        workspace_id: workspace_id.to_string(),
         precommit_id: None,
         change_type: None,
         path_prefix: None,
@@ -291,7 +292,7 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
         page_size: Some(50),
     };
     let unchanged = catalog
-        .query_playground_change_list(&identity, change_request.clone())
+        .query_workspace_change_list(&identity, change_request.clone())
         .await
         .unwrap();
     assert!(unchanged.items.is_empty());
@@ -308,7 +309,7 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
     )
     .await;
     let changed = catalog
-        .query_playground_change_list(&identity, change_request)
+        .query_workspace_change_list(&identity, change_request)
         .await
         .unwrap();
     assert_eq!(
@@ -330,7 +331,7 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
     assert_eq!(changed.summary.bytes_removed, "20");
 
     let replay = service
-        .commit_playground(&identity, request.clone())
+        .commit_workspace(&identity, request.clone())
         .await
         .unwrap();
     assert!(replay.replayed);
@@ -339,7 +340,7 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
     let mut reused_identity = request;
     reused_identity.message = "Publish a different workspace".to_owned();
     let conflict = service
-        .commit_playground(&identity, reused_identity)
+        .commit_workspace(&identity, reused_identity)
         .await
         .unwrap_err();
     assert_eq!(conflict.category(), ErrorCategory::Conflict);
@@ -352,7 +353,7 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
             tenant_id: tenant_id.clone(),
             project_id: project_id.clone(),
             artifact_id: artifact_id.clone(),
-            playground_id: playground_id.clone(),
+            workspace_id: workspace_id.clone(),
         })
         .await
         .unwrap();
@@ -364,7 +365,7 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
             tenant_id: tenant_id.clone(),
             project_id: project_id.clone(),
             artifact_id: artifact_id.clone(),
-            playground_id: playground_id.clone(),
+            workspace_id: workspace_id.clone(),
             precommit_id: second_precommit_id.clone(),
             precommit_request_id: RequestId::new("precommit-request-b").unwrap(),
             source_index_version: second_source.clone(),
@@ -381,20 +382,20 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
             tenant_id.clone(),
             project_id.clone(),
             artifact_id.clone(),
-            playground_id.clone(),
+            workspace_id.clone(),
             second_job_id,
             second_source.clone(),
         ))
         .await
         .unwrap();
     let second_committed = service
-        .commit_playground(
+        .commit_workspace(
             &identity,
-            CommitPlaygroundRequest {
+            CommitWorkspaceRequest {
                 tenant_id: tenant_id.to_string(),
                 project_id: project_id.to_string(),
                 artifact_id: artifact_id.to_string(),
-                playground_id: playground_id.to_string(),
+                workspace_id: workspace_id.to_string(),
                 commit_request_id: "commit-request-b".to_owned(),
                 precommit_id: second_precommit_id.to_string(),
                 expected_candidate_index_version: IndexVersionBody {
@@ -456,22 +457,22 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
     );
     assert!(graph_second.graph.next_cursor.is_none());
 
-    let historical_request = CreatePlaygroundRequest {
+    let historical_request = CreateWorkspaceRequest {
         tenant_id: tenant_id.to_string(),
         project_id: project_id.to_string(),
         artifact_id: artifact_id.to_string(),
-        playground_id: "playground-historical".to_owned(),
+        workspace_id: "workspace-historical".to_owned(),
         storage_volume_id: "volume-a".to_owned(),
-        display_name: "Historical Playground".to_owned(),
+        display_name: "Historical Workspace".to_owned(),
         base_commit_id: Some(committed.commit.commit_id.to_string()),
     };
     let historical = catalog
-        .create_playground(&identity, historical_request.clone())
+        .create_workspace(&identity, historical_request.clone())
         .await
         .unwrap();
-    assert!(!historical.replayed);
+    assert!(!historical.request_replayed);
     assert_eq!(
-        historical.playground.base_commit_id,
+        historical.workspace.base_commit_id,
         Some(committed.commit.commit_id.to_string())
     );
     assert_eq!(
@@ -481,7 +482,7 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
                 tenant_id: tenant_id.clone(),
                 project_id: project_id.clone(),
                 artifact_id: artifact_id.clone(),
-                playground_id: PlaygroundId::new("playground-historical").unwrap(),
+                workspace_id: WorkspaceId::new("workspace-historical").unwrap(),
             })
             .await
             .unwrap()
@@ -490,10 +491,10 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
     );
     assert!(
         catalog
-            .create_playground(&identity, historical_request)
+            .create_workspace(&identity, historical_request)
             .await
             .unwrap()
-            .replayed
+            .request_replayed
     );
 
     components
@@ -526,23 +527,23 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
         })
         .await
         .unwrap();
-    let cross_volume_playground = catalog
-        .create_playground(
+    let cross_volume_workspace = catalog
+        .create_workspace(
             &identity,
-            CreatePlaygroundRequest {
+            CreateWorkspaceRequest {
                 tenant_id: tenant_id.to_string(),
                 project_id: project_id.to_string(),
                 artifact_id: artifact_id.to_string(),
-                playground_id: "playground-cross-volume".to_owned(),
+                workspace_id: "workspace-cross-volume".to_owned(),
                 storage_volume_id: "volume-b".to_owned(),
-                display_name: "Cross-volume Playground".to_owned(),
+                display_name: "Cross-volume Workspace".to_owned(),
                 base_commit_id: Some(committed.commit.commit_id.to_string()),
             },
         )
         .await
         .unwrap();
     assert_eq!(
-        cross_volume_playground.playground.storage_volume_id,
+        cross_volume_workspace.workspace.storage_volume_id,
         "volume-b"
     );
     // Workspace creation may target any ready Volume. Hydration resolves a readable Commit
@@ -624,16 +625,16 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
         .unwrap_err();
     assert_eq!(unscoped.code().as_str(), "resource_not_found");
 
-    let historical_playground_id = PlaygroundId::new("playground-historical").unwrap();
+    let historical_workspace_id = WorkspaceId::new("workspace-historical").unwrap();
     components
         .control_catalog
-        .transition_playground_state(
+        .transition_workspace_state(
             &tenant_id,
             &project_id,
             &artifact_id,
-            &historical_playground_id,
-            neoengram_central::PlaygroundState::Creating,
-            neoengram_central::PlaygroundState::Ready,
+            &historical_workspace_id,
+            neoengram_central::WorkspaceState::Creating,
+            neoengram_central::WorkspaceState::Ready,
             components.clock.now(),
         )
         .await
@@ -645,7 +646,7 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
             tenant_id: tenant_id.clone(),
             project_id: project_id.clone(),
             artifact_id: artifact_id.clone(),
-            playground_id: historical_playground_id.clone(),
+            workspace_id: historical_workspace_id.clone(),
         })
         .await
         .unwrap();
@@ -657,7 +658,7 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
             tenant_id: tenant_id.clone(),
             project_id: project_id.clone(),
             artifact_id: artifact_id.clone(),
-            playground_id: historical_playground_id.clone(),
+            workspace_id: historical_workspace_id.clone(),
             precommit_id: branch_precommit_id.clone(),
             precommit_request_id: RequestId::new("precommit-request-branch").unwrap(),
             source_index_version: branch_source.clone(),
@@ -674,20 +675,20 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
             tenant_id.clone(),
             project_id.clone(),
             artifact_id.clone(),
-            historical_playground_id.clone(),
+            historical_workspace_id.clone(),
             branch_job_id,
             branch_source.clone(),
         ))
         .await
         .unwrap();
     let branch_commit = service
-        .commit_playground(
+        .commit_workspace(
             &identity,
-            CommitPlaygroundRequest {
+            CommitWorkspaceRequest {
                 tenant_id: tenant_id.to_string(),
                 project_id: project_id.to_string(),
                 artifact_id: artifact_id.to_string(),
-                playground_id: historical_playground_id.to_string(),
+                workspace_id: historical_workspace_id.to_string(),
                 commit_request_id: "commit-request-branch".to_owned(),
                 precommit_id: branch_precommit_id.to_string(),
                 expected_candidate_index_version: IndexVersionBody {
@@ -709,13 +710,13 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
     assert_eq!(
         components
             .control_catalog
-            .get_playground(&tenant_id, &project_id, &artifact_id, &playground_id)
+            .get_workspace(&tenant_id, &project_id, &artifact_id, &workspace_id)
             .await
             .unwrap()
             .unwrap()
             .head_commit_id,
         Some(second_committed.commit.commit_id.into()),
-        "publishing a sibling must not move another Playground"
+        "publishing a sibling must not move another Workspace"
     );
     let branched_graph = catalog
         .query_artifact_commit_graph(
@@ -745,10 +746,10 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
     }));
 
     let mut unknown_commit = derived_request.clone();
-    unknown_commit.playground_id = "playground-unknown-commit".to_owned();
+    unknown_commit.workspace_id = "workspace-unknown-commit".to_owned();
     unknown_commit.base_commit_id = Some("bb".repeat(32));
     let unknown_error = catalog
-        .create_playground(&identity, unknown_commit)
+        .create_workspace(&identity, unknown_commit)
         .await
         .unwrap_err();
     assert_eq!(unknown_error.category(), ErrorCategory::NotFound);
@@ -773,10 +774,10 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
         .unwrap();
     let mut cross_artifact = derived_request.clone();
     cross_artifact.artifact_id = "artifact-b".to_owned();
-    cross_artifact.playground_id = "playground-cross-artifact".to_owned();
+    cross_artifact.workspace_id = "workspace-cross-artifact".to_owned();
     cross_artifact.base_commit_id = Some(committed.commit.commit_id.to_string());
     let cross_error = catalog
-        .create_playground(&identity, cross_artifact)
+        .create_workspace(&identity, cross_artifact)
         .await
         .unwrap_err();
     assert_eq!(cross_error.category(), ErrorCategory::NotFound);
@@ -785,11 +786,11 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
     let next_head = ContentDigest::from_bytes([0xee; 32]);
     components
         .control_catalog
-        .advance_playground_commit(AdvancePlaygroundCommitRequest {
+        .advance_workspace_commit(AdvanceWorkspaceCommitRequest {
             tenant_id: tenant_id.clone(),
             project_id: project_id.clone(),
             artifact_id: artifact_id.clone(),
-            playground_id,
+            workspace_id,
             expected_head_commit_id: Some(second_committed.commit.commit_id.into()),
             commit_id: next_head,
             updated_at_unix_ms: UnixMillis::new(5_002),
@@ -812,12 +813,12 @@ async fn commit_consumes_frozen_candidate_and_publishes_both_heads() {
     assert_eq!(stale_cursor.category(), ErrorCategory::Conflict);
     assert_eq!(stale_cursor.code().as_str(), "cursor_scope_conflict");
     let replayed_derived = catalog
-        .create_playground(&identity, derived_request)
+        .create_workspace(&identity, derived_request)
         .await
         .unwrap();
-    assert!(replayed_derived.replayed);
+    assert!(replayed_derived.request_replayed);
     assert_eq!(
-        replayed_derived.playground.base_commit_id,
+        replayed_derived.workspace.base_commit_id,
         Some(commit_digest.to_string())
     );
 }
@@ -828,13 +829,13 @@ async fn commit_graph_exposes_only_commits_that_reached_a_published_head() {
     let tenant_id = TenantId::new("tenant-a").unwrap();
     let project_id = ProjectId::new("project-a").unwrap();
     let artifact_id = ArtifactId::new("artifact-a").unwrap();
-    let playground_id = PlaygroundId::new("playground-a").unwrap();
+    let workspace_id = WorkspaceId::new("workspace-a").unwrap();
     seed_catalog(
         &components,
         &tenant_id,
         &project_id,
         &artifact_id,
-        &playground_id,
+        &workspace_id,
     )
     .await;
 
@@ -844,7 +845,7 @@ async fn commit_graph_exposes_only_commits_that_reached_a_published_head() {
             tenant_id: tenant_id.clone(),
             project_id: project_id.clone(),
             artifact_id: artifact_id.clone(),
-            playground_id: playground_id.clone(),
+            workspace_id: workspace_id.clone(),
         })
         .await
         .unwrap();
@@ -858,7 +859,7 @@ async fn commit_graph_exposes_only_commits_that_reached_a_published_head() {
             tenant_id: tenant_id.clone(),
             project_id: project_id.clone(),
             artifact_id: artifact_id.clone(),
-            playground_id: playground_id.clone(),
+            workspace_id: workspace_id.clone(),
             precommit_id: precommit_id.clone(),
             precommit_request_id: RequestId::new("precommit-request-publication-window").unwrap(),
             source_index_version: source.clone(),
@@ -876,7 +877,7 @@ async fn commit_graph_exposes_only_commits_that_reached_a_published_head() {
                 tenant_id.clone(),
                 project_id.clone(),
                 artifact_id.clone(),
-                playground_id.clone(),
+                workspace_id.clone(),
                 job_id,
                 source.clone(),
             ),
@@ -907,7 +908,7 @@ async fn commit_graph_exposes_only_commits_that_reached_a_published_head() {
                 tenant_id: tenant_id.clone(),
                 project_id: project_id.clone(),
                 artifact_id: artifact_id.clone(),
-                source_playground_id: playground_id.clone(),
+                source_workspace_id: workspace_id.clone(),
                 source_precommit_id: precommit_id,
                 commit_request_id: RequestId::new("commit-request-publication-window").unwrap(),
                 commit_id,
@@ -936,7 +937,7 @@ async fn commit_graph_exposes_only_commits_that_reached_a_published_head() {
             [tenant_id.to_string()],
             [
                 Permission::ArtifactRead,
-                Permission::PlaygroundCreate,
+                Permission::WorkspaceCreate,
                 Permission::SnapshotCreate,
             ],
         )
@@ -966,14 +967,14 @@ async fn commit_graph_exposes_only_commits_that_reached_a_published_head() {
         .unwrap();
     assert!(authority_only.graph.nodes.is_empty());
 
-    let unpublished_playground = catalog
-        .create_playground(
+    let unpublished_workspace = catalog
+        .create_workspace(
             &identity,
-            CreatePlaygroundRequest {
+            CreateWorkspaceRequest {
                 tenant_id: tenant_id.to_string(),
                 project_id: project_id.to_string(),
                 artifact_id: artifact_id.to_string(),
-                playground_id: "playground-unpublished-base".to_owned(),
+                workspace_id: "workspace-unpublished-base".to_owned(),
                 storage_volume_id: "volume-a".to_owned(),
                 display_name: "Unpublished base".to_owned(),
                 base_commit_id: Some(commit_id.to_string()),
@@ -981,7 +982,7 @@ async fn commit_graph_exposes_only_commits_that_reached_a_published_head() {
         )
         .await
         .unwrap_err();
-    assert_eq!(unpublished_playground.code().as_str(), "resource_not_found");
+    assert_eq!(unpublished_workspace.code().as_str(), "resource_not_found");
     let unpublished_snapshot = catalog
         .create_snapshot(
             &identity,
@@ -1002,11 +1003,11 @@ async fn commit_graph_exposes_only_commits_that_reached_a_published_head() {
 
     components
         .control_catalog
-        .advance_playground_commit(AdvancePlaygroundCommitRequest {
+        .advance_workspace_commit(AdvanceWorkspaceCommitRequest {
             tenant_id,
             project_id,
             artifact_id,
-            playground_id,
+            workspace_id,
             expected_head_commit_id: None,
             commit_id: commit_id.into(),
             updated_at_unix_ms: UnixMillis::new(4_300),
@@ -1039,13 +1040,13 @@ async fn commit_hides_cross_tenant_scope_behind_the_same_not_found_contract() {
     let tenant_id = TenantId::new("tenant-a").unwrap();
     let project_id = ProjectId::new("project-a").unwrap();
     let artifact_id = ArtifactId::new("artifact-a").unwrap();
-    let playground_id = PlaygroundId::new("playground-a").unwrap();
+    let workspace_id = WorkspaceId::new("workspace-a").unwrap();
     seed_catalog(
         &components,
         &tenant_id,
         &project_id,
         &artifact_id,
-        &playground_id,
+        &workspace_id,
     )
     .await;
     let source = components
@@ -1054,7 +1055,7 @@ async fn commit_hides_cross_tenant_scope_behind_the_same_not_found_contract() {
             tenant_id: tenant_id.clone(),
             project_id: project_id.clone(),
             artifact_id: artifact_id.clone(),
-            playground_id: playground_id.clone(),
+            workspace_id: workspace_id.clone(),
         })
         .await
         .unwrap();
@@ -1062,7 +1063,7 @@ async fn commit_hides_cross_tenant_scope_behind_the_same_not_found_contract() {
         StaticRbacPolicy::one_principal(
             "user-a",
             ["tenant-b".to_owned()],
-            [Permission::PlaygroundCreate],
+            [Permission::WorkspaceCreate],
         )
         .unwrap(),
     );
@@ -1074,11 +1075,11 @@ async fn commit_hides_cross_tenant_scope_behind_the_same_not_found_contract() {
     .unwrap();
     let identity =
         AuthenticatedIdentity::new("user-a", PrincipalKind::User, "test", "subject-a").unwrap();
-    let request = CommitPlaygroundRequest {
+    let request = CommitWorkspaceRequest {
         tenant_id: tenant_id.to_string(),
         project_id: project_id.to_string(),
         artifact_id: artifact_id.to_string(),
-        playground_id: playground_id.to_string(),
+        workspace_id: workspace_id.to_string(),
         commit_request_id: "commit-request-hidden".to_owned(),
         precommit_id: "precommit-hidden".to_owned(),
         expected_candidate_index_version: IndexVersionBody {
@@ -1092,13 +1093,13 @@ async fn commit_hides_cross_tenant_scope_behind_the_same_not_found_contract() {
     };
 
     let hidden = service
-        .commit_playground(&identity, request.clone())
+        .commit_workspace(&identity, request.clone())
         .await
         .unwrap_err();
     let mut absent_but_visible = request;
     absent_but_visible.tenant_id = "tenant-b".to_owned();
     let absent = service
-        .commit_playground(&identity, absent_but_visible)
+        .commit_workspace(&identity, absent_but_visible)
         .await
         .unwrap_err();
 
@@ -1113,7 +1114,7 @@ async fn seed_catalog(
     tenant_id: &TenantId,
     project_id: &ProjectId,
     artifact_id: &ArtifactId,
-    playground_id: &PlaygroundId,
+    workspace_id: &WorkspaceId,
 ) {
     components
         .control_catalog
@@ -1177,20 +1178,20 @@ async fn seed_catalog(
         .unwrap();
     components
         .control_catalog
-        .insert_playground(neoengram_central::PlaygroundRecord {
+        .insert_workspace(neoengram_central::WorkspaceRecord {
             tenant_id: tenant_id.clone(),
             project_id: project_id.clone(),
             artifact_id: artifact_id.clone(),
-            playground_id: playground_id.clone(),
+            workspace_id: workspace_id.clone(),
             storage_volume_id: volume_id,
             region: "local".to_owned(),
-            display_name: "Playground".to_owned(),
+            display_name: "Workspace".to_owned(),
             base_commit_id: None,
             head_commit_id: None,
-            state: neoengram_central::PlaygroundState::Ready,
+            state: neoengram_central::WorkspaceState::Ready,
             resource_version: 1,
             lifecycle: neoengram_domain::protocol::ResourceLifecycle::active(),
-            relative_root: "playgrounds/project-a/artifact-a/playground-a".to_owned(),
+            relative_root: "workspaces/project-a/artifact-a/workspace-a".to_owned(),
             created_at_unix_ms: UnixMillis::new(1_300),
             updated_at_unix_ms: UnixMillis::new(1_300),
         })
@@ -1202,7 +1203,7 @@ fn succeeded_job(
     tenant_id: TenantId,
     project_id: ProjectId,
     artifact_id: ArtifactId,
-    playground_id: PlaygroundId,
+    workspace_id: WorkspaceId,
     job_id: JobId,
     expected_index_version: neoengram_domain::protocol::WireIndexVersion,
 ) -> JobRecord {
@@ -1217,13 +1218,14 @@ fn succeeded_job(
             tenant_id,
             project_id,
             artifact_id,
-            playground_id,
+            workspace_id,
             expected_index_version: expected_index_version.clone(),
             data_layout: neoengram_domain::protocol::CommitDataLayout::FastCdc,
             request_digest: ContentDigest::from_bytes([3; 32]),
             deadline_unix_ms: UnixMillis::new(10_000),
             paths: Vec::new(),
             all: true,
+            operation_task_id: None,
             extensions: Extensions::new(),
         },
         operation: JobOperation::Add,
@@ -1240,6 +1242,13 @@ fn succeeded_job(
         publication_candidate: None,
         decision: Some(JobDecision {
             job_id,
+            task_fence: TaskExecutionFence::new(
+                TaskId::new("task-precommit-job").unwrap(),
+                Generation::new(1),
+                "publish_commit",
+                Generation::new(1),
+                Generation::new(1),
+            ),
             assignment_id: AssignmentId::new("assignment-a").unwrap(),
             assignment_generation: AssignmentGeneration::new(1),
             decision_generation: DecisionGeneration::new(1),

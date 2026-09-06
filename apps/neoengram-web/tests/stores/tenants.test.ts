@@ -22,7 +22,7 @@ describe('Tenant context store', () => {
     const store = useTenantsStore();
     const result = await store.create({ tenant_id: 'tenant-new', display_name: '新租户' });
 
-    expect(result.data.replayed).toBe(false);
+    expect(result.data.request_replayed).toBe(false);
     expect(store.byId('tenant-new')?.display_name).toBe('新租户');
     expect(store.lastTenantId).toBe('tenant-new');
   });

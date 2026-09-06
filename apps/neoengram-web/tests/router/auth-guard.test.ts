@@ -69,9 +69,8 @@ describe('OIDC route guard', () => {
   it.each([
     {
       directLink:
-        '/tenants/tenant-a/projects/project-a/artifacts/artifact-a/playgrounds/playground-a/commit',
-      fallback:
-        '/tenants/tenant-a/projects/project-a/artifacts/artifact-a/playgrounds/playground-a',
+        '/tenants/tenant-a/projects/project-a/artifacts/artifact-a/workspaces/workspace-a/commit',
+      fallback: '/tenants/tenant-a/projects/project-a/artifacts/artifact-a/workspaces/workspace-a',
     },
     {
       directLink: '/tenants/tenant-a/snapshots',

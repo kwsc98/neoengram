@@ -8,14 +8,14 @@ import type {
   ArtifactView,
   CancelPreCommitRequest,
   CancelPreCommitResponse,
-  CommitPlaygroundRequest,
-  CommitPlaygroundResponse,
+  CommitWorkspaceRequest,
+  CommitWorkspaceResponse,
   CommitDiffEntry,
   CommitNode,
   CreateArtifactRequest,
   CreateArtifactResponse,
-  CreatePlaygroundRequest,
-  CreatePlaygroundResponse,
+  CreateWorkspaceRequest,
+  CreateWorkspaceResponse,
   CreateProjectRequest,
   CreateProjectResponse,
   CreateSnapshotRequest,
@@ -43,18 +43,18 @@ import type {
   QueryArtifactListResponse,
   QueryArtifactCommitDiffResponse,
   QueryArtifactResponse,
-  QueryPlaygroundListRequest,
-  QueryPlaygroundListResponse,
-  QueryPlaygroundChangeListRequest,
-  QueryPlaygroundChangeListResponse,
-  QueryPlaygroundDatasetProfileRequest,
-  QueryPlaygroundDatasetProfileResponse,
-  QueryPlaygroundFileListRequest,
-  QueryPlaygroundFileListResponse,
-  QueryPlaygroundFileMetadataRequest,
-  QueryPlaygroundFileMetadataResponse,
+  QueryWorkspaceListRequest,
+  QueryWorkspaceListResponse,
+  QueryWorkspaceChangeListRequest,
+  QueryWorkspaceChangeListResponse,
+  QueryWorkspaceDatasetProfileRequest,
+  QueryWorkspaceDatasetProfileResponse,
+  QueryWorkspaceFileListRequest,
+  QueryWorkspaceFileListResponse,
+  QueryWorkspaceFileMetadataRequest,
+  QueryWorkspaceFileMetadataResponse,
   QueryPreCommitResponse,
-  QueryPlaygroundResponse,
+  QueryWorkspaceResponse,
   QueryProjectListRequest,
   QueryProjectListResponse,
   QuerySnapshotListRequest,
@@ -145,7 +145,7 @@ import {
   artifacts,
   commitGraphs,
   gatewayPools,
-  playgrounds,
+  workspaces,
   projects,
   resourceKey,
   resetMockData,
@@ -175,6 +175,7 @@ interface MockMaterializationRecord {
   artifact_id?: string;
   commit_id: string;
   target_storage_volume_id: string;
+  purpose: CreateCommitMaterializationRequest['purpose'];
   attempt: string;
   state: MaterializationView['state'];
   object_set_digest: string;
@@ -233,10 +234,10 @@ const storageEnrollmentReviewAudit = new Map<string, string>();
 const pvcBindings = new Map<string, PvcBinding>();
 const activePvcOwners = new Map<string, PvcOwner>();
 const artifactCreatePayloads = new Map<string, string>();
-const playgroundQueryCounts = new Map<string, number>();
+const workspaceQueryCounts = new Map<string, number>();
 const commitRequests = new Map<
   string,
-  { requestJson: string; response: CommitPlaygroundResponse }
+  { requestJson: string; response: CommitWorkspaceResponse }
 >();
 const precommits = new Map<string, PreCommitView>();
 const precommitQueryCounts = new Map<string, number>();
@@ -325,6 +326,7 @@ function toMaterializationView(value: MockMaterializationRecord): Materializatio
     object_namespace_id: objectNamespaceId,
     commit_id: value.commit_id,
     target_storage_volume_id: value.target_storage_volume_id,
+    purpose: value.purpose,
     plan_revision: value.attempt,
     coverage_goal: 'complete',
     state: value.state,
@@ -371,16 +373,85 @@ function taskStateForMaterialization(state: MaterializationView['state']): TaskV
 function taskFromMaterialization(value: MockMaterializationRecord, requestId: string): TaskView {
   const materialization = toMaterializationView(value);
   const state = taskStateForMaterialization(materialization.state);
+  const now = String(Date.now());
+  const stageKeys = ['validate', 'plan', 'transfer', 'verify', 'publish_coverage', 'finalize'];
+  const activeIndex = state === 'succeeded' || state === 'failed' || state === 'cancelled' ? 5 : 2;
+  const stages: TaskView['stages'] = stageKeys.map((stageKey, index) => {
+    const stageState: TaskView['stages'][number]['state'] =
+      index < activeIndex
+        ? 'succeeded'
+        : index === activeIndex
+          ? state === 'succeeded'
+            ? 'succeeded'
+            : state === 'queued'
+              ? 'ready'
+              : state
+          : 'pending';
+    return {
+      stage_key: stageKey,
+      stage_kind: stageKey,
+      ordinal: String(index + 1),
+      dependencies: index === 0 ? [] : [stageKeys[index - 1]!],
+      state: stageState,
+      stage_attempt: materialization.plan_revision,
+      ...(stageState === 'succeeded' ? { outcome: 'succeeded' as const } : {}),
+      progress: {
+        completed: materialization.verified_objects,
+        total: materialization.total_objects,
+        completed_bytes: materialization.verified_bytes,
+        total_bytes: materialization.total_bytes,
+      },
+      created_at_unix_ms: now,
+      updated_at_unix_ms: now,
+      resource_version: '1',
+    };
+  });
   return {
     task_id: materialization.materialization_id,
-    task_kind: 'commit.materialize',
+    intent_kind: 'commit.materialize',
+    purpose: materialization.purpose,
     state,
-    phase: materialization.state,
     tenant_id: materialization.tenant_id,
-    ...(materialization.artifact_id ? { artifact_id: materialization.artifact_id } : {}),
-    object_namespace_id: materialization.object_namespace_id,
-    commit_id: materialization.commit_id,
-    storage_volume_id: materialization.target_storage_volume_id,
+    primary_resource: {
+      resource_kind: 'materialization',
+      resource_id: materialization.materialization_id,
+    },
+    resource_links: [
+      ...(materialization.artifact_id
+        ? [
+            {
+              resource_kind: 'artifact',
+              resource_id: materialization.artifact_id,
+              role: 'related' as const,
+            },
+          ]
+        : []),
+      {
+        resource_kind: 'object_namespace',
+        resource_id: materialization.object_namespace_id,
+        role: 'related' as const,
+      },
+      { resource_kind: 'commit', resource_id: materialization.commit_id, role: 'source' as const },
+      {
+        resource_kind: 'storage_volume',
+        resource_id: materialization.target_storage_volume_id,
+        role: 'target' as const,
+      },
+    ],
+    execution_id: `execution-${materialization.materialization_id}`,
+    execution_key_digest: materialization.object_set_digest,
+    execution_reused: false,
+    current_stage: stages[activeIndex]!,
+    stages,
+    ...(state === 'succeeded' || state === 'failed' || state === 'cancelled'
+      ? {
+          completion: {
+            outcome:
+              state === 'succeeded' ? 'succeeded' : state === 'cancelled' ? 'cancelled' : 'failed',
+            finished_at_unix_ms: now,
+          },
+        }
+      : {}),
     request_id: requestId,
     request_digest: materialization.object_set_digest,
     actor: 'mock-central',
@@ -391,8 +462,6 @@ function taskFromMaterialization(value: MockMaterializationRecord, requestId: st
       completed_bytes: materialization.verified_bytes,
       total_bytes: materialization.total_bytes,
     },
-    detail_kind: 'materialization',
-    detail_id: materialization.materialization_id,
     deadline_unix_ms: String(Date.now() + 60 * 60 * 1000),
     ...(materialization.issue
       ? {
@@ -403,8 +472,8 @@ function taskFromMaterialization(value: MockMaterializationRecord, requestId: st
           },
         }
       : {}),
-    created_at_unix_ms: String(Date.now()),
-    updated_at_unix_ms: String(Date.now()),
+    created_at_unix_ms: now,
+    updated_at_unix_ms: now,
     resource_version: '1',
     origin: 'user',
     executable: true,
@@ -437,6 +506,16 @@ function appendTaskEvent(
   taskEvents.set(key, events);
 }
 
+function taskResourceMatches(task: TaskView, resourceKind: string, resourceId: string): boolean {
+  return (
+    (task.primary_resource.resource_kind === resourceKind &&
+      task.primary_resource.resource_id === resourceId) ||
+    task.resource_links.some(
+      (link) => link.resource_kind === resourceKind && link.resource_id === resourceId,
+    )
+  );
+}
+
 function storeMaterializationTask(
   materialization: MockMaterializationRecord,
   requestId: string,
@@ -461,7 +540,7 @@ function storeMaterializationTask(
       task_id: next.task_id,
       attempt: next.attempt,
       state: next.state,
-      phase: next.phase,
+      current_stage_key: next.current_stage.stage_key,
       created_at_unix_ms: next.created_at_unix_ms,
       updated_at_unix_ms: next.updated_at_unix_ms,
       resource_version: '1',
@@ -605,16 +684,18 @@ function activeLifecycle(): ResourceLifecycleView {
 
 function resourceIdentity(resource: ResourceRef): string {
   switch (resource.type) {
+    case 'project':
+      return resourceKey(resource.type, resource.project_id);
     case 'storage_volume':
       return resourceKey(resource.type, resource.storage_volume_id);
     case 'artifact':
       return resourceKey(resource.type, resource.project_id, resource.artifact_id);
-    case 'playground':
+    case 'workspace':
       return resourceKey(
         resource.type,
         resource.project_id,
         resource.artifact_id,
-        resource.playground_id,
+        resource.workspace_id,
       );
     case 'snapshot':
       return resourceKey(resource.type, resource.snapshot_id);
@@ -626,6 +707,10 @@ function findLifecycleResource(
   resource: ResourceRef,
 ): LifecycleMockResource | undefined {
   switch (resource.type) {
+    case 'project':
+      return projects.find(
+        (item) => item.tenant_id === tenantId && item.project_id === resource.project_id,
+      );
     case 'storage_volume':
       return storageVolumes.find(
         (item) =>
@@ -638,13 +723,13 @@ function findLifecycleResource(
           item.project_id === resource.project_id &&
           item.artifact_id === resource.artifact_id,
       );
-    case 'playground':
-      return playgrounds.find(
+    case 'workspace':
+      return workspaces.find(
         (item) =>
           item.tenant_id === tenantId &&
           item.project_id === resource.project_id &&
           item.artifact_id === resource.artifact_id &&
-          item.playground_id === resource.playground_id,
+          item.workspace_id === resource.workspace_id,
       );
     case 'snapshot':
       return snapshots.find(
@@ -681,7 +766,7 @@ function deletionTargets(
   const refs: ResourceRef[] = [root];
   if (cascade && root.type === 'artifact') {
     refs.push(
-      ...playgrounds
+      ...workspaces
         .filter(
           (item) =>
             item.tenant_id === tenantId &&
@@ -690,10 +775,10 @@ function deletionTargets(
             isLifecycleActive(item),
         )
         .map((item) => ({
-          type: 'playground' as const,
+          type: 'workspace' as const,
           project_id: item.project_id,
           artifact_id: item.artifact_id,
-          playground_id: item.playground_id,
+          workspace_id: item.workspace_id,
         })),
       ...snapshots
         .filter(
@@ -708,13 +793,13 @@ function deletionTargets(
   }
   if (cascade && root.type === 'storage_volume') {
     refs.push(
-      ...playgrounds
+      ...workspaces
         .filter((item) => item.tenant_id === tenantId && isLifecycleActive(item))
         .map((item) => ({
-          type: 'playground' as const,
+          type: 'workspace' as const,
           project_id: item.project_id,
           artifact_id: item.artifact_id,
-          playground_id: item.playground_id,
+          workspace_id: item.workspace_id,
         })),
       ...snapshots
         .filter((item) => item.tenant_id === tenantId && isLifecycleActive(item))
@@ -1201,21 +1286,21 @@ function seedSnapshotDeliveryState(): void {
 }
 
 function seedPreCommitState(): void {
-  const playground = playgrounds.find(
+  const workspace = workspaces.find(
     (item) =>
       item.tenant_id === 'tenant-a' &&
       item.project_id === 'project-vision' &&
       item.artifact_id === 'quality-reports' &&
-      item.playground_id === 'nightly-review',
+      item.workspace_id === 'nightly-review',
   );
-  if (!playground?.active_precommit_id) return;
-  const key = resourceKey(playground.tenant_id, playground.active_precommit_id);
+  if (!workspace?.active_precommit_id) return;
+  const key = resourceKey(workspace.tenant_id, workspace.active_precommit_id);
   precommits.set(key, {
-    tenant_id: playground.tenant_id,
-    project_id: playground.project_id,
-    artifact_id: playground.artifact_id,
-    playground_id: playground.playground_id,
-    precommit_id: playground.active_precommit_id,
+    tenant_id: workspace.tenant_id,
+    project_id: workspace.project_id,
+    artifact_id: workspace.artifact_id,
+    workspace_id: workspace.workspace_id,
+    precommit_id: workspace.active_precommit_id,
     precommit_request_id: 'precommit-nightly-seeded',
     data_layout: 'fast_cdc',
     attempt: 1,
@@ -1231,12 +1316,12 @@ function seedPreCommitState(): void {
     checks: [],
     warnings: [],
     blockers: [],
-    source_index_version: structuredClone(playground.index_version),
-    created_at_unix_ms: playground.updated_at_unix_ms,
-    updated_at_unix_ms: playground.updated_at_unix_ms,
+    source_index_version: structuredClone(workspace.index_version),
+    created_at_unix_ms: workspace.updated_at_unix_ms,
+    updated_at_unix_ms: workspace.updated_at_unix_ms,
   });
   precommitQueryCounts.set(key, 2);
-  precommitSourceHeads.set(key, playground.head_commit_id ?? null);
+  precommitSourceHeads.set(key, workspace.head_commit_id ?? null);
 }
 
 function mutationConflict(
@@ -1367,7 +1452,7 @@ function diffSummary(changes: CommitDiffEntry[]) {
   };
 }
 
-const mockLogicalFiles: QueryPlaygroundFileListResponse['items'] = [
+const mockLogicalFiles: QueryWorkspaceFileListResponse['items'] = [
   {
     path: 'dataset/night-rain/part-0042.parquet',
     entry_type: 'file',
@@ -1394,7 +1479,7 @@ const mockLogicalFiles: QueryPlaygroundFileListResponse['items'] = [
   },
 ];
 
-const mockPlaygroundChanges: QueryPlaygroundChangeListResponse['items'] = [
+const mockWorkspaceChanges: QueryWorkspaceChangeListResponse['items'] = [
   {
     change_type: 'modified',
     path: 'dataset/index.json',
@@ -1424,7 +1509,7 @@ const mockPlaygroundChanges: QueryPlaygroundChangeListResponse['items'] = [
   },
 ];
 
-const mockDatasetProfile: QueryPlaygroundDatasetProfileResponse['profile'] = {
+const mockDatasetProfile: QueryWorkspaceDatasetProfileResponse['profile'] = {
   state: 'ready',
   summary: {
     format_count: 4,
@@ -1541,9 +1626,9 @@ export const handlers = [
           'artifact_commit_graph',
           'artifact_commit_diff',
           'commit_materialization_v2',
-          'playground_browser',
-          'playground_materialize',
-          'playground_precommit',
+          'workspace_browser',
+          'workspace_materialize',
+          'workspace_precommit',
           'commit_layout_selection_v2',
           'snapshot_delivery_fuse_v2',
           'snapshot_delivery_copy_v2',
@@ -1635,7 +1720,11 @@ export const handlers = [
           'The Tenant ID already belongs to a different create request',
         );
       }
-      const response: CreateTenantResponse = { tenant: existing, replayed: true };
+      const response: CreateTenantResponse = {
+        tenant: existing,
+        request_replayed: true,
+        execution_reused: false,
+      };
       return HttpResponse.json(response, { headers: headers(request) });
     }
     const now = Date.now().toString();
@@ -1659,7 +1748,7 @@ export const handlers = [
         'artifact.commit.replicate',
         'project.read',
         'project.create',
-        'playground.create',
+        'workspace.create',
         'snapshot.create',
         'task.manage',
         'resource.lifecycle.read',
@@ -1669,7 +1758,11 @@ export const handlers = [
     };
     tenants.push(tenant);
     tenantCreatePayloads.set(body.tenant_id, requestJson);
-    const response: CreateTenantResponse = { tenant, replayed: false };
+    const response: CreateTenantResponse = {
+      tenant,
+      request_replayed: false,
+      execution_reused: false,
+    };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
   http.post('*/api/gateway/pool/list/query', async ({ request }) => {
@@ -1805,7 +1898,8 @@ export const handlers = [
       }
       const response: CreateStorageVolumeResponse = {
         storage_volume: existing,
-        replayed: true,
+        request_replayed: true,
+        execution_reused: false,
       };
       return HttpResponse.json(response, { headers: headers(request) });
     }
@@ -1861,7 +1955,8 @@ export const handlers = [
     storageVolumeCreatePayloads.set(key, requestJson);
     const response: CreateStorageVolumeResponse = {
       storage_volume: storageVolume,
-      replayed: false,
+      request_replayed: false,
+      execution_reused: false,
     };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
@@ -1915,7 +2010,7 @@ export const handlers = [
         );
       }
       return HttpResponse.json(
-        { ...structuredClone(previous.response), replayed: true },
+        { ...structuredClone(previous.response), request_replayed: true },
         { headers: headers(request) },
       );
     }
@@ -1969,7 +2064,8 @@ export const handlers = [
       bootstrap_token: `ngenr_v1_${crypto.randomUUID().replaceAll('-', '')}`,
       volume_descriptor_digest: 'd'.repeat(64),
       expires_at_unix_ms: (now + 15 * 60 * 1000).toString(),
-      replayed: false,
+      request_replayed: false,
+      execution_reused: false,
     };
     storageEnrollmentTokenRequests.set(requestKey, {
       requestJson,
@@ -2056,7 +2152,7 @@ export const handlers = [
         );
       }
       return HttpResponse.json(
-        { ...structuredClone(previous.response), replayed: true },
+        { ...structuredClone(previous.response), request_replayed: true },
         { headers: headers(request) },
       );
     }
@@ -2209,7 +2305,8 @@ export const handlers = [
     const response: ApproveStorageEnrollmentResponse = {
       enrollment: structuredClone(enrollment),
       storage_volume: structuredClone(storageVolume),
-      replayed: false,
+      request_replayed: false,
+      execution_reused: false,
     };
     storageEnrollmentDecisionRequests.set(requestKey, {
       kind: 'approve',
@@ -2247,7 +2344,7 @@ export const handlers = [
         );
       }
       return HttpResponse.json(
-        { ...structuredClone(previous.response), replayed: true },
+        { ...structuredClone(previous.response), request_replayed: true },
         { headers: headers(request) },
       );
     }
@@ -2281,7 +2378,8 @@ export const handlers = [
     enrollment.updated_at_unix_ms = now;
     const response: RejectStorageEnrollmentResponse = {
       enrollment: structuredClone(enrollment),
-      replayed: false,
+      request_replayed: false,
+      execution_reused: false,
     };
     storageEnrollmentDecisionRequests.set(requestKey, {
       kind: 'reject',
@@ -2349,7 +2447,8 @@ export const handlers = [
       }
       const response: CreateProjectResponse = {
         project: structuredClone(existing),
-        replayed: true,
+        request_replayed: true,
+        execution_reused: false,
       };
       return HttpResponse.json(response, { headers: headers(request) });
     }
@@ -2360,12 +2459,17 @@ export const handlers = [
       display_name: body.display_name.trim(),
       ...(body.description?.trim() ? { description: body.description.trim() } : {}),
       resource_version: '1',
+      lifecycle: activeLifecycle(),
       created_at_unix_ms: now,
       updated_at_unix_ms: now,
     };
     projects.push(project);
     projectCreatePayloads.set(key, requestJson);
-    const response: CreateProjectResponse = { project, replayed: false };
+    const response: CreateProjectResponse = {
+      project,
+      request_replayed: false,
+      execution_reused: false,
+    };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
   http.post('*/api/artifact/list/query', async ({ request }) => {
@@ -2453,7 +2557,11 @@ export const handlers = [
           'The Artifact ID already belongs to a different create request',
         );
       }
-      const response: CreateArtifactResponse = { artifact: existing, replayed: true };
+      const response: CreateArtifactResponse = {
+        artifact: existing,
+        request_replayed: true,
+        execution_reused: false,
+      };
       return HttpResponse.json(response, { headers: headers(request) });
     }
 
@@ -2473,7 +2581,11 @@ export const handlers = [
     artifacts.push(artifact);
     commitGraphs.set(graphKey, { graph_version: '0', nodes: [] });
     artifactCreatePayloads.set(createKey, requestJson);
-    const response: CreateArtifactResponse = { artifact, replayed: false };
+    const response: CreateArtifactResponse = {
+      artifact,
+      request_replayed: false,
+      execution_reused: false,
+    };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
   http.post('*/api/artifact/commit/graph/query', async ({ request }) => {
@@ -2571,10 +2683,10 @@ export const handlers = [
     };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
-  http.post('*/api/playground/list/query', async ({ request }) => {
+  http.post('*/api/workspace/list/query', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
-    const body = (await request.json()) as QueryPlaygroundListRequest;
+    const body = (await request.json()) as QueryWorkspaceListRequest;
     const failed = requireTenant(request, body.tenant_id);
     if (failed) return failed;
     if (body.artifact_id && !body.project_id) {
@@ -2591,15 +2703,15 @@ export const handlers = [
       );
     }
     const search = body.query?.toLocaleLowerCase('zh-CN');
-    const filtered = playgrounds.filter(
-      (playground) =>
-        playground.tenant_id === body.tenant_id &&
-        isLifecycleActive(playground) &&
-        (!body.project_id || playground.project_id === body.project_id) &&
-        (!body.artifact_id || playground.artifact_id === body.artifact_id) &&
+    const filtered = workspaces.filter(
+      (workspace) =>
+        workspace.tenant_id === body.tenant_id &&
+        isLifecycleActive(workspace) &&
+        (!body.project_id || workspace.project_id === body.project_id) &&
+        (!body.artifact_id || workspace.artifact_id === body.artifact_id) &&
         (!search ||
-          playground.playground_id.toLocaleLowerCase('zh-CN').includes(search) ||
-          playground.display_name.toLocaleLowerCase('zh-CN').includes(search)),
+          workspace.workspace_id.toLocaleLowerCase('zh-CN').includes(search) ||
+          workspace.display_name.toLocaleLowerCase('zh-CN').includes(search)),
     );
     const filters = {
       tenant_id: body.tenant_id,
@@ -2607,50 +2719,50 @@ export const handlers = [
       artifact_id: body.artifact_id ?? '',
       query: body.query ?? '',
     };
-    const page = paginate(request, 'playgrounds', filters, filtered, body);
+    const page = paginate(request, 'workspaces', filters, filtered, body);
     if (page instanceof HttpResponse) return page;
-    const response: QueryPlaygroundListResponse = page;
+    const response: QueryWorkspaceListResponse = page;
     return HttpResponse.json(response, { headers: headers(request) });
   }),
-  http.post('*/api/playground/query', async ({ request }) => {
+  http.post('*/api/workspace/query', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
     const body = (await request.json()) as {
       tenant_id: string;
       project_id: string;
       artifact_id: string;
-      playground_id: string;
+      workspace_id: string;
     };
     const failed = requireTenant(request, body.tenant_id);
     if (failed) return failed;
-    const playground = playgrounds.find(
+    const workspace = workspaces.find(
       (item) =>
         item.tenant_id === body.tenant_id &&
         item.project_id === body.project_id &&
         item.artifact_id === body.artifact_id &&
-        item.playground_id === body.playground_id,
+        item.workspace_id === body.workspace_id,
     );
-    if (!playground) return notFound(request, 'Playground');
-    const playgroundKey = resourceKey(
-      playground.tenant_id,
-      playground.project_id,
-      playground.artifact_id,
-      playground.playground_id,
+    if (!workspace) return notFound(request, 'Workspace');
+    const workspaceKey = resourceKey(
+      workspace.tenant_id,
+      workspace.project_id,
+      workspace.artifact_id,
+      workspace.workspace_id,
     );
     if (
-      playground.state === 'creating' &&
-      completesOnThisQuery(playgroundQueryCounts, playgroundKey)
+      workspace.state === 'creating' &&
+      completesOnThisQuery(workspaceQueryCounts, workspaceKey)
     ) {
-      playground.state = 'ready';
-      playground.updated_at_unix_ms = Date.now().toString();
+      workspace.state = 'ready';
+      workspace.updated_at_unix_ms = Date.now().toString();
     }
-    const response: QueryPlaygroundResponse = { playground };
+    const response: QueryWorkspaceResponse = { workspace };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
-  http.post('*/api/playground/create', async ({ request }) => {
+  http.post('*/api/workspace/create', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
-    const body = (await request.json()) as CreatePlaygroundRequest;
+    const body = (await request.json()) as CreateWorkspaceRequest;
     const failed = requireMutationAccess(request, body.tenant_id);
     if (failed) return failed;
     const artifactKey = resourceKey(body.tenant_id, body.project_id, body.artifact_id);
@@ -2663,13 +2775,13 @@ export const handlers = [
     const graph = commitGraphs.get(artifactKey);
     if (!artifact || !graph) return notFound(request, 'Artifact');
 
-    const key = resourceKey(body.tenant_id, body.project_id, body.artifact_id, body.playground_id);
-    const existing = playgrounds.find(
+    const key = resourceKey(body.tenant_id, body.project_id, body.artifact_id, body.workspace_id);
+    const existing = workspaces.find(
       (item) =>
         item.tenant_id === body.tenant_id &&
         item.project_id === body.project_id &&
         item.artifact_id === body.artifact_id &&
-        item.playground_id === body.playground_id,
+        item.workspace_id === body.workspace_id,
     );
     if (existing) {
       const equivalentExisting =
@@ -2679,11 +2791,15 @@ export const handlers = [
       if (!equivalentExisting) {
         return mutationConflict(
           request,
-          'PLAYGROUND_ID_REUSED',
-          'The Playground ID already belongs to a different create request',
+          'WORKSPACE_ID_REUSED',
+          'The Workspace ID already belongs to a different create request',
         );
       }
-      const response: CreatePlaygroundResponse = { playground: existing, replayed: true };
+      const response: CreateWorkspaceResponse = {
+        workspace: existing,
+        request_replayed: true,
+        execution_reused: false,
+      };
       return HttpResponse.json(response, { headers: headers(request) });
     }
     if (
@@ -2706,11 +2822,11 @@ export const handlers = [
       ? { revision: graph.graph_version, digest: baseCommitId }
       : { revision: '0', digest: '0'.repeat(64) };
     const now = Date.now().toString();
-    const playground = {
+    const workspace = {
       tenant_id: body.tenant_id,
       project_id: body.project_id,
       artifact_id: body.artifact_id,
-      playground_id: body.playground_id,
+      workspace_id: body.workspace_id,
       storage_volume_id: storageVolume.storage_volume_id,
       region: storageVolume.region,
       display_name: body.display_name.trim(),
@@ -2723,40 +2839,44 @@ export const handlers = [
       created_at_unix_ms: now,
       updated_at_unix_ms: now,
     };
-    playgrounds.push(playground);
-    playgroundQueryCounts.set(key, 0);
-    const response: CreatePlaygroundResponse = { playground, replayed: false };
+    workspaces.push(workspace);
+    workspaceQueryCounts.set(key, 0);
+    const response: CreateWorkspaceResponse = {
+      workspace,
+      request_replayed: false,
+      execution_reused: false,
+    };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
-  http.post('*/api/playground/precommit/start', async ({ request }) => {
+  http.post('*/api/workspace/precommit/start', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
     const body = (await request.json()) as StartPreCommitRequest;
     const failed = requireMutationAccess(request, body.tenant_id);
     if (failed) return failed;
-    const playground = playgrounds.find(
+    const workspace = workspaces.find(
       (item) =>
         item.tenant_id === body.tenant_id &&
         item.project_id === body.project_id &&
         item.artifact_id === body.artifact_id &&
-        item.playground_id === body.playground_id,
+        item.workspace_id === body.workspace_id,
     );
-    if (!playground) return notFound(request, 'Playground');
-    if (playground.state !== 'ready' || playground.storage_availability !== 'ready') {
+    if (!workspace) return notFound(request, 'Workspace');
+    if (workspace.state !== 'ready' || workspace.storage_availability !== 'ready') {
       return mutationConflict(
         request,
-        'PLAYGROUND_NOT_READY',
-        'Only a Ready Playground can start Pre-commit',
+        'WORKSPACE_NOT_READY',
+        'Only a Ready Workspace can start Pre-commit',
       );
     }
     if (
-      playground.index_version.revision !== body.expected_index_version.revision ||
-      playground.index_version.digest !== body.expected_index_version.digest
+      workspace.index_version.revision !== body.expected_index_version.revision ||
+      workspace.index_version.digest !== body.expected_index_version.digest
     ) {
       return mutationConflict(
         request,
         'INDEX_VERSION_CONFLICT',
-        'The expected IndexVersion no longer matches the Playground',
+        'The expected IndexVersion no longer matches the Workspace',
       );
     }
 
@@ -2776,14 +2896,19 @@ export const handlers = [
           item.tenant_id === body.tenant_id &&
           item.precommit_request_id === body.precommit_request_id,
       )!;
-      const response: StartPreCommitResponse = { precommit: existing, playground, replayed: true };
+      const response: StartPreCommitResponse = {
+        precommit: existing,
+        workspace,
+        request_replayed: true,
+        execution_reused: false,
+      };
       return HttpResponse.json(response, { headers: headers(request) });
     }
-    if (playground.active_precommit_id) {
+    if (workspace.active_precommit_id) {
       return mutationConflict(
         request,
         'PRECOMMIT_ALREADY_ACTIVE',
-        'The Playground already has an active Pre-commit',
+        'The Workspace already has an active Pre-commit',
       );
     }
 
@@ -2793,7 +2918,7 @@ export const handlers = [
       tenant_id: body.tenant_id,
       project_id: body.project_id,
       artifact_id: body.artifact_id,
-      playground_id: body.playground_id,
+      workspace_id: body.workspace_id,
       precommit_id: precommitId,
       precommit_request_id: body.precommit_request_id,
       data_layout: body.data_layout,
@@ -2811,14 +2936,19 @@ export const handlers = [
     const precommitKey = resourceKey(body.tenant_id, precommitId);
     precommits.set(precommitKey, precommit);
     precommitQueryCounts.set(precommitKey, 0);
-    precommitSourceHeads.set(precommitKey, playground.head_commit_id ?? null);
+    precommitSourceHeads.set(precommitKey, workspace.head_commit_id ?? null);
     precommitMutationRequests.set(requestKey, requestJson);
-    playground.active_precommit_id = precommitId;
-    playground.updated_at_unix_ms = now;
-    const response: StartPreCommitResponse = { precommit, playground, replayed: false };
+    workspace.active_precommit_id = precommitId;
+    workspace.updated_at_unix_ms = now;
+    const response: StartPreCommitResponse = {
+      precommit,
+      workspace,
+      request_replayed: false,
+      execution_reused: false,
+    };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
-  http.post('*/api/playground/precommit/query', async ({ request }) => {
+  http.post('*/api/workspace/precommit/query', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
     const body = (await request.json()) as { tenant_id: string; precommit_id: string };
@@ -2902,7 +3032,7 @@ export const handlers = [
     const response: QueryPreCommitResponse = { precommit };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
-  http.post('*/api/playground/precommit/restart', async ({ request }) => {
+  http.post('*/api/workspace/precommit/restart', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
     const body = (await request.json()) as RestartPreCommitRequest;
@@ -2918,12 +3048,12 @@ export const handlers = [
         'The requested Pre-commit was not found',
       );
     }
-    const playground = playgrounds.find(
+    const workspace = workspaces.find(
       (item) =>
         item.tenant_id === precommit.tenant_id &&
         item.project_id === precommit.project_id &&
         item.artifact_id === precommit.artifact_id &&
-        item.playground_id === precommit.playground_id,
+        item.workspace_id === precommit.workspace_id,
     )!;
     const requestKey = resourceKey(body.tenant_id, 'precommit-restart', body.restart_request_id);
     const requestJson = stableJson(body);
@@ -2936,7 +3066,12 @@ export const handlers = [
       );
     }
     if (priorRequest) {
-      const response: RestartPreCommitResponse = { precommit, playground, replayed: true };
+      const response: RestartPreCommitResponse = {
+        precommit,
+        workspace,
+        request_replayed: true,
+        execution_reused: false,
+      };
       return HttpResponse.json(response, { headers: headers(request) });
     }
     if (!['abnormal', 'cancelled'].includes(precommit.state)) {
@@ -2947,13 +3082,13 @@ export const handlers = [
       );
     }
     if (
-      playground.index_version.revision !== body.expected_index_version.revision ||
-      playground.index_version.digest !== body.expected_index_version.digest
+      workspace.index_version.revision !== body.expected_index_version.revision ||
+      workspace.index_version.digest !== body.expected_index_version.digest
     ) {
       return mutationConflict(
         request,
         'INDEX_VERSION_CONFLICT',
-        'The expected IndexVersion no longer matches the Playground',
+        'The expected IndexVersion no longer matches the Workspace',
       );
     }
     const now = Date.now().toString();
@@ -2971,14 +3106,19 @@ export const handlers = [
     precommit.updated_at_unix_ms = now;
     const precommitKey = resourceKey(body.tenant_id, body.precommit_id);
     precommitQueryCounts.set(precommitKey, 0);
-    precommitSourceHeads.set(precommitKey, playground.head_commit_id ?? null);
-    playground.active_precommit_id = precommit.precommit_id;
-    playground.updated_at_unix_ms = now;
+    precommitSourceHeads.set(precommitKey, workspace.head_commit_id ?? null);
+    workspace.active_precommit_id = precommit.precommit_id;
+    workspace.updated_at_unix_ms = now;
     precommitMutationRequests.set(requestKey, requestJson);
-    const response: RestartPreCommitResponse = { precommit, playground, replayed: false };
+    const response: RestartPreCommitResponse = {
+      precommit,
+      workspace,
+      request_replayed: false,
+      execution_reused: false,
+    };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
-  http.post('*/api/playground/precommit/cancel', async ({ request }) => {
+  http.post('*/api/workspace/precommit/cancel', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
     const body = (await request.json()) as CancelPreCommitRequest;
@@ -2994,12 +3134,12 @@ export const handlers = [
         'The requested Pre-commit was not found',
       );
     }
-    const playground = playgrounds.find(
+    const workspace = workspaces.find(
       (item) =>
         item.tenant_id === precommit.tenant_id &&
         item.project_id === precommit.project_id &&
         item.artifact_id === precommit.artifact_id &&
-        item.playground_id === precommit.playground_id,
+        item.workspace_id === precommit.workspace_id,
     )!;
     const requestKey = resourceKey(body.tenant_id, 'precommit-cancel', body.cancel_request_id);
     const requestJson = stableJson(body);
@@ -3012,7 +3152,12 @@ export const handlers = [
       );
     }
     if (priorRequest) {
-      const response: CancelPreCommitResponse = { precommit, playground, replayed: true };
+      const response: CancelPreCommitResponse = {
+        precommit,
+        workspace,
+        request_replayed: true,
+        execution_reused: false,
+      };
       return HttpResponse.json(response, { headers: headers(request) });
     }
     if (precommit.state === 'committed') {
@@ -3026,18 +3171,23 @@ export const handlers = [
     precommit.state = 'cancelled';
     precommit.phase = 'idle';
     precommit.updated_at_unix_ms = now;
-    if (playground.active_precommit_id === precommit.precommit_id) {
-      delete playground.active_precommit_id;
+    if (workspace.active_precommit_id === precommit.precommit_id) {
+      delete workspace.active_precommit_id;
     }
-    playground.updated_at_unix_ms = now;
+    workspace.updated_at_unix_ms = now;
     precommitMutationRequests.set(requestKey, requestJson);
-    const response: CancelPreCommitResponse = { precommit, playground, replayed: false };
+    const response: CancelPreCommitResponse = {
+      precommit,
+      workspace,
+      request_replayed: false,
+      execution_reused: false,
+    };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
-  http.post('*/api/playground/commit/create', async ({ request }) => {
+  http.post('*/api/workspace/commit/create', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
-    const body = (await request.json()) as CommitPlaygroundRequest;
+    const body = (await request.json()) as CommitWorkspaceRequest;
     const failed = requireMutationAccess(request, body.tenant_id);
     if (failed) return failed;
 
@@ -3053,23 +3203,23 @@ export const handlers = [
         );
       }
       const response = structuredClone(previous.response);
-      response.replayed = true;
+      response.request_replayed = true;
       return HttpResponse.json(response, { headers: headers(request) });
     }
 
-    const playground = playgrounds.find(
+    const workspace = workspaces.find(
       (item) =>
         item.tenant_id === body.tenant_id &&
         item.project_id === body.project_id &&
         item.artifact_id === body.artifact_id &&
-        item.playground_id === body.playground_id,
+        item.workspace_id === body.workspace_id,
     );
-    if (!playground) return notFound(request, 'Playground');
-    if (playground.state !== 'ready') {
+    if (!workspace) return notFound(request, 'Workspace');
+    if (workspace.state !== 'ready') {
       return mutationConflict(
         request,
-        'PLAYGROUND_NOT_READY',
-        'The Playground is not ready to create a Commit',
+        'WORKSPACE_NOT_READY',
+        'The Workspace is not ready to create a Commit',
       );
     }
     const precommit = precommits.get(resourceKey(body.tenant_id, body.precommit_id));
@@ -3077,14 +3227,14 @@ export const handlers = [
       !precommit ||
       precommit.project_id !== body.project_id ||
       precommit.artifact_id !== body.artifact_id ||
-      precommit.playground_id !== body.playground_id
+      precommit.workspace_id !== body.workspace_id
     ) {
       return problem(
         request,
         404,
         'PRECOMMIT_NOT_FOUND',
         'Pre-commit not found',
-        'The requested Pre-commit was not found for this Playground',
+        'The requested Pre-commit was not found for this Workspace',
       );
     }
     if (precommit.state !== 'ready' || !precommit.candidate_index_version) {
@@ -3106,11 +3256,11 @@ export const handlers = [
       );
     }
     const frozenHead = precommitSourceHeads.get(resourceKey(body.tenant_id, body.precommit_id));
-    if (frozenHead === undefined || frozenHead !== (playground.head_commit_id ?? null)) {
+    if (frozenHead === undefined || frozenHead !== (workspace.head_commit_id ?? null)) {
       return mutationConflict(
         request,
         'HEAD_COMMIT_CONFLICT',
-        'The Playground Head changed after this Pre-commit was started',
+        'The Workspace Head changed after this Pre-commit was started',
       );
     }
     if (!body.message.trim()) {
@@ -3169,7 +3319,7 @@ export const handlers = [
     const now = Date.now().toString();
     const commit: CommitNode = {
       commit_id: contentDigest({ request: body, at: now }),
-      ...(playground.head_commit_id ? { parent_commit_id: playground.head_commit_id } : {}),
+      ...(workspace.head_commit_id ? { parent_commit_id: workspace.head_commit_id } : {}),
       message: body.message.trim(),
       ...(body.description?.trim() ? { description: body.description.trim() } : {}),
       tag_names: tagNames,
@@ -3182,37 +3332,38 @@ export const handlers = [
     artifact.head_commit_id = commit.commit_id;
     artifact.resource_version = (BigInt(artifact.resource_version) + 1n).toString();
     artifact.updated_at_unix_ms = now;
-    playground.head_commit_id = commit.commit_id;
-    playground.updated_at_unix_ms = now;
-    delete playground.active_precommit_id;
+    workspace.head_commit_id = commit.commit_id;
+    workspace.updated_at_unix_ms = now;
+    delete workspace.active_precommit_id;
     precommit.state = 'committed';
     precommit.phase = 'idle';
     precommit.committed_commit_id = commit.commit_id;
     precommit.updated_at_unix_ms = now;
 
-    const response: CommitPlaygroundResponse = {
+    const response: CommitWorkspaceResponse = {
       commit,
-      playground,
+      workspace,
       consumed_precommit: precommit,
-      replayed: false,
+      request_replayed: false,
+      execution_reused: false,
     };
     commitRequests.set(requestKey, { requestJson, response: structuredClone(response) });
     return HttpResponse.json(response, { headers: headers(request) });
   }),
-  http.post('*/api/playground/file/list/query', async ({ request }) => {
+  http.post('*/api/workspace/file/list/query', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
-    const body = (await request.json()) as QueryPlaygroundFileListRequest;
+    const body = (await request.json()) as QueryWorkspaceFileListRequest;
     const failed = requireTenant(request, body.tenant_id);
     if (failed) return failed;
-    const playground = playgrounds.find(
+    const workspace = workspaces.find(
       (item) =>
         item.tenant_id === body.tenant_id &&
         item.project_id === body.project_id &&
         item.artifact_id === body.artifact_id &&
-        item.playground_id === body.playground_id,
+        item.workspace_id === body.workspace_id,
     );
-    if (!playground) return notFound(request, 'Playground');
+    if (!workspace) return notFound(request, 'Workspace');
     const filtered = mockLogicalFiles.filter(
       (item) =>
         (!body.path_prefix || item.path.startsWith(body.path_prefix)) &&
@@ -3222,33 +3373,33 @@ export const handlers = [
       tenant_id: body.tenant_id,
       project_id: body.project_id,
       artifact_id: body.artifact_id,
-      playground_id: body.playground_id,
+      workspace_id: body.workspace_id,
       path_prefix: body.path_prefix ?? '',
       format: body.format ?? '',
-      index_version: playground.index_version,
+      index_version: workspace.index_version,
     };
-    const page = paginate(request, 'playground-files', filters, filtered, body);
+    const page = paginate(request, 'workspace-files', filters, filtered, body);
     if (page instanceof HttpResponse) return page;
-    const response: QueryPlaygroundFileListResponse = {
-      index_version: playground.index_version,
+    const response: QueryWorkspaceFileListResponse = {
+      index_version: workspace.index_version,
       ...page,
     };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
-  http.post('*/api/playground/change/list/query', async ({ request }) => {
+  http.post('*/api/workspace/change/list/query', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
-    const body = (await request.json()) as QueryPlaygroundChangeListRequest;
+    const body = (await request.json()) as QueryWorkspaceChangeListRequest;
     const failed = requireTenant(request, body.tenant_id);
     if (failed) return failed;
-    const playground = playgrounds.find(
+    const workspace = workspaces.find(
       (item) =>
         item.tenant_id === body.tenant_id &&
         item.project_id === body.project_id &&
         item.artifact_id === body.artifact_id &&
-        item.playground_id === body.playground_id,
+        item.workspace_id === body.workspace_id,
     );
-    if (!playground) return notFound(request, 'Playground');
+    if (!workspace) return notFound(request, 'Workspace');
     const precommit = body.precommit_id
       ? precommits.get(resourceKey(body.tenant_id, body.precommit_id))
       : undefined;
@@ -3257,35 +3408,35 @@ export const handlers = [
       (!precommit ||
         precommit.project_id !== body.project_id ||
         precommit.artifact_id !== body.artifact_id ||
-        precommit.playground_id !== body.playground_id)
+        precommit.workspace_id !== body.workspace_id)
     ) {
       return problem(
         request,
         404,
         'PRECOMMIT_NOT_FOUND',
         'Pre-commit not found',
-        'The requested Pre-commit was not found for this Playground',
+        'The requested Pre-commit was not found for this Workspace',
       );
     }
-    const filtered = mockPlaygroundChanges.filter(
+    const filtered = mockWorkspaceChanges.filter(
       (item) =>
         (!body.change_type || item.change_type === body.change_type) &&
         (!body.path_prefix || item.path.startsWith(body.path_prefix)),
     );
-    const indexVersion = precommit?.candidate_index_version ?? playground.index_version;
+    const indexVersion = precommit?.candidate_index_version ?? workspace.index_version;
     const filters = {
       tenant_id: body.tenant_id,
       project_id: body.project_id,
       artifact_id: body.artifact_id,
-      playground_id: body.playground_id,
+      workspace_id: body.workspace_id,
       precommit_id: body.precommit_id ?? '',
       change_type: body.change_type ?? '',
       path_prefix: body.path_prefix ?? '',
       index_version: indexVersion,
     };
-    const page = paginate(request, 'playground-changes', filters, filtered, body);
+    const page = paginate(request, 'workspace-changes', filters, filtered, body);
     if (page instanceof HttpResponse) return page;
-    const response: QueryPlaygroundChangeListResponse = {
+    const response: QueryWorkspaceChangeListResponse = {
       source: precommit ? 'precommit' : 'workspace',
       ...(precommit ? { precommit_id: precommit.precommit_id } : {}),
       index_version: indexVersion,
@@ -3301,20 +3452,20 @@ export const handlers = [
     };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
-  http.post('*/api/playground/file/metadata/query', async ({ request }) => {
+  http.post('*/api/workspace/file/metadata/query', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
-    const body = (await request.json()) as QueryPlaygroundFileMetadataRequest;
+    const body = (await request.json()) as QueryWorkspaceFileMetadataRequest;
     const failed = requireTenant(request, body.tenant_id);
     if (failed) return failed;
-    const playground = playgrounds.find(
+    const workspace = workspaces.find(
       (item) =>
         item.tenant_id === body.tenant_id &&
         item.project_id === body.project_id &&
         item.artifact_id === body.artifact_id &&
-        item.playground_id === body.playground_id,
+        item.workspace_id === body.workspace_id,
     );
-    if (!playground) return notFound(request, 'Playground');
+    if (!workspace) return notFound(request, 'Workspace');
     const file = mockLogicalFiles.find((item) => item.path === body.path);
     if (!file || file.entry_type !== 'file' || !file.size_bytes || !file.format) {
       return problem(
@@ -3325,8 +3476,8 @@ export const handlers = [
         'The logical file was not found',
       );
     }
-    const response: QueryPlaygroundFileMetadataResponse = {
-      index_version: playground.index_version,
+    const response: QueryWorkspaceFileMetadataResponse = {
+      index_version: workspace.index_version,
       metadata: {
         path: file.path,
         size_bytes: file.size_bytes,
@@ -3342,22 +3493,22 @@ export const handlers = [
     };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
-  http.post('*/api/playground/dataset/profile/query', async ({ request }) => {
+  http.post('*/api/workspace/dataset/profile/query', async ({ request }) => {
     const denied = authorize(request);
     if (denied) return denied;
-    const body = (await request.json()) as QueryPlaygroundDatasetProfileRequest;
+    const body = (await request.json()) as QueryWorkspaceDatasetProfileRequest;
     const failed = requireTenant(request, body.tenant_id);
     if (failed) return failed;
-    const playground = playgrounds.find(
+    const workspace = workspaces.find(
       (item) =>
         item.tenant_id === body.tenant_id &&
         item.project_id === body.project_id &&
         item.artifact_id === body.artifact_id &&
-        item.playground_id === body.playground_id,
+        item.workspace_id === body.workspace_id,
     );
-    if (!playground) return notFound(request, 'Playground');
-    const response: QueryPlaygroundDatasetProfileResponse = {
-      index_version: playground.index_version,
+    if (!workspace) return notFound(request, 'Workspace');
+    const response: QueryWorkspaceDatasetProfileResponse = {
+      index_version: workspace.index_version,
       profile: mockDatasetProfile,
     };
     return HttpResponse.json(response, { headers: headers(request) });
@@ -3453,7 +3604,7 @@ export const handlers = [
         );
       }
       const response = structuredClone(priorRequest.response);
-      response.replayed = true;
+      response.request_replayed = true;
       return HttpResponse.json(response, { headers: headers(request) });
     }
     if (!body.target_edge_cluster_id || !body.target_storage_volume_id || !body.delivery_mode) {
@@ -3568,7 +3719,8 @@ export const handlers = [
     snapshotQueryCounts.set(resourceKey(snapshot.tenant_id, snapshot.snapshot_id), 0);
     const response: CreateSnapshotResponse = {
       snapshot,
-      replayed: false,
+      request_replayed: false,
+      execution_reused: false,
     };
     snapshotCreateRequests.set(requestKey, { requestJson, response: structuredClone(response) });
     return HttpResponse.json(response, { headers: headers(request) });
@@ -3581,6 +3733,27 @@ export const handlers = [
     if (failed) return failed;
     const requestKey = resourceKey(body.tenant_id, body.request_id);
     const requestJson = stableJson(body);
+    if (body.purpose === 'repair') {
+      const hasDigest = Boolean(body.repair_observation_digest);
+      const hasGeneration = Boolean(body.target_placement_generation);
+      if (hasDigest === hasGeneration) {
+        return problem(
+          request,
+          422,
+          'REPAIR_FENCE_REQUIRED',
+          'Repair materialization requires exactly one repair fence',
+          'Provide repair_observation_digest or target_placement_generation, but not both.',
+        );
+      }
+    } else if (body.repair_observation_digest || body.target_placement_generation) {
+      return problem(
+        request,
+        422,
+        'COPY_REPAIR_FENCE_INVALID',
+        'Copy materialization cannot carry a repair fence',
+        'Repair fences are only valid for purpose=repair.',
+      );
+    }
     const prior = commitMaterializationRequests.get(requestKey);
     if (prior) {
       if (prior.requestJson !== requestJson) {
@@ -3591,7 +3764,7 @@ export const handlers = [
         );
       }
       const response = structuredClone(prior.response);
-      response.replayed = true;
+      response.request_replayed = true;
       return HttpResponse.json(response, { headers: headers(request) });
     }
     const artifact = artifacts.find(
@@ -3671,6 +3844,7 @@ export const handlers = [
       artifact_id: body.artifact_id,
       commit_id: body.commit_id,
       target_storage_volume_id: body.target_storage_volume_id,
+      purpose: body.purpose,
       attempt: '1',
       state: 'queued' as const,
       object_set_digest: body.commit_id,
@@ -3683,7 +3857,8 @@ export const handlers = [
     const response: CreateCommitMaterializationResponse = {
       materialization: toMaterializationView(materialization),
       task,
-      replayed: false,
+      request_replayed: false,
+      execution_reused: false,
     };
     const materializationKey = resourceKey(body.tenant_id, materializationId);
     commitMaterializations.set(materializationKey, materialization);
@@ -3845,7 +4020,7 @@ export const handlers = [
         );
       }
       const response = structuredClone(priorRequest.response);
-      response.replayed = true;
+      response.request_replayed = true;
       return HttpResponse.json(response, { headers: headers(request) });
     }
     const resolved = resolveSnapshotDelivery(body.tenant_id, body.delivery_id);
@@ -3882,7 +4057,8 @@ export const handlers = [
     }
     const response: RetrySnapshotDeliveryResponse = {
       delivery: resolved.delivery,
-      replayed: false,
+      request_replayed: false,
+      execution_reused: false,
     };
     snapshotRetryRequests.set(requestKey, { requestJson, response: structuredClone(response) });
     return HttpResponse.json(response, { headers: headers(request) });
@@ -3905,7 +4081,7 @@ export const handlers = [
         );
       }
       const response = structuredClone(priorRequest.response);
-      response.replayed = true;
+      response.request_replayed = true;
       return HttpResponse.json(response, { headers: headers(request) });
     }
     const resolved = resolveSnapshotDelivery(body.tenant_id, body.delivery_id);
@@ -3917,7 +4093,8 @@ export const handlers = [
     resolved.delivery.updated_at_unix_ms = Date.now().toString();
     const response: DeleteSnapshotDeliveryResponse = {
       delivery: resolved.delivery,
-      replayed: false,
+      request_replayed: false,
+      execution_reused: false,
     };
     snapshotDeliveryDeleteRequests.set(requestKey, {
       requestJson,
@@ -4103,7 +4280,7 @@ export const handlers = [
         );
       }
       const response = structuredClone(previous.response);
-      response.replayed = true;
+      response.request_replayed = true;
       delete response.secret_access_key;
       return HttpResponse.json(response, { headers: headers(request) });
     }
@@ -4122,7 +4299,8 @@ export const handlers = [
         access_point: existing,
         access_key_id: 'NGS3ROADREADER01',
         credential_expires_at_unix_ms: '1790000000000',
-        replayed: true,
+        request_replayed: true,
+        execution_reused: false,
       };
       s3AccessPointCreateRequests.set(requestKey, {
         requestJson,
@@ -4165,7 +4343,8 @@ export const handlers = [
       access_key_id: accessKeyId,
       secret_access_key: secretAccessKey,
       credential_expires_at_unix_ms: '1790000000000',
-      replayed: false,
+      request_replayed: false,
+      execution_reused: false,
     };
     s3AccessPointCreateRequests.set(requestKey, {
       requestJson,
@@ -4184,7 +4363,11 @@ export const handlers = [
     accessPoint.state = 'active';
     accessPoint.policy_generation = (BigInt(accessPoint.policy_generation) + 1n).toString();
     accessPoint.updated_at_unix_ms = Date.now().toString();
-    const response: UpdateS3AccessPointResponse = { access_point: accessPoint, replayed: false };
+    const response: UpdateS3AccessPointResponse = {
+      access_point: accessPoint,
+      request_replayed: false,
+      execution_reused: false,
+    };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
   http.post('*/api/s3/access-point/disable', async ({ request }) => {
@@ -4206,7 +4389,37 @@ export const handlers = [
     }
     accessPoint.policy_generation = (BigInt(accessPoint.policy_generation) + 1n).toString();
     accessPoint.updated_at_unix_ms = Date.now().toString();
-    const response: UpdateS3AccessPointResponse = { access_point: accessPoint, replayed: false };
+    const response: UpdateS3AccessPointResponse = {
+      access_point: accessPoint,
+      request_replayed: false,
+      execution_reused: false,
+    };
+    return HttpResponse.json(response, { headers: headers(request) });
+  }),
+  http.post('*/api/s3/access-point/delete', async ({ request }) => {
+    const denied = authorize(request);
+    if (denied) return denied;
+    const body = (await request.json()) as UpdateS3AccessPointRequest;
+    const failed = requireMutationAccess(request, body.tenant_id);
+    if (failed) return failed;
+    const accessPoint = resolveS3AccessPoint(request, body.tenant_id, body.access_point_id);
+    if (accessPoint instanceof HttpResponse) return accessPoint;
+    accessPoint.state = 'deleted';
+    for (const credential of s3Credentials) {
+      if (
+        credential.access_point_id === accessPoint.access_point_id &&
+        credential.state === 'active'
+      ) {
+        credential.state = 'revoked';
+      }
+    }
+    accessPoint.policy_generation = (BigInt(accessPoint.policy_generation) + 1n).toString();
+    accessPoint.updated_at_unix_ms = Date.now().toString();
+    const response: UpdateS3AccessPointResponse = {
+      access_point: accessPoint,
+      request_replayed: false,
+      execution_reused: false,
+    };
     return HttpResponse.json(response, { headers: headers(request) });
   }),
   http.post('*/api/s3/credential/list/query', async ({ request }) => {
@@ -4249,7 +4462,7 @@ export const handlers = [
         );
       }
       const response = structuredClone(previous.response);
-      response.replayed = true;
+      response.request_replayed = true;
       delete response.secret_access_key;
       return HttpResponse.json(response, { headers: headers(request) });
     }
@@ -4278,7 +4491,8 @@ export const handlers = [
     const response: CreateS3CredentialResponse = {
       credential,
       secret_access_key: `mock-secret-${crypto.randomUUID()}`,
-      replayed: false,
+      request_replayed: false,
+      execution_reused: false,
     };
     s3CredentialCreateRequests.set(requestKey, {
       requestJson,
@@ -4411,18 +4625,18 @@ export const handlers = [
         ),
       )
       .filter((snapshot): snapshot is NonNullable<typeof snapshot> => Boolean(snapshot));
-    const targetPlaygrounds = targets
-      .filter((target) => target.resource.type === 'playground')
+    const targetWorkspaces = targets
+      .filter((target) => target.resource.type === 'workspace')
       .map((target) =>
-        playgrounds.find(
-          (playground) =>
-            target.resource.type === 'playground' &&
-            playground.project_id === target.resource.project_id &&
-            playground.artifact_id === target.resource.artifact_id &&
-            playground.playground_id === target.resource.playground_id,
+        workspaces.find(
+          (workspace) =>
+            target.resource.type === 'workspace' &&
+            workspace.project_id === target.resource.project_id &&
+            workspace.artifact_id === target.resource.artifact_id &&
+            workspace.workspace_id === target.resource.workspace_id,
         ),
       )
-      .filter((playground): playground is NonNullable<typeof playground> => Boolean(playground));
+      .filter((workspace): workspace is NonNullable<typeof workspace> => Boolean(workspace));
     const targetSnapshotIds = new Set(targetSnapshots.map((snapshot) => snapshot.snapshot_id));
     const targetAccessPointIds = new Set(
       s3AccessPoints
@@ -4444,8 +4658,8 @@ export const handlers = [
       cascade: body.cascade,
       confirm_managed_data_erase: body.confirm_managed_data_erase,
       targets,
-      active_job_count: targetPlaygrounds
-        .filter((playground) => Boolean(playground.active_precommit_id))
+      active_job_count: targetWorkspaces
+        .filter((workspace) => Boolean(workspace.active_precommit_id))
         .length.toString(),
       active_s3_credential_count: activeCredentials.toString(),
       estimated_file_count: targetSnapshots
@@ -4477,7 +4691,7 @@ export const handlers = [
         return mutationConflict(request, 'REQUEST_ID_REUSED', 'Request ID was reused');
       }
       const response = structuredClone(previous.response) as DeletionMutationResponse;
-      response.replayed = true;
+      response.request_replayed = true;
       return HttpResponse.json(response, { headers: headers(request) });
     }
     const impact = deletionImpacts.get(body.impact_digest);
@@ -4548,7 +4762,11 @@ export const handlers = [
       }
     }
     deletionOperations.unshift(deletion);
-    const response: DeletionMutationResponse = { deletion, replayed: false };
+    const response: DeletionMutationResponse = {
+      deletion,
+      request_replayed: false,
+      execution_reused: false,
+    };
     deletionMutationRequests.set(requestKey, {
       requestJson,
       response: structuredClone(response),
@@ -4610,7 +4828,7 @@ export const handlers = [
         return mutationConflict(request, 'REQUEST_ID_REUSED', 'Request ID was reused');
       }
       const response = structuredClone(previous.response) as DeletionMutationResponse;
-      response.replayed = true;
+      response.request_replayed = true;
       return HttpResponse.json(response, { headers: headers(request) });
     }
     const deletion = deletionOperations.find(
@@ -4637,7 +4855,11 @@ export const handlers = [
     deletion.completion = 'restored';
     deletion.resource_version = (BigInt(deletion.resource_version) + 1n).toString();
     deletion.updated_at_unix_ms = Date.now().toString();
-    const response: DeletionMutationResponse = { deletion, replayed: false };
+    const response: DeletionMutationResponse = {
+      deletion,
+      request_replayed: false,
+      execution_reused: false,
+    };
     deletionMutationRequests.set(requestKey, {
       requestJson,
       response: structuredClone(response),
@@ -4658,7 +4880,7 @@ export const handlers = [
         return mutationConflict(request, 'REQUEST_ID_REUSED', 'Request ID was reused');
       }
       const response = structuredClone(previous.response) as DeletionMutationResponse;
-      response.replayed = true;
+      response.request_replayed = true;
       return HttpResponse.json(response, { headers: headers(request) });
     }
     const deletion = deletionOperations.find(
@@ -4676,7 +4898,11 @@ export const handlers = [
     deletion.retry_count = (BigInt(deletion.retry_count) + 1n).toString();
     deletion.resource_version = (BigInt(deletion.resource_version) + 1n).toString();
     deletion.updated_at_unix_ms = Date.now().toString();
-    const response: DeletionMutationResponse = { deletion, replayed: false };
+    const response: DeletionMutationResponse = {
+      deletion,
+      request_replayed: false,
+      execution_reused: false,
+    };
     deletionMutationRequests.set(requestKey, {
       requestJson,
       response: structuredClone(response),
@@ -4697,7 +4923,7 @@ export const handlers = [
         return mutationConflict(request, 'REQUEST_ID_REUSED', 'Request ID was reused');
       }
       const response = structuredClone(previous.response) as CreateRetentionHoldResponse;
-      response.replayed = true;
+      response.request_replayed = true;
       return HttpResponse.json(response, { headers: headers(request) });
     }
     const deletion = deletionOperations.find(
@@ -4725,7 +4951,8 @@ export const handlers = [
     const response: CreateRetentionHoldResponse = {
       deletion,
       retention_hold: hold,
-      replayed: false,
+      request_replayed: false,
+      execution_reused: false,
     };
     deletionMutationRequests.set(requestKey, {
       requestJson,
@@ -4747,7 +4974,7 @@ export const handlers = [
         return mutationConflict(request, 'REQUEST_ID_REUSED', 'Request ID was reused');
       }
       const response = structuredClone(previous.response) as ReleaseRetentionHoldResponse;
-      response.replayed = true;
+      response.request_replayed = true;
       return HttpResponse.json(response, { headers: headers(request) });
     }
     const deletion = deletionOperations.find(
@@ -4770,7 +4997,8 @@ export const handlers = [
     const response: ReleaseRetentionHoldResponse = {
       deletion,
       retention_hold: hold,
-      replayed: false,
+      request_replayed: false,
+      execution_reused: false,
     };
     deletionMutationRequests.set(requestKey, {
       requestJson,
@@ -4785,22 +5013,31 @@ export const handlers = [
     const failed = requireTenant(request, body.tenant_id);
     if (failed) return failed;
     const states = body.state ?? [];
-    const kinds = body.task_kind ?? [];
+    const kinds = body.intent_kind ?? [];
     const all = [...operationTasks.values()]
       .filter((task) => {
         if (task.tenant_id !== body.tenant_id) return false;
-        if (body.project_id && task.project_id !== body.project_id) return false;
-        if (body.artifact_id && task.artifact_id !== body.artifact_id) return false;
-        if (body.object_namespace_id && task.object_namespace_id !== body.object_namespace_id)
+        if (body.project_id && !taskResourceMatches(task, 'project', body.project_id)) return false;
+        if (body.artifact_id && !taskResourceMatches(task, 'artifact', body.artifact_id))
           return false;
-        if (body.commit_id && task.commit_id !== body.commit_id) return false;
-        if (body.playground_id && task.playground_id !== body.playground_id) return false;
-        if (body.snapshot_id && task.snapshot_id !== body.snapshot_id) return false;
-        if (body.storage_volume_id && task.storage_volume_id !== body.storage_volume_id)
+        if (
+          body.object_namespace_id &&
+          !taskResourceMatches(task, 'object_namespace', body.object_namespace_id)
+        )
           return false;
-        if (body.parent_task_id && task.parent_task_id !== body.parent_task_id) return false;
+        if (body.commit_id && !taskResourceMatches(task, 'commit', body.commit_id)) return false;
+        if (body.workspace_id && !taskResourceMatches(task, 'workspace', body.workspace_id))
+          return false;
+        if (body.snapshot_id && !taskResourceMatches(task, 'snapshot', body.snapshot_id))
+          return false;
+        if (
+          body.storage_volume_id &&
+          !taskResourceMatches(task, 'storage_volume', body.storage_volume_id)
+        )
+          return false;
+        if (body.purpose && task.purpose !== body.purpose) return false;
         if (states.length && !states.includes(task.state)) return false;
-        if (kinds.length && !kinds.includes(task.task_kind)) return false;
+        if (kinds.length && !kinds.includes(task.intent_kind)) return false;
         return true;
       })
       .sort((left, right) => left.created_at_unix_ms.localeCompare(right.created_at_unix_ms));
@@ -4850,7 +5087,6 @@ export const handlers = [
         task: latest,
         attempts: taskAttempts.get(key) ?? [],
         events: taskEvents.get(key) ?? [],
-        children: [],
       },
       { headers: headers(request) },
     );
@@ -4881,19 +5117,22 @@ export const handlers = [
     const failed = requireTenant(request, body.tenant_id);
     if (failed) return failed;
     const states = body.state ?? [];
-    const kinds = body.task_kind ?? [];
+    const kinds = body.intent_kind ?? [];
     const selected = [...operationTasks.values()].filter(
       (task) =>
         task.tenant_id === body.tenant_id &&
-        (!body.project_id || task.project_id === body.project_id) &&
-        (!body.artifact_id || task.artifact_id === body.artifact_id) &&
-        (!body.object_namespace_id || task.object_namespace_id === body.object_namespace_id) &&
-        (!body.commit_id || task.commit_id === body.commit_id) &&
-        (!body.playground_id || task.playground_id === body.playground_id) &&
-        (!body.snapshot_id || task.snapshot_id === body.snapshot_id) &&
-        (!body.storage_volume_id || task.storage_volume_id === body.storage_volume_id) &&
+        (!body.project_id || taskResourceMatches(task, 'project', body.project_id)) &&
+        (!body.artifact_id || taskResourceMatches(task, 'artifact', body.artifact_id)) &&
+        (!body.object_namespace_id ||
+          taskResourceMatches(task, 'object_namespace', body.object_namespace_id)) &&
+        (!body.commit_id || taskResourceMatches(task, 'commit', body.commit_id)) &&
+        (!body.workspace_id || taskResourceMatches(task, 'workspace', body.workspace_id)) &&
+        (!body.snapshot_id || taskResourceMatches(task, 'snapshot', body.snapshot_id)) &&
+        (!body.storage_volume_id ||
+          taskResourceMatches(task, 'storage_volume', body.storage_volume_id)) &&
+        (!body.purpose || task.purpose === body.purpose) &&
         (!states.length || states.includes(task.state)) &&
-        (!kinds.length || kinds.includes(task.task_kind)),
+        (!kinds.length || kinds.includes(task.intent_kind)),
     );
     const summary = {
       total: String(selected.length),
@@ -4929,7 +5168,10 @@ export const handlers = [
       task.state === 'waiting' ||
       task.state === 'verifying'
     ) {
-      return HttpResponse.json({ task, replayed: true }, { headers: headers(request) });
+      return HttpResponse.json(
+        { task, request_replayed: true, execution_reused: task.execution_reused },
+        { headers: headers(request) },
+      );
     }
     if (task.state !== 'failed' && task.state !== 'stalled') {
       return mutationConflict(request, 'TASK_NOT_RETRYABLE', 'Task is not retryable');
@@ -4937,7 +5179,6 @@ export const handlers = [
     const oldState = task.state;
     task.attempt = (BigInt(task.attempt) + 1n).toString();
     task.state = 'queued';
-    task.phase = 'queued';
     delete task.issue;
     task.resource_version = (BigInt(task.resource_version) + 1n).toString();
     task.updated_at_unix_ms = String(Date.now());
@@ -4948,7 +5189,7 @@ export const handlers = [
       task_id: task.task_id,
       attempt: task.attempt,
       state: task.state,
-      phase: task.phase,
+      current_stage_key: task.current_stage.stage_key,
       created_at_unix_ms: task.updated_at_unix_ms,
       updated_at_unix_ms: task.updated_at_unix_ms,
       resource_version: task.resource_version,
@@ -4962,7 +5203,10 @@ export const handlers = [
       commitMaterializations.set(key, next);
       commitMaterializationQueryCounts.set(key, 0);
     }
-    return HttpResponse.json({ task, replayed: false }, { headers: headers(request) });
+    return HttpResponse.json(
+      { task, request_replayed: false, execution_reused: task.execution_reused },
+      { headers: headers(request) },
+    );
   }),
   http.post('*/api/task/cancel', async ({ request }) => {
     const denied = authorize(request);
@@ -4979,25 +5223,30 @@ export const handlers = [
     ) {
       return mutationConflict(request, 'RESOURCE_VERSION_CONFLICT', 'Task changed');
     }
-    if (task.state === 'cancelled') {
-      return HttpResponse.json({ task, replayed: true }, { headers: headers(request) });
+    if (task.state === 'cancelled' || task.state === 'cancelling') {
+      return HttpResponse.json(
+        { task, request_replayed: true, execution_reused: task.execution_reused },
+        { headers: headers(request) },
+      );
     }
     if (!['queued', 'running', 'waiting', 'verifying', 'stalled'].includes(task.state)) {
       return mutationConflict(request, 'TASK_NOT_CANCELLABLE', 'Task is not cancellable');
     }
     const oldState = task.state;
-    task.state = 'cancelled';
-    task.phase = 'cancelled';
+    task.state = 'cancelling';
     task.resource_version = (BigInt(task.resource_version) + 1n).toString();
     task.updated_at_unix_ms = String(Date.now());
     operationTasks.set(key, task);
-    appendTaskEvent(task, 'cancelled', 'mock-user', oldState, 'Task cancelled');
+    appendTaskEvent(task, 'cancel_requested', 'mock-user', oldState, 'Task cancellation requested');
     const materialization = commitMaterializations.get(key);
     if (materialization) {
       commitMaterializations.set(key, { ...materialization, state: 'cancelled' as const });
       commitMaterializationQueryCounts.delete(key);
     }
-    return HttpResponse.json({ task, replayed: false }, { headers: headers(request) });
+    return HttpResponse.json(
+      { task, request_replayed: false, execution_reused: task.execution_reused },
+      { headers: headers(request) },
+    );
   }),
 ];
 
@@ -5012,7 +5261,7 @@ export function resetMockState(): void {
   pvcBindings.clear();
   activePvcOwners.clear();
   artifactCreatePayloads.clear();
-  playgroundQueryCounts.clear();
+  workspaceQueryCounts.clear();
   commitRequests.clear();
   precommits.clear();
   precommitQueryCounts.clear();

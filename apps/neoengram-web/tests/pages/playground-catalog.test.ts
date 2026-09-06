@@ -5,17 +5,17 @@ import { createPinia, setActivePinia } from 'pinia';
 import { createMemoryHistory, createRouter } from 'vue-router';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import PlaygroundDetailPage from '@/pages/PlaygroundDetailPage.vue';
+import WorkspaceDetailPage from '@/pages/WorkspaceDetailPage.vue';
 import { useTenantsStore } from '@/stores/tenants';
 
 const api = vi.hoisted(() => ({
   queryApiVersion: vi.fn(),
-  queryPlayground: vi.fn(),
-  queryPlaygroundChangeList: vi.fn(),
-  queryPlaygroundDatasetProfile: vi.fn(),
-  queryPlaygroundFileList: vi.fn(),
-  queryPlaygroundFileMetadata: vi.fn(),
-  startPlaygroundPreCommit: vi.fn(),
+  queryWorkspace: vi.fn(),
+  queryWorkspaceChangeList: vi.fn(),
+  queryWorkspaceDatasetProfile: vi.fn(),
+  queryWorkspaceFileList: vi.fn(),
+  queryWorkspaceFileMetadata: vi.fn(),
+  startWorkspacePreCommit: vi.fn(),
 }));
 
 vi.mock('@/api/operations', () => api);
@@ -43,16 +43,16 @@ async function mountPage({
     },
     requestId: 'request-version',
   });
-  api.queryPlayground.mockResolvedValue({
+  api.queryWorkspace.mockResolvedValue({
     data: {
-      playground: {
+      workspace: {
         tenant_id: 'tenant-a',
         project_id: 'project-a',
         artifact_id: 'artifact-a',
-        playground_id: 'playground-a',
+        workspace_id: 'workspace-a',
         storage_volume_id: 'volume-a',
         region: 'cn-shanghai',
-        display_name: 'Catalog Playground',
+        display_name: 'Catalog Workspace',
         index_version: { revision: '7', digest: indexDigest },
         state,
         ...(includeStorageAvailability ? { storage_availability: storageAvailability } : {}),
@@ -60,7 +60,7 @@ async function mountPage({
         updated_at_unix_ms: '1785167600000',
       },
     },
-    requestId: 'request-playground',
+    requestId: 'request-workspace',
   });
 
   const pinia = createPinia();
@@ -69,7 +69,7 @@ async function mountPage({
     {
       tenant_id: 'tenant-a',
       display_name: 'Tenant A',
-      permissions: ['playground.read', 'playground.create', 'task.manage'],
+      permissions: ['workspace.read', 'workspace.create', 'task.manage'],
       resource_version: '1',
       created_at_unix_ms: '1',
       updated_at_unix_ms: '2',
@@ -79,13 +79,13 @@ async function mountPage({
     history: createMemoryHistory(),
     routes: [
       {
-        path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/playgrounds/:playgroundId',
-        name: 'playground-detail',
+        path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/workspaces/:workspaceId',
+        name: 'workspace-detail',
         component: { template: '<div />' },
       },
       {
-        path: '/tenants/:tenantId/playgrounds',
-        name: 'playground-list',
+        path: '/tenants/:tenantId/workspaces',
+        name: 'workspace-list',
         component: { template: '<div />' },
       },
       {
@@ -94,20 +94,20 @@ async function mountPage({
         component: { template: '<div />' },
       },
       {
-        path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/playgrounds/:playgroundId/commit',
-        name: 'playground-commit',
+        path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/workspaces/:workspaceId/commit',
+        name: 'workspace-commit',
         component: { template: '<div />' },
       },
     ],
   });
   await router.push(
-    '/tenants/tenant-a/projects/project-a/artifacts/artifact-a/playgrounds/playground-a',
+    '/tenants/tenant-a/projects/project-a/artifacts/artifact-a/workspaces/workspace-a',
   );
   await router.isReady();
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
   });
-  const wrapper = mount(PlaygroundDetailPage, {
+  const wrapper = mount(WorkspaceDetailPage, {
     global: {
       plugins: [ElementPlus, pinia, [VueQueryPlugin, { queryClient }], router],
     },
@@ -121,23 +121,23 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe('artifact_catalog-only Playground detail', () => {
+describe('artifact_catalog-only Workspace detail', () => {
   it('shows authoritative metadata without exposing a direct Add/scan Job entry', async () => {
     const { queryClient, wrapper } = await mountPage();
 
-    expect(api.queryPlayground).toHaveBeenCalledWith(
+    expect(api.queryWorkspace).toHaveBeenCalledWith(
       'tenant-a',
       'project-a',
       'artifact-a',
-      'playground-a',
+      'workspace-a',
     );
-    expect(api.queryPlaygroundChangeList).not.toHaveBeenCalled();
-    expect(api.queryPlaygroundFileList).not.toHaveBeenCalled();
-    expect(api.queryPlaygroundDatasetProfile).not.toHaveBeenCalled();
-    expect(api.queryPlaygroundFileMetadata).not.toHaveBeenCalled();
-    expect(api.startPlaygroundPreCommit).not.toHaveBeenCalled();
+    expect(api.queryWorkspaceChangeList).not.toHaveBeenCalled();
+    expect(api.queryWorkspaceFileList).not.toHaveBeenCalled();
+    expect(api.queryWorkspaceDatasetProfile).not.toHaveBeenCalled();
+    expect(api.queryWorkspaceFileMetadata).not.toHaveBeenCalled();
+    expect(api.startWorkspacePreCommit).not.toHaveBeenCalled();
 
-    expect(wrapper.text()).toContain('Playground 元数据');
+    expect(wrapper.text()).toContain('Workspace 元数据');
     expect(wrapper.text()).toContain('artifact-a');
     expect(wrapper.text()).toContain('7');
     expect(wrapper.text()).toContain(indexDigest);
@@ -152,17 +152,17 @@ describe('artifact_catalog-only Playground detail', () => {
     queryClient.clear();
   });
 
-  it('does not offer a scan Job for a non-ready Playground', async () => {
+  it('does not offer a scan Job for a non-ready Workspace', async () => {
     const { queryClient, wrapper } = await mountPage({ state: 'abnormal' });
 
     expect(wrapper.findAll('button').some((button) => button.text() === '创建扫描 Job')).toBe(
       false,
     );
-    expect(api.queryPlaygroundChangeList).not.toHaveBeenCalled();
-    expect(api.queryPlaygroundFileList).not.toHaveBeenCalled();
-    expect(api.queryPlaygroundDatasetProfile).not.toHaveBeenCalled();
-    expect(api.queryPlaygroundFileMetadata).not.toHaveBeenCalled();
-    expect(api.startPlaygroundPreCommit).not.toHaveBeenCalled();
+    expect(api.queryWorkspaceChangeList).not.toHaveBeenCalled();
+    expect(api.queryWorkspaceFileList).not.toHaveBeenCalled();
+    expect(api.queryWorkspaceDatasetProfile).not.toHaveBeenCalled();
+    expect(api.queryWorkspaceFileMetadata).not.toHaveBeenCalled();
+    expect(api.startWorkspacePreCommit).not.toHaveBeenCalled();
     expect(wrapper.text()).toContain('工作区物化异常');
 
     wrapper.unmount();
@@ -175,8 +175,8 @@ describe('artifact_catalog-only Playground detail', () => {
     expect(wrapper.text()).toContain('工作区正在创建');
     expect(wrapper.text()).toContain('创建中');
     expect(wrapper.text()).not.toContain('发起 Pre-commit');
-    expect(api.queryPlaygroundChangeList).not.toHaveBeenCalled();
-    expect(api.queryPlaygroundFileList).not.toHaveBeenCalled();
+    expect(api.queryWorkspaceChangeList).not.toHaveBeenCalled();
+    expect(api.queryWorkspaceFileList).not.toHaveBeenCalled();
 
     wrapper.unmount();
     queryClient.clear();
@@ -185,7 +185,7 @@ describe('artifact_catalog-only Playground detail', () => {
   it('shows an unavailable StorageVolume, keeps central metadata readable, and gates mutations', async () => {
     const { queryClient, wrapper } = await mountPage({
       storageAvailability: 'unavailable',
-      capabilities: ['artifact_catalog', 'playground_browser', 'playground_precommit'],
+      capabilities: ['artifact_catalog', 'workspace_browser', 'workspace_precommit'],
     });
 
     expect(wrapper.text()).toContain('已物化');
@@ -195,9 +195,9 @@ describe('artifact_catalog-only Playground detail', () => {
     expect(wrapper.findAll('button').some((button) => button.text() === '发起 Pre-commit')).toBe(
       false,
     );
-    expect(api.queryPlaygroundChangeList).toHaveBeenCalled();
-    expect(api.queryPlaygroundFileList).toHaveBeenCalled();
-    expect(api.queryPlaygroundDatasetProfile).toHaveBeenCalled();
+    expect(api.queryWorkspaceChangeList).toHaveBeenCalled();
+    expect(api.queryWorkspaceFileList).toHaveBeenCalled();
+    expect(api.queryWorkspaceDatasetProfile).toHaveBeenCalled();
 
     wrapper.unmount();
     queryClient.clear();
@@ -206,36 +206,36 @@ describe('artifact_catalog-only Playground detail', () => {
   it('fails closed for a legacy response that omits storage availability', async () => {
     const { queryClient, wrapper } = await mountPage({
       includeStorageAvailability: false,
-      capabilities: ['artifact_catalog', 'playground_browser', 'playground_precommit'],
+      capabilities: ['artifact_catalog', 'workspace_browser', 'workspace_precommit'],
     });
 
     expect(wrapper.text()).toContain('存储状态未知');
     expect(wrapper.findAll('button').some((button) => button.text() === '发起 Pre-commit')).toBe(
       false,
     );
-    expect(api.queryPlaygroundChangeList).toHaveBeenCalled();
-    expect(api.startPlaygroundPreCommit).not.toHaveBeenCalled();
+    expect(api.queryWorkspaceChangeList).toHaveBeenCalled();
+    expect(api.startWorkspacePreCommit).not.toHaveBeenCalled();
 
     wrapper.unmount();
     queryClient.clear();
   });
 
-  it('automatically follows Agent storage loss and recovery after the Playground is ready', async () => {
+  it('automatically follows Agent storage loss and recovery after the Workspace is ready', async () => {
     vi.useFakeTimers();
     const { queryClient, wrapper } = await mountPage({
-      capabilities: ['artifact_catalog', 'playground_browser', 'playground_precommit'],
+      capabilities: ['artifact_catalog', 'workspace_browser', 'workspace_precommit'],
     });
 
-    api.queryPlayground.mockResolvedValueOnce({
+    api.queryWorkspace.mockResolvedValueOnce({
       data: {
-        playground: {
+        workspace: {
           tenant_id: 'tenant-a',
           project_id: 'project-a',
           artifact_id: 'artifact-a',
-          playground_id: 'playground-a',
+          workspace_id: 'workspace-a',
           storage_volume_id: 'volume-a',
           region: 'cn-shanghai',
-          display_name: 'Catalog Playground',
+          display_name: 'Catalog Workspace',
           index_version: { revision: '7', digest: indexDigest },
           state: 'ready',
           storage_availability: 'unavailable',
@@ -243,24 +243,24 @@ describe('artifact_catalog-only Playground detail', () => {
           updated_at_unix_ms: '1785167600000',
         },
       },
-      requestId: 'request-playground-offline',
+      requestId: 'request-workspace-offline',
     });
     await vi.advanceTimersByTimeAsync(5_000);
     await flushPromises();
 
-    expect(api.queryPlayground).toHaveBeenCalledTimes(2);
+    expect(api.queryWorkspace).toHaveBeenCalledTimes(2);
     expect(wrapper.text()).toContain('存储不可达');
 
-    api.queryPlayground.mockResolvedValueOnce({
+    api.queryWorkspace.mockResolvedValueOnce({
       data: {
-        playground: {
+        workspace: {
           tenant_id: 'tenant-a',
           project_id: 'project-a',
           artifact_id: 'artifact-a',
-          playground_id: 'playground-a',
+          workspace_id: 'workspace-a',
           storage_volume_id: 'volume-a',
           region: 'cn-shanghai',
-          display_name: 'Catalog Playground',
+          display_name: 'Catalog Workspace',
           index_version: { revision: '7', digest: indexDigest },
           state: 'ready',
           storage_availability: 'ready',
@@ -268,12 +268,12 @@ describe('artifact_catalog-only Playground detail', () => {
           updated_at_unix_ms: '1785167600000',
         },
       },
-      requestId: 'request-playground-recovered',
+      requestId: 'request-workspace-recovered',
     });
     await vi.advanceTimersByTimeAsync(5_000);
     await flushPromises();
 
-    expect(api.queryPlayground).toHaveBeenCalledTimes(3);
+    expect(api.queryWorkspace).toHaveBeenCalledTimes(3);
     expect(wrapper.text()).toContain('存储可达');
     expect(wrapper.text()).not.toContain('依赖 Agent 的实时操作已暂停');
 

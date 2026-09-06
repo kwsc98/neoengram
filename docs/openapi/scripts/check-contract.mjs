@@ -427,39 +427,39 @@ const resourceContracts = {
     "QueryArtifactCommitDiffRequest",
     "QueryArtifactCommitDiffResponse",
   ],
-  queryPlaygroundList: [
-    "QueryPlaygroundListRequest",
-    "QueryPlaygroundListResponse",
+  queryWorkspaceList: [
+    "QueryWorkspaceListRequest",
+    "QueryWorkspaceListResponse",
   ],
-  queryPlayground: ["QueryPlaygroundRequest", "QueryPlaygroundResponse"],
-  createPlayground: ["CreatePlaygroundRequest", "CreatePlaygroundResponse"],
-  startPlaygroundPreCommit: ["StartPreCommitRequest", "StartPreCommitResponse"],
-  queryPlaygroundPreCommit: ["QueryPreCommitRequest", "QueryPreCommitResponse"],
-  restartPlaygroundPreCommit: [
+  queryWorkspace: ["QueryWorkspaceRequest", "QueryWorkspaceResponse"],
+  createWorkspace: ["CreateWorkspaceRequest", "CreateWorkspaceResponse"],
+  startWorkspacePreCommit: ["StartPreCommitRequest", "StartPreCommitResponse"],
+  queryWorkspacePreCommit: ["QueryPreCommitRequest", "QueryPreCommitResponse"],
+  restartWorkspacePreCommit: [
     "RestartPreCommitRequest",
     "RestartPreCommitResponse",
   ],
-  cancelPlaygroundPreCommit: [
+  cancelWorkspacePreCommit: [
     "CancelPreCommitRequest",
     "CancelPreCommitResponse",
   ],
-  queryPlaygroundFileList: [
-    "QueryPlaygroundFileListRequest",
-    "QueryPlaygroundFileListResponse",
+  queryWorkspaceFileList: [
+    "QueryWorkspaceFileListRequest",
+    "QueryWorkspaceFileListResponse",
   ],
-  queryPlaygroundChangeList: [
-    "QueryPlaygroundChangeListRequest",
-    "QueryPlaygroundChangeListResponse",
+  queryWorkspaceChangeList: [
+    "QueryWorkspaceChangeListRequest",
+    "QueryWorkspaceChangeListResponse",
   ],
-  queryPlaygroundFileMetadata: [
-    "QueryPlaygroundFileMetadataRequest",
-    "QueryPlaygroundFileMetadataResponse",
+  queryWorkspaceFileMetadata: [
+    "QueryWorkspaceFileMetadataRequest",
+    "QueryWorkspaceFileMetadataResponse",
   ],
-  queryPlaygroundDatasetProfile: [
-    "QueryPlaygroundDatasetProfileRequest",
-    "QueryPlaygroundDatasetProfileResponse",
+  queryWorkspaceDatasetProfile: [
+    "QueryWorkspaceDatasetProfileRequest",
+    "QueryWorkspaceDatasetProfileResponse",
   ],
-  commitPlayground: ["CommitPlaygroundRequest", "CommitPlaygroundResponse"],
+  commitWorkspace: ["CommitWorkspaceRequest", "CommitWorkspaceResponse"],
   querySnapshotList: ["QuerySnapshotListRequest", "QuerySnapshotListResponse"],
   querySnapshot: ["QuerySnapshotRequest", "QuerySnapshotResponse"],
   createSnapshot: ["CreateSnapshotRequest", "CreateSnapshotResponse"],
@@ -508,6 +508,10 @@ const resourceContracts = {
     "UpdateS3AccessPointResponse",
   ],
   disableS3AccessPoint: [
+    "UpdateS3AccessPointRequest",
+    "UpdateS3AccessPointResponse",
+  ],
+  deleteS3AccessPoint: [
     "UpdateS3AccessPointRequest",
     "UpdateS3AccessPointResponse",
   ],
@@ -624,8 +628,8 @@ assertSameMembers(
     "artifact.commit.replicate",
     "project.read",
     "project.create",
-    "playground.read",
-    "playground.create",
+    "workspace.read",
+    "workspace.create",
     "snapshot.read",
     "snapshot.create",
     "s3.access.read",
@@ -689,16 +693,17 @@ assertSameMembers(
 const resourceRef = document.components.schemas.ResourceRef;
 assert(
   resourceRef.discriminator?.propertyName === "type" &&
-    resourceRef.oneOf?.length === 4,
-  "ResourceRef must remain a four-way tagged union",
+    resourceRef.oneOf?.length === 5,
+  "ResourceRef must remain a five-way tagged union",
 );
 for (const [schemaName, type, required] of [
+  ["ProjectResourceRef", "project", ["type", "project_id"]],
   ["StorageVolumeResourceRef", "storage_volume", ["type", "storage_volume_id"]],
   ["ArtifactResourceRef", "artifact", ["type", "project_id", "artifact_id"]],
   [
-    "PlaygroundResourceRef",
-    "playground",
-    ["type", "project_id", "artifact_id", "playground_id"],
+    "WorkspaceResourceRef",
+    "workspace",
+    ["type", "project_id", "artifact_id", "workspace_id"],
   ],
   ["SnapshotResourceRef", "snapshot", ["type", "snapshot_id"]],
 ]) {
@@ -714,7 +719,7 @@ for (const [schemaName, type, required] of [
 for (const schemaName of [
   "StorageVolumeView",
   "ArtifactView",
-  "PlaygroundView",
+  "WorkspaceView",
   "SnapshotView",
 ]) {
   const schema = document.components.schemas[schemaName];
@@ -869,27 +874,32 @@ assert(
 );
 assertSameMembers(
   document.components.schemas.CreateSnapshotResponse.required,
-  ["snapshot", "replayed"],
+  ["snapshot", "request_replayed", "execution_reused"],
   "Snapshot create replay signals changed",
 );
+assert(
+  document.components.schemas.CreateSnapshotResponse.properties.task?.$ref ===
+    "#/components/schemas/TaskView",
+  "Snapshot create must return the unified operation task",
+);
 
-const commitRequest = document.components.schemas.CommitPlaygroundRequest;
+const commitRequest = document.components.schemas.CommitWorkspaceRequest;
 assert(
   commitRequest.required.includes("commit_request_id"),
-  "Playground Commit must have a stable mutation identity",
+  "Workspace Commit must have a stable mutation identity",
 );
 assert(
   commitRequest.required.includes("precommit_id") &&
     commitRequest.required.includes("expected_candidate_index_version"),
-  "Playground Commit must consume a Pre-commit candidate",
+  "Workspace Commit must consume a Pre-commit candidate",
 );
 assert(
   commitRequest.properties.description && commitRequest.properties.tag_names,
-  "Playground Commit must accept a description and tag names",
+  "Workspace Commit must accept a description and tag names",
 );
 assert(
   commitRequest.properties.tag_names.maxItems === 20,
-  "Playground Commit tag limit changed",
+  "Workspace Commit tag limit changed",
 );
 assert(
   !commitRequest.properties.actor &&
@@ -897,13 +907,13 @@ assert(
     !commitRequest.properties.request_digest &&
     !commitRequest.properties.source_head_commit_id &&
     !commitRequest.properties.expected_head_commit_id,
-  "Playground Commit request must not declare identity internals or a client-supplied Head",
+  "Workspace Commit request must not declare identity internals or a client-supplied Head",
 );
 assert(
-  document.components.schemas.CommitPlaygroundResponse.required.includes(
+  document.components.schemas.CommitWorkspaceResponse.required.includes(
     "consumed_precommit",
   ),
-  "Playground Commit response must return the consumed Pre-commit",
+  "Workspace Commit response must return the consumed Pre-commit",
 );
 
 const artifactCreate = document.components.schemas.CreateArtifactRequest;
@@ -966,17 +976,17 @@ for (const [schema, field] of [
     "QueryArtifactCommitDiffRequest.base_commit_id",
   ],
   [
-    document.components.schemas.CreatePlaygroundRequest.properties
+    document.components.schemas.CreateWorkspaceRequest.properties
       .base_commit_id,
-    "CreatePlaygroundRequest.base_commit_id",
+    "CreateWorkspaceRequest.base_commit_id",
   ],
   [
-    document.components.schemas.PlaygroundView.properties.base_commit_id,
-    "PlaygroundView.base_commit_id",
+    document.components.schemas.WorkspaceView.properties.base_commit_id,
+    "WorkspaceView.base_commit_id",
   ],
   [
-    document.components.schemas.PlaygroundView.properties.head_commit_id,
-    "PlaygroundView.head_commit_id",
+    document.components.schemas.WorkspaceView.properties.head_commit_id,
+    "WorkspaceView.head_commit_id",
   ],
   [
     document.components.schemas.PreCommitView.properties.committed_commit_id,
@@ -1050,9 +1060,9 @@ assert(
 );
 
 assertSameMembers(
-  document.components.schemas.PlaygroundState.enum,
+  document.components.schemas.WorkspaceState.enum,
   ["creating", "ready", "abnormal"],
-  "Playground states changed",
+  "Workspace states changed",
 );
 assertSameMembers(
   document.components.schemas.PreCommitState.enum,
@@ -1165,7 +1175,7 @@ const publicResourceViews = [
   document.components.schemas.ArtifactView,
   document.components.schemas.CommitNode,
   document.components.schemas.CommitDiffEntry,
-  document.components.schemas.PlaygroundView,
+  document.components.schemas.WorkspaceView,
   document.components.schemas.PreCommitView,
   document.components.schemas.LogicalFileEntry,
   document.components.schemas.FileMetadataView,
@@ -1215,11 +1225,11 @@ assert(
   "Commit diff must not expose internal content identities or locations",
 );
 
-const playgroundView = document.components.schemas.PlaygroundView;
+const workspaceView = document.components.schemas.WorkspaceView;
 assert(
-  playgroundView.required.includes("storage_volume_id") &&
-    playgroundView.required.includes("region"),
-  "PlaygroundView must expose its public storage placement",
+  workspaceView.required.includes("storage_volume_id") &&
+    workspaceView.required.includes("region"),
+  "WorkspaceView must expose its public storage placement",
 );
 const snapshotView = document.components.schemas.SnapshotView;
 assert(
@@ -1241,11 +1251,11 @@ assertSameMembers(
   "SnapshotView delivery target fields changed",
 );
 assertSameMembers(
-  document.components.schemas.PlaygroundView.required.filter((field) =>
+  document.components.schemas.WorkspaceView.required.filter((field) =>
     ["tenant_id", "project_id", "artifact_id"].includes(field),
   ),
   ["tenant_id", "project_id", "artifact_id"],
-  "Playground must retain its immutable Artifact source scope",
+  "Workspace must retain its immutable Artifact source scope",
 );
 assertSameMembers(
   document.components.schemas.SnapshotView.required.filter((field) =>
@@ -1267,10 +1277,10 @@ assert(
 );
 
 assert(
-  document.components.schemas.CreatePlaygroundRequest.required.includes(
+  document.components.schemas.CreateWorkspaceRequest.required.includes(
     "storage_volume_id",
   ),
-  "CreatePlaygroundRequest must select a StorageVolume",
+  "CreateWorkspaceRequest must select a StorageVolume",
 );
 assert(
   document.components.schemas.CreateSnapshotRequest.required.includes(
@@ -1316,16 +1326,16 @@ assertDescriptionIncludes(
   "Direct StorageVolume registration response state is not documented",
 );
 
-const createPlaygroundRequest =
-  document.components.schemas.CreatePlaygroundRequest;
+const createWorkspaceRequest =
+  document.components.schemas.CreateWorkspaceRequest;
 assert(
-  !createPlaygroundRequest.properties.region,
-  "Playground create must derive Region from its selected Volume",
+  !createWorkspaceRequest.properties.region,
+  "Workspace create must derive Region from its selected Volume",
 );
 assertDescriptionIncludes(
-  createPlaygroundRequest,
+  createWorkspaceRequest,
   ["state=ready", "Region"],
-  "Playground ready-only placement semantics are not documented",
+  "Workspace ready-only placement semantics are not documented",
 );
 assertDescriptionIncludes(
   createSnapshotRequest,
@@ -1340,10 +1350,10 @@ assertDescriptionIncludes(
   "Snapshot target-first creation boundary is not documented",
 );
 
-const startPreCommit = document.paths["/api/playground/precommit/start"].post;
+const startPreCommit = document.paths["/api/workspace/precommit/start"].post;
 const restartPreCommit =
-  document.paths["/api/playground/precommit/restart"].post;
-const commitPlayground = document.paths["/api/playground/commit/create"].post;
+  document.paths["/api/workspace/precommit/restart"].post;
+const commitWorkspace = document.paths["/api/workspace/commit/create"].post;
 assertDescriptionIncludes(
   startPreCommit,
   ["新的", "precommit_id", "内部冻结", "Head", "不得隐式"],
@@ -1355,7 +1365,7 @@ assertDescriptionIncludes(
   "Pre-commit restart/attempt semantics are not documented",
 );
 assertDescriptionIncludes(
-  commitPlayground,
+  commitWorkspace,
   ["state=ready, phase=idle", "blockers", "内部冻结", "Head", "CAS", "409"],
   "Commit candidate and internal Head CAS semantics are not documented",
 );
@@ -1373,13 +1383,13 @@ for (const schemaName of [
   );
 }
 
-const [playgroundCreatePath, [playgroundCreateMethod]] = Object.entries(
+const [workspaceCreatePath, [workspaceCreateMethod]] = Object.entries(
   expectedOperations,
-).find(([, [, candidate]]) => candidate === "createPlayground");
+).find(([, [, candidate]]) => candidate === "createWorkspace");
 assertDescriptionIncludes(
-  document.paths[playgroundCreatePath][playgroundCreateMethod],
+  document.paths[workspaceCreatePath][workspaceCreateMethod],
   ["state=ready", "degraded", "unavailable", "409"],
-  "createPlayground ready-only placement rejection is not documented",
+  "createWorkspace ready-only placement rejection is not documented",
 );
 const [snapshotCreatePath, [snapshotCreateMethod]] = Object.entries(
   expectedOperations,
@@ -1662,7 +1672,8 @@ const createEnrollmentTokenResponseFields = [
   "bootstrap_token",
   "volume_descriptor_digest",
   "expires_at_unix_ms",
-  "replayed",
+  "request_replayed",
+  "execution_reused",
 ];
 assertSameMembers(
   createEnrollmentTokenResponse.required,
@@ -1709,7 +1720,13 @@ assertSameMembers(
 );
 assertDescriptionIncludes(
   createEnrollmentTokenResponse,
-  ["只在本响应中返回", "相同 token_request_id", "相同 payload", "replayed"],
+  [
+    "只在本响应中返回",
+    "相同 token_request_id",
+    "相同 payload",
+    "request_replayed",
+    "execution_reused",
+  ],
   "Storage enrollment token replay or exposure boundary is incomplete",
 );
 
@@ -1718,7 +1735,7 @@ const tokenSuccessMedia = resolveRef(
 ).content["application/json"];
 assertSameMembers(
   Object.keys(tokenSuccessMedia.examples ?? {}),
-  ["created", "replayed"],
+  ["created", "request_replayed"],
   "Storage enrollment token success/replay examples changed",
 );
 for (const example of Object.values(tokenSuccessMedia.examples)) {
@@ -1730,11 +1747,11 @@ for (const example of Object.values(tokenSuccessMedia.examples)) {
 }
 assert(
   tokenSuccessMedia.examples.created.value.token_id ===
-    tokenSuccessMedia.examples.replayed.value.token_id &&
+    tokenSuccessMedia.examples.request_replayed.value.token_id &&
     tokenSuccessMedia.examples.created.value.bootstrap_token ===
-      tokenSuccessMedia.examples.replayed.value.bootstrap_token &&
+      tokenSuccessMedia.examples.request_replayed.value.bootstrap_token &&
     tokenSuccessMedia.examples.created.value.expires_at_unix_ms ===
-      tokenSuccessMedia.examples.replayed.value.expires_at_unix_ms,
+      tokenSuccessMedia.examples.request_replayed.value.expires_at_unix_ms,
   "Storage enrollment token replay must return the original result",
 );
 
@@ -1997,7 +2014,12 @@ const approveEnrollmentResponse =
   document.components.schemas.ApproveStorageEnrollmentResponse;
 assertSameMembers(
   approveEnrollmentResponse.required,
-  ["enrollment", "storage_volume", "replayed"],
+  [
+    "enrollment",
+    "storage_volume",
+    "request_replayed",
+    "execution_reused",
+  ],
   "Storage enrollment approval response fields changed",
 );
 assert(

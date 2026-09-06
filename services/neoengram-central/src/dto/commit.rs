@@ -1,7 +1,7 @@
 use fusen_rs::SensitiveFields;
 use serde::{Deserialize, Serialize};
 
-use super::{IndexVersionBody, PlaygroundView, PreCommitView, TaskView};
+use super::{IndexVersionBody, PreCommitView, TaskView, WorkspaceView};
 
 /// Immutable Commit data layout. The value is frozen when a Pre-commit starts and is part of
 /// the resulting Commit identity.
@@ -104,11 +104,12 @@ pub struct CommitGraphView {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
-pub struct CommitPlaygroundRequest {
+pub struct CommitWorkspaceRequest {
     pub tenant_id: String,
     pub project_id: String,
     pub artifact_id: String,
-    pub playground_id: String,
+    #[serde(rename = "workspace_id")]
+    pub workspace_id: String,
     pub commit_request_id: String,
     pub precommit_id: String,
     pub expected_candidate_index_version: IndexVersionBody,
@@ -138,11 +139,13 @@ pub struct CommitNodeView {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SensitiveFields)]
 #[serde(deny_unknown_fields)]
 #[sensitive(opaque)]
-pub struct CommitPlaygroundResponse {
+pub struct CommitWorkspaceResponse {
     pub commit: CommitNodeView,
-    pub playground: PlaygroundView,
+    #[serde(rename = "workspace")]
+    pub workspace: WorkspaceView,
     pub consumed_precommit: PreCommitView,
-    pub replayed: bool,
+    pub request_replayed: bool,
+    pub execution_reused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskView>,
 }

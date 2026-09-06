@@ -17,7 +17,14 @@ const queryClient = useQueryClient();
 const tenantId = computed(() => String(route.params.tenantId ?? ''));
 const taskId = computed(() => String(route.params.taskId ?? ''));
 const queryKey = computed(() => ['task', tenantId.value, taskId.value] as const);
-const activeStates = new Set<TaskState>(['queued', 'running', 'waiting', 'verifying', 'stalled']);
+const activeStates = new Set<TaskState>([
+  'queued',
+  'running',
+  'waiting',
+  'verifying',
+  'stalled',
+  'cancelling',
+]);
 
 const taskQuery = useQuery({
   queryKey,
@@ -31,7 +38,7 @@ const taskQuery = useQuery({
 const task = computed(() => taskQuery.data.value?.data.task);
 const attempts = computed(() => taskQuery.data.value?.data.attempts ?? []);
 const events = computed(() => taskQuery.data.value?.data.events ?? []);
-const children = computed(() => taskQuery.data.value?.data.children ?? []);
+const stages = computed(() => task.value?.stages ?? []);
 
 const retryMutation = useMutation({
   mutationFn: () =>
@@ -43,7 +50,7 @@ const retryMutation = useMutation({
   onSuccess: async (result) => {
     queryClient.setQueryData(queryKey.value, result);
     await taskQuery.refetch();
-    ElMessage.success(result.data.replayed ? '任务已保持原状态' : '任务已重新排队');
+    ElMessage.success(result.data.request_replayed ? '任务已保持原状态' : '任务已重新排队');
   },
 });
 
@@ -57,7 +64,7 @@ const cancelMutation = useMutation({
   onSuccess: async (result) => {
     queryClient.setQueryData(queryKey.value, result);
     await taskQuery.refetch();
-    ElMessage.success(result.data.replayed ? '任务已是取消状态' : '任务已取消');
+    ElMessage.success(result.data.request_replayed ? '任务已是取消状态' : '任务已取消');
   },
 });
 
@@ -111,13 +118,7 @@ function eventLabel(event: TaskEventView): string {
 }
 
 function scope(taskView: TaskView): string {
-  return (
-    taskView.commit_id ??
-    taskView.artifact_id ??
-    taskView.playground_id ??
-    taskView.snapshot_id ??
-    '—'
-  );
+  return taskView.primary_resource.resource_id || '—';
 }
 
 async function back(): Promise<void> {
@@ -132,6 +133,7 @@ const stateLabels: Record<TaskState, string> = {
   stalled: '已停滞',
   succeeded: '已完成',
   failed: '失败',
+  cancelling: '取消中',
   cancelled: '已取消',
 };
 const eventLabels: Record<string, string> = {
@@ -152,7 +154,10 @@ const eventLabels: Record<string, string> = {
 
 <template>
   <div class="page">
-    <PageHeading :title="task?.task_id ?? taskId" :description="task?.task_kind ?? '统一操作任务'">
+    <PageHeading
+      :title="task?.task_id ?? taskId"
+      :description="task?.intent_kind ?? '统一操作任务'"
+    >
       <template #actions>
         <el-button :icon="ArrowLeft" @click="back">返回任务列表</el-button>
         <el-button
@@ -201,11 +206,11 @@ const eventLabels: Record<string, string> = {
         <dl class="definition-grid definition-grid--scope">
           <div>
             <dt>类型</dt>
-            <dd>{{ task.task_kind }}</dd>
+            <dd>{{ task.intent_kind }}</dd>
           </div>
           <div>
-            <dt>阶段</dt>
-            <dd>{{ task.phase }}</dd>
+            <dt>当前阶段</dt>
+            <dd>{{ task.current_stage.stage_key }}</dd>
           </div>
           <div>
             <dt>Attempt</dt>
@@ -262,7 +267,7 @@ const eventLabels: Record<string, string> = {
               }}</el-tag></template
             ></el-table-column
           >
-          <el-table-column prop="phase" label="阶段" min-width="130" />
+          <el-table-column prop="current_stage_key" label="当前阶段" min-width="130" />
           <el-table-column label="更新时间" min-width="180"
             ><template #default="slotProps">{{
               formatTime(slotProps.row.updated_at_unix_ms)
@@ -294,20 +299,16 @@ const eventLabels: Record<string, string> = {
         </ol>
       </section>
 
-      <section v-if="children.length" class="content-section">
+      <section v-if="stages.length" class="content-section">
         <div class="section-heading">
           <div>
-            <h2>子任务</h2>
-            <p>{{ children.length }} 个关联执行任务</p>
+            <h2>执行阶段</h2>
+            <p>{{ stages.length }} 个阶段</p>
           </div>
         </div>
-        <el-table :data="children" size="small">
-          <el-table-column label="任务" min-width="250"
-            ><template #default="slotProps"
-              ><code>{{ slotProps.row.task_id }}</code></template
-            ></el-table-column
-          >
-          <el-table-column prop="task_kind" label="类型" min-width="190" />
+        <el-table :data="stages" size="small">
+          <el-table-column prop="stage_key" label="阶段" min-width="190" />
+          <el-table-column prop="stage_kind" label="类型" min-width="190" />
           <el-table-column label="状态" width="120"
             ><template #default="slotProps"
               ><el-tag :type="stateType(slotProps.row.state)" effect="plain">{{
@@ -315,6 +316,7 @@ const eventLabels: Record<string, string> = {
               }}</el-tag></template
             ></el-table-column
           >
+          <el-table-column prop="stage_attempt" label="阶段 Attempt" width="120" />
         </el-table>
       </section>
     </div>

@@ -3,14 +3,14 @@ use neoengram_central::{
     InitializeIndexSnapshotRequest,
 };
 use neoengram_domain::core::{ContentDigest, FileRecord, IndexVersion, LogicalPath, ManifestId};
-use neoengram_domain::protocol::{ArtifactId, PlaygroundId, ProjectId, TenantId, WireIndexVersion};
+use neoengram_domain::protocol::{ArtifactId, ProjectId, TenantId, WireIndexVersion, WorkspaceId};
 
-fn index_key(playground_id: &str) -> IndexKey {
+fn index_key(workspace_id: &str) -> IndexKey {
     IndexKey {
         tenant_id: TenantId::new("tenant-index-init").unwrap(),
         project_id: ProjectId::new("project-index-init").unwrap(),
         artifact_id: ArtifactId::new("artifact-index-init").unwrap(),
-        playground_id: PlaygroundId::new(playground_id).unwrap(),
+        workspace_id: WorkspaceId::new(workspace_id).unwrap(),
     }
 }
 
@@ -43,7 +43,7 @@ fn request(
 #[tokio::test]
 async fn memory_initialization_is_create_only_and_exactly_idempotent() {
     let publisher = InMemoryIndexPublisher::default();
-    let key = index_key("playground-memory-init");
+    let key = index_key("workspace-memory-init");
     let records = vec![record("a", 1), record("b/c", 2)];
     let initialization = request(key.clone(), 7, records.clone());
 
@@ -68,7 +68,7 @@ async fn memory_initialization_is_create_only_and_exactly_idempotent() {
 #[tokio::test]
 async fn memory_empty_initialization_is_distinct_from_an_absent_virtual_empty_index() {
     let publisher = InMemoryIndexPublisher::default();
-    let key = index_key("playground-empty-init");
+    let key = index_key("workspace-empty-init");
     let empty = request(key.clone(), 0, Vec::new());
 
     publisher.initialize_snapshot(empty.clone()).await.unwrap();
@@ -85,7 +85,7 @@ async fn memory_empty_initialization_is_distinct_from_an_absent_virtual_empty_in
 #[tokio::test]
 async fn initialization_rejects_noncanonical_records_and_digest_without_mutation() {
     let publisher = InMemoryIndexPublisher::default();
-    let key = index_key("playground-invalid-init");
+    let key = index_key("workspace-invalid-init");
     let canonical = vec![record("a", 1), record("b", 2)];
 
     let digest_error = publisher
@@ -124,7 +124,7 @@ async fn sqlite_initialization_replays_after_reopen_and_rejects_different_conten
     use neoengram_central::{open_sqlite_authority, SqliteAuthorityConfig};
 
     let directory = tempfile::TempDir::new().unwrap();
-    let key = index_key("playground-sqlite-init");
+    let key = index_key("workspace-sqlite-init");
     let records = vec![record("a", 1), record("nested/b", 2)];
     let initialization = request(key.clone(), 12, records.clone());
 

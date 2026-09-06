@@ -31,9 +31,9 @@ use crate::{
     FinalizeReplicationRequest, FinalizeReplicationResult,
     MaterializationLeaseExpiryReconciliation, MaterializationPlan,
     MaterializationPlanInsertOutcome, MaterializationPlanReplacement, PlacementRepository,
-    RefreshReplicationRoutesRequest, ReplicationObjectRecord, ReplicationRecord,
-    ReplicationRouteBinding, ReplicationStateTransitionRequest, RetryReplicationRequest,
-    RetryReplicationResult, WorkspaceRecord,
+    PlacementWorkspaceRecord, RefreshReplicationRoutesRequest, ReplicationObjectRecord,
+    ReplicationRecord, ReplicationRouteBinding, ReplicationStateTransitionRequest,
+    RetryReplicationRequest, RetryReplicationResult,
 };
 
 fn as_i64(value: UnixMillis) -> CentralResult<i64> {
@@ -1892,13 +1892,13 @@ fn decode_replication(row: &SqliteRow) -> CentralResult<ReplicationRecord> {
     })
 }
 
-fn decode_workspace(row: &SqliteRow) -> CentralResult<WorkspaceRecord> {
+fn decode_workspace(row: &SqliteRow) -> CentralResult<PlacementWorkspaceRecord> {
     let base_commit_id = row
         .try_get::<Option<Vec<u8>>, _>("base_commit_id")
         .map_err(storage_error)?
         .map(|bytes| digest_from_blob(bytes, "workspace base_commit_id"))
         .transpose()?;
-    Ok(WorkspaceRecord {
+    Ok(PlacementWorkspaceRecord {
         tenant_id: TenantId::new(
             row.try_get::<String, _>("tenant_id")
                 .map_err(storage_error)?,
@@ -8039,7 +8039,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         &self,
         tenant_id: &TenantId,
         workspace_id: &WorkspaceId,
-    ) -> CentralResult<Option<WorkspaceRecord>> {
+    ) -> CentralResult<Option<PlacementWorkspaceRecord>> {
         let sql = format!(
             "SELECT {WORKSPACE_COLUMNS} FROM workspaces WHERE tenant_id = ? AND workspace_id = ?"
         );
@@ -8057,7 +8057,7 @@ impl PlacementRepository for SqliteAuthorityStore {
         &self,
         tenant_id: &TenantId,
         request_id: &RequestId,
-    ) -> CentralResult<Option<WorkspaceRecord>> {
+    ) -> CentralResult<Option<PlacementWorkspaceRecord>> {
         let sql = format!(
             "SELECT {WORKSPACE_COLUMNS} FROM workspaces WHERE tenant_id = ? AND request_id = ?"
         );
@@ -8071,7 +8071,10 @@ impl PlacementRepository for SqliteAuthorityStore {
             .transpose()
     }
 
-    async fn insert_workspace(&self, record: WorkspaceRecord) -> CentralResult<WorkspaceRecord> {
+    async fn insert_workspace(
+        &self,
+        record: PlacementWorkspaceRecord,
+    ) -> CentralResult<PlacementWorkspaceRecord> {
         if record.created_at_unix_ms > record.updated_at_unix_ms {
             return Err(CentralError::new(
                 CentralErrorCode::ProtocolInvalid,
@@ -8362,7 +8365,7 @@ mod tests {
                 .unwrap(),
             Some(record)
         );
-        let workspace = WorkspaceRecord {
+        let workspace = PlacementWorkspaceRecord {
             tenant_id: tenant_id.clone(),
             workspace_id: WorkspaceId::new("workspace-test-1").unwrap(),
             project_id: neoengram_domain::protocol::ProjectId::new("project-a").unwrap(),

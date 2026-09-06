@@ -36,7 +36,7 @@ impl AuthorityLifecycleRepository for SqliteAuthorityStore {
             .count();
 
         let placement_rows = sqlx::query(
-            "SELECT artifact_id, storage_volume_id, object_id, size \
+            "SELECT project_id, artifact_id, storage_volume_id, object_id, size \
              FROM managed_object_placement_evidence WHERE tenant_id = ?",
         )
         .bind(tenant_id.as_str())
@@ -46,10 +46,14 @@ impl AuthorityLifecycleRepository for SqliteAuthorityStore {
         let mut objects = BTreeSet::new();
         let mut estimated_bytes = 0_u64;
         for row in placement_rows {
+            let project_id: String = row.try_get("project_id").map_err(storage_error)?;
             let artifact_id: String = row.try_get("artifact_id").map_err(storage_error)?;
             let storage_volume_id: String =
                 row.try_get("storage_volume_id").map_err(storage_error)?;
             let matches = match target {
+                ResourceRef::Project {
+                    project_id: expected,
+                } => project_id == expected.as_str(),
                 ResourceRef::StorageVolume {
                     storage_volume_id: expected,
                 } => storage_volume_id == expected.as_str(),
@@ -57,7 +61,7 @@ impl AuthorityLifecycleRepository for SqliteAuthorityStore {
                     artifact_id: expected,
                     ..
                 } => artifact_id == expected.as_str(),
-                ResourceRef::Playground { .. } | ResourceRef::Snapshot { .. } => false,
+                ResourceRef::Workspace { .. } | ResourceRef::Snapshot { .. } => false,
             };
             if !matches {
                 continue;
@@ -393,16 +397,17 @@ async fn finalize_metadata(
 
     delete_matching_jobs(transaction, &request.tenant_id, &request.target).await?;
     match &request.target {
+        ResourceRef::Project { .. } => {}
         ResourceRef::Snapshot { .. } => {}
-        ResourceRef::Playground {
+        ResourceRef::Workspace {
             project_id,
             artifact_id,
-            playground_id,
+            workspace_id,
         } => {
             sqlx::query(
                 "DELETE FROM precommit_mutations WHERE tenant_id = ? AND precommit_id IN ( \
                      SELECT precommit_id FROM precommit_records WHERE tenant_id = ? \
-                       AND project_id = ? AND artifact_id = ? AND playground_id = ? \
+                       AND project_id = ? AND artifact_id = ? AND workspace_id = ? \
                        AND state <> 'committed' \
                  )",
             )
@@ -410,29 +415,29 @@ async fn finalize_metadata(
             .bind(request.tenant_id.as_str())
             .bind(project_id.as_str())
             .bind(artifact_id.as_str())
-            .bind(playground_id.as_str())
+            .bind(workspace_id.as_str())
             .execute(&mut **transaction)
             .await
             .map_err(storage_error)?;
             sqlx::query(
                 "DELETE FROM precommit_records WHERE tenant_id = ? AND project_id = ? \
-                 AND artifact_id = ? AND playground_id = ? AND state <> 'committed'",
+                 AND artifact_id = ? AND workspace_id = ? AND state <> 'committed'",
             )
             .bind(request.tenant_id.as_str())
             .bind(project_id.as_str())
             .bind(artifact_id.as_str())
-            .bind(playground_id.as_str())
+            .bind(workspace_id.as_str())
             .execute(&mut **transaction)
             .await
             .map_err(storage_error)?;
             sqlx::query(
-                "DELETE FROM playground_indexes WHERE tenant_id = ? AND project_id = ? \
-                 AND artifact_id = ? AND playground_id = ?",
+                "DELETE FROM workspace_indexes WHERE tenant_id = ? AND project_id = ? \
+                 AND artifact_id = ? AND workspace_id = ?",
             )
             .bind(request.tenant_id.as_str())
             .bind(project_id.as_str())
             .bind(artifact_id.as_str())
-            .bind(playground_id.as_str())
+            .bind(workspace_id.as_str())
             .execute(&mut **transaction)
             .await
             .map_err(storage_error)?;
@@ -473,7 +478,7 @@ async fn finalize_metadata(
             .await
             .map_err(storage_error)?;
             sqlx::query(
-                "DELETE FROM playground_indexes WHERE tenant_id = ? AND project_id = ? AND artifact_id = ?",
+                "DELETE FROM workspace_indexes WHERE tenant_id = ? AND project_id = ? AND artifact_id = ?",
             )
             .bind(request.tenant_id.as_str())
             .bind(project_id.as_str())
@@ -568,23 +573,24 @@ async fn delete_matching_jobs(
 
 fn job_matches_target(job: &JobRecord, target: &ResourceRef) -> bool {
     match target {
+        ResourceRef::Project { project_id } => &job.spec.project_id == project_id,
         ResourceRef::Artifact {
             project_id,
             artifact_id,
         } => &job.spec.project_id == project_id && &job.spec.artifact_id == artifact_id,
-        ResourceRef::Playground {
+        ResourceRef::Workspace {
             project_id,
             artifact_id,
-            playground_id,
+            workspace_id,
         } => {
             &job.spec.project_id == project_id
                 && &job.spec.artifact_id == artifact_id
                 && match job.operation {
-                    JobOperation::Add => &job.spec.playground_id == playground_id,
+                    JobOperation::Add => &job.spec.workspace_id == workspace_id,
                     JobOperation::WorkspaceMaterialize => job
                         .workspace_spec
                         .as_ref()
-                        .is_some_and(|spec| &spec.playground_id == playground_id),
+                        .is_some_and(|spec| &spec.workspace_id == workspace_id),
                     JobOperation::SnapshotDelivery => false,
                 }
         }
@@ -610,18 +616,19 @@ fn job_matches_target(job: &JobRecord, target: &ResourceRef) -> bool {
 
 fn precommit_matches_target(record: &PreCommitRecord, target: &ResourceRef) -> bool {
     match target {
+        ResourceRef::Project { project_id } => &record.project_id == project_id,
         ResourceRef::Artifact {
             project_id,
             artifact_id,
         } => &record.project_id == project_id && &record.artifact_id == artifact_id,
-        ResourceRef::Playground {
+        ResourceRef::Workspace {
             project_id,
             artifact_id,
-            playground_id,
+            workspace_id,
         } => {
             &record.project_id == project_id
                 && &record.artifact_id == artifact_id
-                && &record.playground_id == playground_id
+                && &record.workspace_id == workspace_id
         }
         ResourceRef::StorageVolume { .. } | ResourceRef::Snapshot { .. } => false,
     }
@@ -629,6 +636,7 @@ fn precommit_matches_target(record: &PreCommitRecord, target: &ResourceRef) -> b
 
 fn target_identity(target: &ResourceRef) -> (&'static str, String) {
     match target {
+        ResourceRef::Project { project_id } => ("project", project_id.to_string()),
         ResourceRef::StorageVolume { storage_volume_id } => {
             ("storage_volume", storage_volume_id.to_string())
         }
@@ -636,13 +644,13 @@ fn target_identity(target: &ResourceRef) -> (&'static str, String) {
             project_id,
             artifact_id,
         } => ("artifact", format!("{project_id}/{artifact_id}")),
-        ResourceRef::Playground {
+        ResourceRef::Workspace {
             project_id,
             artifact_id,
-            playground_id,
+            workspace_id,
         } => (
-            "playground",
-            format!("{project_id}/{artifact_id}/{playground_id}"),
+            "workspace",
+            format!("{project_id}/{artifact_id}/{workspace_id}"),
         ),
         ResourceRef::Snapshot { snapshot_id } => ("snapshot", snapshot_id.to_string()),
     }

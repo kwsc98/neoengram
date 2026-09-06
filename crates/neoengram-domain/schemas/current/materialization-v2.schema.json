@@ -487,6 +487,16 @@
         "signed_ticket": {
           "$ref": "#/$defs/SignedMaterializationBatchTicket"
         },
+        "stage_attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "stage_key": {
+          "type": "string"
+        },
+        "task_attempt": {
+          "description": "Explicit root/stage fences are carried in addition to opaque attempt identities.",
+          "$ref": "#/$defs/Generation"
+        },
         "task_attempt_id": {
           "description": "Exact execution attempt authorized for this assignment.",
           "$ref": "#/$defs/TaskAttemptId"
@@ -496,6 +506,9 @@
       "required": [
         "operation_task_id",
         "task_attempt_id",
+        "task_attempt",
+        "stage_key",
+        "stage_attempt",
         "signed_ticket",
         "batch",
         "manifest",
@@ -628,8 +641,17 @@
         "source": {
           "$ref": "#/$defs/MaterializationSource"
         },
+        "stage_attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "stage_key": {
+          "type": "string"
+        },
         "target": {
           "$ref": "#/$defs/MaterializationTarget"
+        },
+        "task_attempt": {
+          "$ref": "#/$defs/Generation"
         },
         "task_attempt_id": {
           "$ref": "#/$defs/TaskAttemptId"
@@ -646,6 +668,9 @@
         "ticket_id",
         "operation_task_id",
         "task_attempt_id",
+        "task_attempt",
+        "stage_key",
+        "stage_attempt",
         "materialization_id",
         "batch_id",
         "plan_revision",
@@ -767,6 +792,31 @@
         "object_namespace_id": {
           "$ref": "#/$defs/ObjectNamespaceId"
         },
+        "purpose": {
+          "description": "The user-visible purpose is part of execution identity. A repair must never reuse a copy\nplan, even when the target and Commit are otherwise identical.",
+          "$ref": "#/$defs/TaskPurpose"
+        },
+        "repair_observation_digest": {
+          "description": "Repair fence observed by the caller. Exactly one fence is required for `repair`; copy\nrequests must leave both unset.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ContentDigest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "repair_target_placement_generation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlacementGeneration"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "target_storage_volume_id": {
           "$ref": "#/$defs/StorageVolumeId"
         },
@@ -780,7 +830,8 @@
         "object_namespace_id",
         "commit_id",
         "target_storage_volume_id",
-        "coverage_goal"
+        "coverage_goal",
+        "purpose"
       ]
     },
     "MaterializationJobState": {
@@ -936,11 +987,20 @@
         "size": {
           "$ref": "#/$defs/DecimalU64"
         },
+        "stage_attempt": {
+          "$ref": "#/$defs/Generation"
+        },
+        "stage_key": {
+          "type": "string"
+        },
         "target_placement_generation": {
           "$ref": "#/$defs/PlacementGeneration"
         },
         "target_storage_volume_id": {
           "$ref": "#/$defs/StorageVolumeId"
+        },
+        "task_attempt": {
+          "$ref": "#/$defs/Generation"
         },
         "task_attempt_id": {
           "$ref": "#/$defs/TaskAttemptId"
@@ -960,6 +1020,9 @@
         "receipt_id",
         "operation_task_id",
         "task_attempt_id",
+        "task_attempt",
+        "stage_key",
+        "stage_attempt",
         "materialization_id",
         "batch_id",
         "plan_revision",
@@ -1069,9 +1132,18 @@
                 "plan_revision": {
                   "$ref": "#/$defs/Generation"
                 },
+                "stage_attempt": {
+                  "$ref": "#/$defs/Generation"
+                },
+                "stage_key": {
+                  "type": "string"
+                },
                 "target": {
                   "description": "The complete target fence from the signed assignment.  Failure reports must not rely\non whatever route happens to be current when Central receives them.",
                   "$ref": "#/$defs/MaterializationTarget"
+                },
+                "task_attempt": {
+                  "$ref": "#/$defs/Generation"
                 },
                 "task_attempt_id": {
                   "$ref": "#/$defs/TaskAttemptId"
@@ -1084,6 +1156,9 @@
               "required": [
                 "operation_task_id",
                 "task_attempt_id",
+                "task_attempt",
+                "stage_key",
+                "stage_attempt",
                 "materialization_id",
                 "batch_id",
                 "plan_revision",
@@ -1653,6 +1728,14 @@
       "maxLength": 128,
       "minLength": 1,
       "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
+    },
+    "TaskPurpose": {
+      "description": "Optional semantic purpose for an intent that can reuse an existing execution plan.\n\nAt present only commit materialization uses a purpose.  The value is intentionally separate\nfrom [`TaskIntent`] so `commit.copy` and `commit.repair` share one execution implementation and\ndiffer only in their idempotency/fencing inputs.",
+      "type": "string",
+      "enum": [
+        "copy",
+        "repair"
+      ]
     },
     "TenantId": {
       "description": "A validated tenant ID wire identifier.",

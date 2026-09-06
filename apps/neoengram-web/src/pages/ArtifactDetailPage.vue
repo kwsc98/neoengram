@@ -6,11 +6,11 @@ import { computed, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
 import {
-  createPlayground,
+  createWorkspace,
   queryApiVersion,
   queryArtifact,
   queryArtifactCommitGraph,
-  queryPlaygroundList,
+  queryWorkspaceList,
   querySnapshotList,
 } from '@/api/operations';
 import type { CommitNode } from '@/api/types';
@@ -21,15 +21,15 @@ import PageHeading from '@/components/PageHeading.vue';
 import StorageVolumeFilter from '@/components/StorageVolumeFilter.vue';
 import {
   supportsArtifactCommitGraph,
-  supportsPlaygroundMaterialize,
+  supportsWorkspaceMaterialize,
   supportsSnapshotMaterialize,
 } from '@/features/capabilities';
 import {
-  playgroundLifecycleLabel,
-  playgroundLifecycleTagType,
-  playgroundStorageAvailability,
-  playgroundStorageAvailabilityLabel,
-  playgroundStorageAvailabilityTagType,
+  workspaceLifecycleLabel,
+  workspaceLifecycleTagType,
+  workspaceStorageAvailability,
+  workspaceStorageAvailabilityLabel,
+  workspaceStorageAvailabilityTagType,
 } from '@/features/precommit/status';
 import { snapshotStateLabel, snapshotStateTagType } from '@/features/snapshots/status';
 import { useTenantsStore } from '@/stores/tenants';
@@ -52,8 +52,8 @@ const versionQuery = useQuery({
 const artifactCommitGraphEnabled = computed(() =>
   supportsArtifactCommitGraph(versionQuery.data.value?.data.capabilities),
 );
-const playgroundMaterializeEnabled = computed(() =>
-  supportsPlaygroundMaterialize(versionQuery.data.value?.data.capabilities),
+const workspaceMaterializeEnabled = computed(() =>
+  supportsWorkspaceMaterialize(versionQuery.data.value?.data.capabilities),
 );
 const snapshotMaterializeEnabled = computed(() =>
   supportsSnapshotMaterialize(versionQuery.data.value?.data.capabilities),
@@ -61,7 +61,7 @@ const snapshotMaterializeEnabled = computed(() =>
 const allowedTabs = computed(() => [
   'overview',
   ...(artifactCommitGraphEnabled.value ? ['commits'] : []),
-  'playgrounds',
+  'workspaces',
   ...(snapshotMaterializeEnabled.value ? ['snapshots'] : []),
 ]);
 const activeTab = ref('overview');
@@ -69,10 +69,10 @@ const commitNodes = ref<CommitNode[]>([]);
 const nextCommitCursor = ref<string>();
 const loadingMoreCommits = ref(false);
 const loadMoreCommitsError = ref<unknown>();
-const createPlaygroundOpen = ref(false);
+const createWorkspaceOpen = ref(false);
 const mutationError = ref('');
-const playgroundForm = reactive({
-  playgroundId: '',
+const workspaceForm = reactive({
+  workspaceId: '',
   displayName: '',
   baseCommitId: '',
   storageVolumeId: '',
@@ -83,7 +83,7 @@ const canCreateSnapshot = computed(
     Boolean(artifact.value?.head_commit_id) &&
     (tenants.byId(tenantId.value)?.permissions.includes('snapshot.create') ?? false),
 );
-const createPlaygroundMutation = useMutation({ mutationFn: createPlayground });
+const createWorkspaceMutation = useMutation({ mutationFn: createWorkspace });
 
 const artifactQuery = useQuery({
   queryKey: computed(() => ['artifact', tenantId.value, projectId.value, artifactId.value]),
@@ -94,11 +94,11 @@ const artifactScopeKey = computed(() =>
   [tenantId.value, projectId.value, artifactId.value].join('\u0000'),
 );
 let commitDataEpoch = 0;
-const canCreatePlayground = computed(
+const canCreateWorkspace = computed(
   () =>
     Boolean(artifact.value) &&
-    (tenants.byId(tenantId.value)?.permissions.includes('playground.create') ?? false) &&
-    playgroundMaterializeEnabled.value,
+    (tenants.byId(tenantId.value)?.permissions.includes('workspace.create') ?? false) &&
+    workspaceMaterializeEnabled.value,
 );
 
 const commitQuery = useQuery({
@@ -117,24 +117,24 @@ const currentCommit = computed(() => {
 });
 const currentCommitTags = computed(() => commitTagNames(currentCommit.value?.tag_names ?? []));
 const commitTree = computed(() => buildCommitTree(commitNodes.value));
-const playgroundQuery = useQuery({
+const workspaceQuery = useQuery({
   queryKey: computed(() => [
-    'playgrounds',
+    'workspaces',
     tenantId.value,
     projectId.value,
     artifactId.value,
     'artifact-detail',
   ]),
   queryFn: () =>
-    queryPlaygroundList({
+    queryWorkspaceList({
       tenant_id: tenantId.value,
       project_id: projectId.value,
       artifact_id: artifactId.value,
       page_size: 100,
     }),
-  enabled: computed(() => activeTab.value === 'overview' || activeTab.value === 'playgrounds'),
+  enabled: computed(() => activeTab.value === 'overview' || activeTab.value === 'workspaces'),
   refetchInterval: (query) =>
-    query.state.data?.data.items.some((playground) => playground.state === 'creating')
+    query.state.data?.data.items.some((workspace) => workspace.state === 'creating')
       ? 1_000
       : 5_000,
 });
@@ -161,13 +161,13 @@ const snapshotQuery = useQuery({
   refetchInterval: (query) =>
     query.state.data?.data.items.some((snapshot) => snapshot.state === 'creating') ? 1000 : false,
 });
-const artifactPlaygrounds = computed(() => playgroundQuery.data.value?.data.items ?? []);
+const artifactWorkspaces = computed(() => workspaceQuery.data.value?.data.items ?? []);
 const artifactSnapshots = computed(() => snapshotQuery.data.value?.data.items ?? []);
 const detailRefreshing = computed(
   () =>
     artifactQuery.isFetching.value ||
     commitQuery.isFetching.value ||
-    playgroundQuery.isFetching.value ||
+    workspaceQuery.isFetching.value ||
     snapshotQuery.isFetching.value,
 );
 
@@ -199,9 +199,9 @@ watch(artifactScopeKey, () => {
   nextCommitCursor.value = undefined;
   loadingMoreCommits.value = false;
   loadMoreCommitsError.value = undefined;
-  createPlaygroundOpen.value = false;
+  createWorkspaceOpen.value = false;
   mutationError.value = '';
-  createPlaygroundMutation.reset();
+  createWorkspaceMutation.reset();
 });
 
 async function changeTab(tab: string | number): Promise<void> {
@@ -250,20 +250,20 @@ async function loadMoreCommits(): Promise<void> {
 }
 
 async function refreshArtifactDetail(): Promise<void> {
-  const requests: Promise<unknown>[] = [artifactQuery.refetch(), playgroundQuery.refetch()];
+  const requests: Promise<unknown>[] = [artifactQuery.refetch(), workspaceQuery.refetch()];
   if (artifactCommitGraphEnabled.value) requests.push(commitQuery.refetch());
   if (snapshotMaterializeEnabled.value) requests.push(snapshotQuery.refetch());
   await Promise.allSettled(requests);
 }
 
-async function openPlayground(playgroundId: string): Promise<void> {
+async function openWorkspace(workspaceId: string): Promise<void> {
   await router.push({
-    name: 'playground-detail',
+    name: 'workspace-detail',
     params: {
       tenantId: tenantId.value,
       projectId: projectId.value,
       artifactId: artifactId.value,
-      playgroundId,
+      workspaceId,
     },
   });
 }
@@ -280,42 +280,42 @@ async function openSnapshot(snapshotId: string): Promise<void> {
   });
 }
 
-function showCreatePlayground(): void {
+function showCreateWorkspace(): void {
   mutationError.value = '';
-  playgroundForm.playgroundId = '';
-  playgroundForm.displayName = '';
-  playgroundForm.storageVolumeId = '';
-  playgroundForm.baseCommitId = artifact.value?.head_commit_id ?? '';
-  createPlaygroundOpen.value = true;
+  workspaceForm.workspaceId = '';
+  workspaceForm.displayName = '';
+  workspaceForm.storageVolumeId = '';
+  workspaceForm.baseCommitId = artifact.value?.head_commit_id ?? '';
+  createWorkspaceOpen.value = true;
 }
 
-async function submitPlayground(): Promise<void> {
+async function submitWorkspace(): Promise<void> {
   mutationError.value = '';
   const resourceId = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
   if (
-    !resourceId.test(playgroundForm.playgroundId) ||
-    !playgroundForm.displayName.trim() ||
-    !playgroundForm.storageVolumeId
+    !resourceId.test(workspaceForm.workspaceId) ||
+    !workspaceForm.displayName.trim() ||
+    !workspaceForm.storageVolumeId
   ) {
-    mutationError.value = '请输入合法 Playground ID、名称并选择 StorageVolume';
+    mutationError.value = '请输入合法 Workspace ID、名称并选择 StorageVolume';
     return;
   }
   try {
-    const result = await createPlaygroundMutation.mutateAsync({
+    const result = await createWorkspaceMutation.mutateAsync({
       tenant_id: tenantId.value,
       project_id: projectId.value,
       artifact_id: artifactId.value,
-      playground_id: playgroundForm.playgroundId,
-      storage_volume_id: playgroundForm.storageVolumeId,
-      display_name: playgroundForm.displayName.trim(),
-      ...(playgroundForm.baseCommitId ? { base_commit_id: playgroundForm.baseCommitId } : {}),
+      workspace_id: workspaceForm.workspaceId,
+      storage_volume_id: workspaceForm.storageVolumeId,
+      display_name: workspaceForm.displayName.trim(),
+      ...(workspaceForm.baseCommitId ? { base_commit_id: workspaceForm.baseCommitId } : {}),
     });
-    createPlaygroundOpen.value = false;
-    await queryClient.invalidateQueries({ queryKey: ['playgrounds', tenantId.value] });
-    ElMessage.success(result.data.replayed ? '已返回现有 Playground' : 'Playground 已创建');
-    await openPlayground(result.data.playground.playground_id);
+    createWorkspaceOpen.value = false;
+    await queryClient.invalidateQueries({ queryKey: ['workspaces', tenantId.value] });
+    ElMessage.success(result.data.request_replayed ? '已返回现有 Workspace' : 'Workspace 已创建');
+    await openWorkspace(result.data.workspace.workspace_id);
   } catch (error) {
-    mutationError.value = error instanceof Error ? error.message : '创建 Playground 失败';
+    mutationError.value = error instanceof Error ? error.message : '创建 Workspace 失败';
   }
 }
 
@@ -341,8 +341,8 @@ async function showCreateSnapshot(): Promise<void> {
       :description="`${projectId} / ${artifactId}`"
     >
       <template #actions>
-        <el-button v-if="canCreatePlayground" :icon="Plus" @click="showCreatePlayground">
-          创建 Playground
+        <el-button v-if="canCreateWorkspace" :icon="Plus" @click="showCreateWorkspace">
+          创建 Workspace
         </el-button>
         <el-button
           v-if="canCreateSnapshot"
@@ -464,8 +464,8 @@ async function showCreateSnapshot(): Promise<void> {
               </dd>
             </div>
             <div>
-              <dt>Playgrounds</dt>
-              <dd>{{ artifactPlaygrounds.length }}</dd>
+              <dt>Workspaces</dt>
+              <dd>{{ artifactWorkspaces.length }}</dd>
             </div>
             <div v-if="snapshotMaterializeEnabled">
               <dt>Snapshots</dt>
@@ -539,43 +539,43 @@ async function showCreateSnapshot(): Promise<void> {
           </template>
         </el-tab-pane>
 
-        <el-tab-pane label="工作区" name="playgrounds">
+        <el-tab-pane label="工作区" name="workspaces">
           <ApiProblemAlert
-            v-if="playgroundQuery.error.value"
-            :error="playgroundQuery.error.value"
-            :retrying="playgroundQuery.isFetching.value"
-            @retry="playgroundQuery.refetch"
+            v-if="workspaceQuery.error.value"
+            :error="workspaceQuery.error.value"
+            :retrying="workspaceQuery.isFetching.value"
+            @retry="workspaceQuery.refetch"
           />
-          <el-skeleton v-if="playgroundQuery.isPending.value" :rows="5" animated />
+          <el-skeleton v-if="workspaceQuery.isPending.value" :rows="5" animated />
           <el-empty
-            v-else-if="!playgroundQuery.data.value?.data.items.length"
-            description="此 Artifact 暂无 Playground"
+            v-else-if="!workspaceQuery.data.value?.data.items.length"
+            description="此 Artifact 暂无 Workspace"
           />
           <div v-else class="relation-list">
             <button
-              v-for="playground in playgroundQuery.data.value?.data.items"
-              :key="playground.playground_id"
+              v-for="workspace in workspaceQuery.data.value?.data.items"
+              :key="workspace.workspace_id"
               type="button"
-              @click="openPlayground(playground.playground_id)"
+              @click="openWorkspace(workspace.workspace_id)"
             >
               <span>
-                <strong>{{ playground.display_name }}</strong>
-                <code>{{ playground.playground_id }}</code>
+                <strong>{{ workspace.display_name }}</strong>
+                <code>{{ workspace.workspace_id }}</code>
               </span>
               <span class="relation-list__aside">
-                <small>{{ playground.region }}</small>
-                <el-tag :type="playgroundLifecycleTagType(playground.state)" effect="plain">{{
-                  playgroundLifecycleLabel(playground.state)
+                <small>{{ workspace.region }}</small>
+                <el-tag :type="workspaceLifecycleTagType(workspace.state)" effect="plain">{{
+                  workspaceLifecycleLabel(workspace.state)
                 }}</el-tag
                 ><el-tag
                   :type="
-                    playgroundStorageAvailabilityTagType(playgroundStorageAvailability(playground))
+                    workspaceStorageAvailabilityTagType(workspaceStorageAvailability(workspace))
                   "
                   effect="plain"
                   >{{
-                    playgroundStorageAvailabilityLabel(playgroundStorageAvailability(playground))
+                    workspaceStorageAvailabilityLabel(workspaceStorageAvailability(workspace))
                   }}</el-tag
-                ><el-tag v-if="playground.active_precommit_id" type="warning" effect="plain">
+                ><el-tag v-if="workspace.active_precommit_id" type="warning" effect="plain">
                   活动 Pre-commit
                 </el-tag>
                 <ArrowRight />
@@ -629,45 +629,45 @@ async function showCreateSnapshot(): Promise<void> {
     </div>
 
     <el-dialog
-      v-model="createPlaygroundOpen"
-      title="创建 Playground"
+      v-model="createWorkspaceOpen"
+      title="创建 Workspace"
       width="min(560px, calc(100vw - 32px))"
     >
       <ApiProblemAlert
-        v-if="createPlaygroundMutation.error.value"
-        :error="createPlaygroundMutation.error.value"
+        v-if="createWorkspaceMutation.error.value"
+        :error="createWorkspaceMutation.error.value"
       />
       <el-alert v-if="mutationError" :title="mutationError" type="error" :closable="false" />
       <el-form label-position="top" class="dialog-form">
-        <el-form-item label="Playground ID">
-          <el-input v-model="playgroundForm.playgroundId" placeholder="review-july" />
+        <el-form-item label="Workspace ID">
+          <el-input v-model="workspaceForm.workspaceId" placeholder="review-july" />
         </el-form-item>
         <el-form-item label="名称">
-          <el-input v-model="playgroundForm.displayName" placeholder="七月复核" />
+          <el-input v-model="workspaceForm.displayName" placeholder="七月复核" />
         </el-form-item>
         <el-form-item label="StorageVolume" required>
-          <StorageVolumeFilter v-model="playgroundForm.storageVolumeId" :tenant-id="tenantId" />
+          <StorageVolumeFilter v-model="workspaceForm.storageVolumeId" :tenant-id="tenantId" />
         </el-form-item>
         <el-form-item label="Base Commit">
           <ArtifactCommitSelect
-            v-model="playgroundForm.baseCommitId"
+            v-model="workspaceForm.baseCommitId"
             :tenant-id="tenantId"
             :project-id="projectId"
             :artifact-id="artifactId"
             :head-commit-id="artifact?.head_commit_id"
-            :enabled="createPlaygroundOpen"
+            :enabled="createWorkspaceOpen"
             :allow-history="artifactCommitGraphEnabled"
           />
         </el-form-item>
       </el-form>
       <template #footer>
-        <el-button @click="createPlaygroundOpen = false">取消</el-button>
+        <el-button @click="createWorkspaceOpen = false">取消</el-button>
         <el-button
           type="primary"
-          :loading="createPlaygroundMutation.isPending.value"
-          @click="submitPlayground"
+          :loading="createWorkspaceMutation.isPending.value"
+          @click="submitWorkspace"
         >
-          创建 Playground
+          创建 Workspace
         </el-button>
       </template>
     </el-dialog>

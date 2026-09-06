@@ -235,12 +235,12 @@ impl AgentDataPlaneService {
         neoengram_domain::protocol::WireIndexVersion,
         Vec<FileRecord>,
     )> {
-        let playground_id = payload
-            .playground_id
+        let workspace_id = payload
+            .workspace_id
             .as_ref()
-            .ok_or_else(|| scope_mismatch("Add Index query requires playground_id"))?;
+            .ok_or_else(|| scope_mismatch("Add Index query requires workspace_id"))?;
         if job.spec.artifact_id != payload.artifact_id
-            || &job.spec.playground_id != playground_id
+            || &job.spec.workspace_id != workspace_id
             || !same_index_version(&job.spec.expected_index_version, &payload.index_version)
         {
             return Err(scope_mismatch(
@@ -253,7 +253,7 @@ impl AgentDataPlaneService {
                 tenant_id: payload.tenant_id.clone(),
                 project_id: job.spec.project_id.clone(),
                 artifact_id: payload.artifact_id.clone(),
-                playground_id: playground_id.clone(),
+                workspace_id: workspace_id.clone(),
             })
             .await?;
         if !same_index_version(&index.version, &payload.index_version) {
@@ -277,12 +277,12 @@ impl AgentDataPlaneService {
         let expected_version = spec.base_index_version.as_ref().ok_or_else(|| {
             scope_mismatch("an empty Workspace baseline has no Index snapshot to query")
         })?;
-        let playground_id = payload
-            .playground_id
+        let workspace_id = payload
+            .workspace_id
             .as_ref()
-            .ok_or_else(|| scope_mismatch("materialization Index query requires playground_id"))?;
+            .ok_or_else(|| scope_mismatch("materialization Index query requires workspace_id"))?;
         if spec.artifact_id != payload.artifact_id
-            || &spec.playground_id != playground_id
+            || &spec.workspace_id != workspace_id
             || !same_index_version(expected_version, &payload.index_version)
         {
             return Err(scope_mismatch(

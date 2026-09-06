@@ -14,7 +14,7 @@ use fusen_rs::{Error, ErrorCategory};
 use neoengram_domain::core::{CommitId, ContentDigest, FileRecord, ObjectId};
 use neoengram_domain::protocol::{
     DeliveryGeneration, RequestId, SnapshotDeliveryId, SnapshotDeliveryMode, SnapshotDeliveryState,
-    SnapshotId, TaskKind, TaskResourceKind, TaskResourceRole, TaskScope, TaskState, TenantId,
+    SnapshotId, TaskIntent, TaskResourceKind, TaskResourceRole, TaskScope, TaskState, TenantId,
 };
 
 use crate::{
@@ -355,14 +355,15 @@ impl CatalogService {
             .ok_or_else(|| resource_not_found("snapshot delivery"))?;
         let (task, task_replayed) = self
             .begin_operation_task(
-                TaskKind::SnapshotDeliveryMaterialize,
+                TaskIntent::SnapshotCreate,
                 TaskScope {
                     tenant_id: tenant_id.clone(),
                     project_id: None,
                     artifact_id: None,
                     object_namespace_id: None,
                     commit_id: Some(CommitId::from_digest(current.commit_id)),
-                    playground_id: None,
+                    workspace_id: None,
+
                     snapshot_id: Some(current.snapshot_id.clone()),
                     storage_volume_id: Some(current.storage_volume_id.clone()),
                 },
@@ -373,39 +374,63 @@ impl CatalogService {
                 Some(delivery_id.as_str()),
             )
             .await?;
-        self.link_operation_resource(
+        self.operation_result(
             &task,
-            TaskResourceKind::SnapshotDelivery,
-            delivery_id.to_string(),
-            TaskResourceRole::Primary,
+            identity,
+            self.link_operation_resource(
+                &task,
+                TaskResourceKind::SnapshotDelivery,
+                delivery_id.to_string(),
+                TaskResourceRole::Primary,
+            )
+            .await,
         )
         .await?;
-        if let Some(receipt) = self
-            .repository
-            .get_snapshot_delivery_mutation(&tenant_id, &request_id)
-            .await
-            .map_err(map_central_error)?
-        {
+        let existing_mutation = self
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .get_snapshot_delivery_mutation(&tenant_id, &request_id)
+                    .await
+                    .map_err(map_central_error),
+            )
+            .await?;
+        if let Some(receipt) = existing_mutation {
             if receipt.delivery_id != delivery_id
                 || receipt.kind != kind
                 || receipt.request_digest != request_digest
             {
-                return Err(mutation_id_reused());
+                let error = mutation_id_reused();
+                self.fail_operation_task(&task, identity, &error).await;
+                return Err(error);
             }
-            self.restore_snapshot_for_retry(&receipt.delivery).await?;
+            self.operation_result(
+                &task,
+                identity,
+                self.restore_snapshot_for_retry(&receipt.delivery).await,
+            )
+            .await?;
             self.best_effort_schedule_snapshot_delivery(&receipt.delivery)
                 .await;
+            let previous_task = task.clone();
             let task = self
-                .transition_operation_task(
-                    task,
-                    TaskState::Running,
+                .operation_result(
+                    &previous_task,
                     identity,
-                    Some("Snapshot Delivery retry scheduled".to_owned()),
+                    self.transition_operation_task(
+                        task,
+                        TaskState::Running,
+                        identity,
+                        Some("Snapshot Delivery retry scheduled".to_owned()),
+                    )
+                    .await,
                 )
                 .await?;
             return Ok(RetrySnapshotDeliveryResponse {
                 delivery: view(&receipt.delivery),
-                replayed: true,
+                request_replayed: !task.as_ref().is_some_and(|value| value.execution_reused),
+                execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
                 task,
             });
         }
@@ -413,40 +438,50 @@ impl CatalogService {
             current.state,
             SnapshotDeliveryState::Failed | SnapshotDeliveryState::Requested
         ) {
-            return Err(application_error(
+            let error = application_error(
                 ErrorCategory::Conflict,
                 "delivery_not_retryable",
                 "DELIVERY_NOT_RETRYABLE",
                 "only a failed or requested delivery can be retried",
                 false,
-            ));
+            );
+            self.fail_operation_task(&task, identity, &error).await;
+            return Err(error);
         }
         if current.state == SnapshotDeliveryState::Failed && !current.issue_retryable {
-            return Err(application_error(
+            let error = application_error(
                 ErrorCategory::Conflict,
                 "delivery_not_retryable",
                 "DELIVERY_NOT_RETRYABLE",
                 "the Delivery failed with a deterministic error and cannot be retried",
                 false,
-            ));
+            );
+            self.fail_operation_task(&task, identity, &error).await;
+            return Err(error);
         }
         let desired =
             if current.state == SnapshotDeliveryState::Requested && current.issue_code.is_none() {
                 current.clone()
             } else {
-                let next_generation = current
-                    .delivery_generation
-                    .get()
-                    .checked_add(1)
-                    .ok_or_else(|| {
-                        application_error(
-                            ErrorCategory::Conflict,
-                            "delivery_generation_exhausted",
-                            "DELIVERY_GENERATION_EXHAUSTED",
-                            "SnapshotDelivery retry generation is exhausted",
-                            false,
-                        )
-                    })?;
+                let next_generation = self
+                    .operation_result(
+                        &task,
+                        identity,
+                        current
+                            .delivery_generation
+                            .get()
+                            .checked_add(1)
+                            .ok_or_else(|| {
+                                application_error(
+                                    ErrorCategory::Conflict,
+                                    "delivery_generation_exhausted",
+                                    "DELIVERY_GENERATION_EXHAUSTED",
+                                    "SnapshotDelivery retry generation is exhausted",
+                                    false,
+                                )
+                            }),
+                    )
+                    .await?;
                 let mut next = current.clone();
                 next.state = if current.issue_code.as_deref() == Some("DELIVERY_DELETE_FAILED") {
                     SnapshotDeliveryState::Deleting
@@ -461,45 +496,68 @@ impl CatalogService {
                 next
             };
         let outcome = self
-            .repository
-            .apply_snapshot_delivery_mutation_idempotent(SnapshotDeliveryMutationRequest {
-                tenant_id: tenant_id.clone(),
-                request_id,
-                delivery_id,
-                kind,
-                request_digest,
-                expected_resource_version: current.resource_version,
-                desired_delivery: desired,
-            })
-            .await
-            .map_err(map_central_error)?;
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .apply_snapshot_delivery_mutation_idempotent(SnapshotDeliveryMutationRequest {
+                        tenant_id: tenant_id.clone(),
+                        request_id,
+                        delivery_id,
+                        kind,
+                        request_digest,
+                        expected_resource_version: current.resource_version,
+                        desired_delivery: desired,
+                    })
+                    .await
+                    .map_err(map_central_error),
+            )
+            .await?;
         let (receipt, replayed) = match outcome {
             CatalogInsertOutcome::Inserted(receipt) => (receipt, false),
             CatalogInsertOutcome::Existing(receipt) => (receipt, true),
         };
-        self.restore_snapshot_for_retry(&receipt.delivery).await?;
+        self.operation_result(
+            &task,
+            identity,
+            self.restore_snapshot_for_retry(&receipt.delivery).await,
+        )
+        .await?;
         if replayed {
             self.best_effort_schedule_snapshot_delivery(&receipt.delivery)
                 .await;
         } else if snapshot_delivery_needs_scheduling(receipt.delivery.state) {
             if let Some(coordinator) = &self.coordinator {
-                coordinator
-                    .ensure_snapshot_delivery(&receipt.delivery)
-                    .await
-                    .map_err(map_central_error)?;
+                self.operation_result(
+                    &task,
+                    identity,
+                    coordinator
+                        .ensure_snapshot_delivery(&receipt.delivery)
+                        .await
+                        .map_err(map_central_error),
+                )
+                .await?;
             }
         }
+        let previous_task = task.clone();
         let task = self
-            .transition_operation_task(
-                task,
-                TaskState::Running,
+            .operation_result(
+                &previous_task,
                 identity,
-                Some("Snapshot Delivery retry scheduled".to_owned()),
+                self.transition_operation_task(
+                    task,
+                    TaskState::Running,
+                    identity,
+                    Some("Snapshot Delivery retry scheduled".to_owned()),
+                )
+                .await,
             )
             .await?;
         Ok(RetrySnapshotDeliveryResponse {
             delivery: view(&receipt.delivery),
-            replayed: replayed || task_replayed,
+            request_replayed: (replayed || task_replayed)
+                && !task.as_ref().is_some_and(|value| value.execution_reused),
+            execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
             task,
         })
     }
@@ -526,14 +584,15 @@ impl CatalogService {
             .ok_or_else(|| resource_not_found("snapshot delivery"))?;
         let (task, task_replayed) = self
             .begin_operation_task(
-                TaskKind::CatalogLifecycle,
+                TaskIntent::SnapshotDelete,
                 TaskScope {
                     tenant_id: tenant_id.clone(),
                     project_id: None,
                     artifact_id: None,
                     object_namespace_id: None,
                     commit_id: Some(CommitId::from_digest(current.commit_id)),
-                    playground_id: None,
+                    workspace_id: None,
+
                     snapshot_id: Some(current.snapshot_id.clone()),
                     storage_volume_id: Some(current.storage_volume_id.clone()),
                 },
@@ -544,38 +603,57 @@ impl CatalogService {
                 Some(delivery_id.as_str()),
             )
             .await?;
-        self.link_operation_resource(
+        self.operation_result(
             &task,
-            TaskResourceKind::SnapshotDelivery,
-            delivery_id.to_string(),
-            TaskResourceRole::Primary,
+            identity,
+            self.link_operation_resource(
+                &task,
+                TaskResourceKind::SnapshotDelivery,
+                delivery_id.to_string(),
+                TaskResourceRole::Primary,
+            )
+            .await,
         )
         .await?;
-        if let Some(receipt) = self
-            .repository
-            .get_snapshot_delivery_mutation(&tenant_id, &request_id)
-            .await
-            .map_err(map_central_error)?
-        {
+        let existing_mutation = self
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .get_snapshot_delivery_mutation(&tenant_id, &request_id)
+                    .await
+                    .map_err(map_central_error),
+            )
+            .await?;
+        if let Some(receipt) = existing_mutation {
             if receipt.delivery_id != delivery_id
                 || receipt.kind != kind
                 || receipt.request_digest != request_digest
             {
-                return Err(mutation_id_reused());
+                let error = mutation_id_reused();
+                self.fail_operation_task(&task, identity, &error).await;
+                return Err(error);
             }
             self.best_effort_schedule_snapshot_delivery(&receipt.delivery)
                 .await;
+            let previous_task = task.clone();
             let task = self
-                .transition_operation_task(
-                    task,
-                    TaskState::Running,
+                .operation_result(
+                    &previous_task,
                     identity,
-                    Some("Snapshot Delivery deletion scheduled".to_owned()),
+                    self.transition_operation_task(
+                        task,
+                        TaskState::Running,
+                        identity,
+                        Some("Snapshot Delivery deletion scheduled".to_owned()),
+                    )
+                    .await,
                 )
                 .await?;
             return Ok(DeleteSnapshotDeliveryResponse {
                 delivery: view(&receipt.delivery),
-                replayed: true,
+                request_replayed: !task.as_ref().is_some_and(|value| value.execution_reused),
+                execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
                 task,
             });
         }
@@ -585,19 +663,25 @@ impl CatalogService {
         ) {
             current.clone()
         } else {
-            let generation = current
-                .delivery_generation
-                .get()
-                .checked_add(1)
-                .ok_or_else(|| {
-                    application_error(
-                        ErrorCategory::Conflict,
-                        "delivery_generation_exhausted",
-                        "DELIVERY_GENERATION_EXHAUSTED",
-                        "SnapshotDelivery delete generation is exhausted",
-                        false,
-                    )
-                })?;
+            let generation = self
+                .operation_result(
+                    &task,
+                    identity,
+                    current
+                        .delivery_generation
+                        .get()
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            application_error(
+                                ErrorCategory::Conflict,
+                                "delivery_generation_exhausted",
+                                "DELIVERY_GENERATION_EXHAUSTED",
+                                "SnapshotDelivery delete generation is exhausted",
+                                false,
+                            )
+                        }),
+                )
+                .await?;
             let mut next = current.clone();
             next.state = SnapshotDeliveryState::Deleting;
             next.delivery_generation = DeliveryGeneration::new(generation);
@@ -608,18 +692,23 @@ impl CatalogService {
             next
         };
         let outcome = self
-            .repository
-            .apply_snapshot_delivery_mutation_idempotent(SnapshotDeliveryMutationRequest {
-                tenant_id: tenant_id.clone(),
-                request_id,
-                delivery_id,
-                kind,
-                request_digest,
-                expected_resource_version: current.resource_version,
-                desired_delivery: desired,
-            })
-            .await
-            .map_err(map_central_error)?;
+            .operation_result(
+                &task,
+                identity,
+                self.repository
+                    .apply_snapshot_delivery_mutation_idempotent(SnapshotDeliveryMutationRequest {
+                        tenant_id: tenant_id.clone(),
+                        request_id,
+                        delivery_id,
+                        kind,
+                        request_digest,
+                        expected_resource_version: current.resource_version,
+                        desired_delivery: desired,
+                    })
+                    .await
+                    .map_err(map_central_error),
+            )
+            .await?;
         let (receipt, replayed) = match outcome {
             CatalogInsertOutcome::Inserted(receipt) => (receipt, false),
             CatalogInsertOutcome::Existing(receipt) => (receipt, true),
@@ -629,23 +718,36 @@ impl CatalogService {
                 .await;
         } else if snapshot_delivery_needs_scheduling(receipt.delivery.state) {
             if let Some(coordinator) = &self.coordinator {
-                coordinator
-                    .ensure_snapshot_delivery(&receipt.delivery)
-                    .await
-                    .map_err(map_central_error)?;
+                self.operation_result(
+                    &task,
+                    identity,
+                    coordinator
+                        .ensure_snapshot_delivery(&receipt.delivery)
+                        .await
+                        .map_err(map_central_error),
+                )
+                .await?;
             }
         }
+        let previous_task = task.clone();
         let task = self
-            .transition_operation_task(
-                task,
-                TaskState::Running,
+            .operation_result(
+                &previous_task,
                 identity,
-                Some("Snapshot Delivery deletion scheduled".to_owned()),
+                self.transition_operation_task(
+                    task,
+                    TaskState::Running,
+                    identity,
+                    Some("Snapshot Delivery deletion scheduled".to_owned()),
+                )
+                .await,
             )
             .await?;
         Ok(DeleteSnapshotDeliveryResponse {
             delivery: view(&receipt.delivery),
-            replayed: replayed || task_replayed,
+            request_replayed: (replayed || task_replayed)
+                && !task.as_ref().is_some_and(|value| value.execution_reused),
+            execution_reused: task.as_ref().is_some_and(|value| value.execution_reused),
             task,
         })
     }

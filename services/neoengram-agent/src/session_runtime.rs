@@ -26,10 +26,10 @@ use neoengram_domain::protocol::{
     ArtifactId, ControlError, DecimalU64, ErrorCode, Extensions, IndexDeltaRecord, IndexRevision,
     JobAccepted, JobAssignment, JobDecision, JobFailed, JobFailureStage, JobId, JobProgress,
     JobState, MaterializationAssignment, MetadataBatchDescriptor, MetadataBatchPage,
-    MountGeneration, OwnerGeneration, PlaygroundId, ReplicationAssignment, ReplicationId,
-    ReplicationState, RequestId, ResourceLifecycleReport, ResourceLifecycleReportState,
-    ResourceVersion, SessionGeneration, SnapshotId, TenantId, TraceId, UnixMillis,
-    WireIndexVersion, WorkspaceMaterializeAssignment, AGENT_JOB_INDEX_PAGE_QUERY_PATH,
+    MountGeneration, OwnerGeneration, ReplicationAssignment, ReplicationId, ReplicationState,
+    RequestId, ResourceLifecycleReport, ResourceLifecycleReportState, ResourceVersion,
+    SessionGeneration, SnapshotId, TenantId, TraceId, UnixMillis, WireIndexVersion, WorkspaceId,
+    WorkspaceMaterializeAssignment, AGENT_JOB_INDEX_PAGE_QUERY_PATH,
     AGENT_JOB_MANIFEST_PAGE_QUERY_PATH, AGENT_JOB_METADATA_BATCH_STAGE_PATH,
     AGENT_JOB_METADATA_PAGE_STAGE_PATH, AGENT_JOB_REPORT_CREATE_PATH, AGENT_SESSION_CLOSE_PATH,
     AGENT_SESSION_HEARTBEAT_REPORT_PATH, AGENT_SESSION_OPEN_PATH, CURRENT_WIRE_VERSION,
@@ -588,31 +588,36 @@ fn queued_workspace_state(
 ) -> AgentDaemonResult<QueuedWorkspaceState> {
     let mut state = QueuedWorkspaceState::default();
     for queued in reports.list(256).map_err(agent_error)? {
-        let (job_id, assignment_id, generation) = match &queued.report {
+        let (job_id, assignment_id, generation, task_fence) = match &queued.report {
             AgentReport::Accepted(report) => (
                 &report.job_id,
                 &report.assignment_id,
                 report.assignment_generation,
+                &report.task_fence,
             ),
             AgentReport::Progress(report) => (
                 &report.job_id,
                 &report.assignment_id,
                 report.assignment_generation,
+                &report.task_fence,
             ),
             AgentReport::Prepared(report) => (
                 &report.job_id,
                 &report.assignment_id,
                 report.assignment_generation,
+                &report.task_fence,
             ),
             AgentReport::Finalized(report) => (
                 &report.job_id,
                 &report.assignment_id,
                 report.assignment_generation,
+                &report.task_fence,
             ),
             AgentReport::Failed(report) => (
                 &report.job_id,
                 &report.assignment_id,
                 report.assignment_generation,
+                &report.task_fence,
             ),
             AgentReport::Lifecycle(_)
             | AgentReport::Replication(_)
@@ -624,6 +629,7 @@ fn queued_workspace_state(
         }
         if assignment_id != &assignment.assignment_id
             || generation != assignment.assignment_generation
+            || task_fence != &assignment.task_fence
         {
             return Err(AgentDaemonError::Session(format!(
                 "durable outbox already contains another assignment for Workspace materialize Job {}",
@@ -676,6 +682,7 @@ fn materialize_workspace_assignment(
         enqueue_workspace_report(
             reports,
             AgentReport::Accepted(JobAccepted {
+                task_fence: assignment.task_fence.clone(),
                 job_id: assignment.job_id.clone(),
                 assignment_id: assignment.assignment_id.clone(),
                 assignment_generation: assignment.assignment_generation,
@@ -691,6 +698,7 @@ fn materialize_workspace_assignment(
         enqueue_workspace_report(
             reports,
             AgentReport::Progress(JobProgress {
+                task_fence: assignment.task_fence.clone(),
                 job_id: assignment.job_id.clone(),
                 assignment_id: assignment.assignment_id.clone(),
                 assignment_generation: assignment.assignment_generation,
@@ -731,6 +739,7 @@ fn materialize_workspace_assignment(
             enqueue_workspace_report(
                 reports,
                 AgentReport::Failed(JobFailed {
+                    task_fence: assignment.task_fence.clone(),
                     tenant_id: assignment.tenant_id,
                     job_id: assignment.job_id,
                     assignment_id: assignment.assignment_id,
@@ -750,6 +759,7 @@ fn materialize_workspace_assignment(
     enqueue_workspace_report(
         reports,
         AgentReport::Progress(JobProgress {
+            task_fence: assignment.task_fence.clone(),
             job_id: assignment.job_id,
             assignment_id: assignment.assignment_id,
             assignment_generation: assignment.assignment_generation,
@@ -782,6 +792,7 @@ fn delete_snapshot_delivery_assignment(
         enqueue_workspace_report(
             reports,
             AgentReport::Accepted(JobAccepted {
+                task_fence: assignment.task_fence.clone(),
                 job_id: assignment.job_id.clone(),
                 assignment_id: assignment.assignment_id.clone(),
                 assignment_generation: assignment.assignment_generation,
@@ -796,6 +807,7 @@ fn delete_snapshot_delivery_assignment(
         enqueue_workspace_report(
             reports,
             AgentReport::Progress(JobProgress {
+                task_fence: assignment.task_fence.clone(),
                 job_id: assignment.job_id.clone(),
                 assignment_id: assignment.assignment_id.clone(),
                 assignment_generation: assignment.assignment_generation,
@@ -832,6 +844,7 @@ fn delete_snapshot_delivery_assignment(
         enqueue_workspace_report(
             reports,
             AgentReport::Failed(JobFailed {
+                task_fence: assignment.task_fence.clone(),
                 tenant_id: assignment.tenant_id,
                 job_id: assignment.job_id,
                 assignment_id: assignment.assignment_id,
@@ -855,6 +868,7 @@ fn delete_snapshot_delivery_assignment(
     enqueue_workspace_report(
         reports,
         AgentReport::Progress(JobProgress {
+            task_fence: assignment.task_fence.clone(),
             job_id: assignment.job_id,
             assignment_id: assignment.assignment_id,
             assignment_generation: assignment.assignment_generation,
@@ -889,6 +903,7 @@ fn mount_snapshot_delivery_assignment(
         enqueue_workspace_report(
             reports,
             AgentReport::Accepted(JobAccepted {
+                task_fence: assignment.task_fence.clone(),
                 job_id: assignment.job_id.clone(),
                 assignment_id: assignment.assignment_id.clone(),
                 assignment_generation: assignment.assignment_generation,
@@ -903,6 +918,7 @@ fn mount_snapshot_delivery_assignment(
         enqueue_workspace_report(
             reports,
             AgentReport::Progress(JobProgress {
+                task_fence: assignment.task_fence.clone(),
                 job_id: assignment.job_id.clone(),
                 assignment_id: assignment.assignment_id.clone(),
                 assignment_generation: assignment.assignment_generation,
@@ -927,6 +943,7 @@ fn mount_snapshot_delivery_assignment(
             enqueue_workspace_report(
                 reports,
                 AgentReport::Failed(JobFailed {
+                    task_fence: assignment.task_fence.clone(),
                     tenant_id: assignment.tenant_id,
                     job_id: assignment.job_id,
                     assignment_id: assignment.assignment_id,
@@ -956,6 +973,7 @@ fn mount_snapshot_delivery_assignment(
     enqueue_workspace_report(
         reports,
         AgentReport::Progress(JobProgress {
+            task_fence: assignment.task_fence.clone(),
             job_id: assignment.job_id,
             assignment_id: assignment.assignment_id,
             assignment_generation: assignment.assignment_generation,
@@ -989,6 +1007,7 @@ fn materialize_snapshot_delivery_assignment(
         enqueue_workspace_report(
             reports,
             AgentReport::Accepted(JobAccepted {
+                task_fence: assignment.task_fence.clone(),
                 job_id: assignment.job_id.clone(),
                 assignment_id: assignment.assignment_id.clone(),
                 assignment_generation: assignment.assignment_generation,
@@ -1003,6 +1022,7 @@ fn materialize_snapshot_delivery_assignment(
         enqueue_workspace_report(
             reports,
             AgentReport::Progress(JobProgress {
+                task_fence: assignment.task_fence.clone(),
                 job_id: assignment.job_id.clone(),
                 assignment_id: assignment.assignment_id.clone(),
                 assignment_generation: assignment.assignment_generation,
@@ -1028,6 +1048,7 @@ fn materialize_snapshot_delivery_assignment(
         enqueue_workspace_report(
             reports,
             AgentReport::Failed(JobFailed {
+                task_fence: assignment.task_fence.clone(),
                 tenant_id: assignment.tenant_id,
                 job_id: assignment.job_id,
                 assignment_id: assignment.assignment_id,
@@ -1066,6 +1087,7 @@ fn materialize_snapshot_delivery_assignment(
             enqueue_workspace_report(
                 reports,
                 AgentReport::Failed(JobFailed {
+                    task_fence: assignment.task_fence.clone(),
                     tenant_id: assignment.tenant_id,
                     job_id: assignment.job_id,
                     assignment_id: assignment.assignment_id,
@@ -1084,6 +1106,7 @@ fn materialize_snapshot_delivery_assignment(
     enqueue_workspace_report(
         reports,
         AgentReport::Progress(JobProgress {
+            task_fence: assignment.task_fence.clone(),
             job_id: assignment.job_id,
             assignment_id: assignment.assignment_id,
             assignment_generation: assignment.assignment_generation,
@@ -1148,31 +1171,36 @@ fn queued_delivery_state(
 ) -> AgentDaemonResult<QueuedWorkspaceState> {
     let mut state = QueuedWorkspaceState::default();
     for queued in reports.list(256).map_err(agent_error)? {
-        let (job_id, assignment_id, generation) = match &queued.report {
+        let (job_id, assignment_id, generation, task_fence) = match &queued.report {
             AgentReport::Accepted(report) => (
                 &report.job_id,
                 &report.assignment_id,
                 report.assignment_generation,
+                &report.task_fence,
             ),
             AgentReport::Progress(report) => (
                 &report.job_id,
                 &report.assignment_id,
                 report.assignment_generation,
+                &report.task_fence,
             ),
             AgentReport::Prepared(report) => (
                 &report.job_id,
                 &report.assignment_id,
                 report.assignment_generation,
+                &report.task_fence,
             ),
             AgentReport::Finalized(report) => (
                 &report.job_id,
                 &report.assignment_id,
                 report.assignment_generation,
+                &report.task_fence,
             ),
             AgentReport::Failed(report) => (
                 &report.job_id,
                 &report.assignment_id,
                 report.assignment_generation,
+                &report.task_fence,
             ),
             AgentReport::Lifecycle(_)
             | AgentReport::Replication(_)
@@ -1184,6 +1212,7 @@ fn queued_delivery_state(
         }
         if assignment_id != &assignment.assignment_id
             || generation != assignment.assignment_generation
+            || task_fence != &assignment.task_fence
         {
             return Err(AgentDaemonError::Session(format!(
                 "durable outbox already contains another assignment for Snapshot delivery Job {}",
@@ -1661,7 +1690,7 @@ impl<C: AgentSessionClient + 'static> SessionExecutionBridge<C> {
             &assignment.tenant_id,
             &assignment.job_id,
             &assignment.artifact_id,
-            Some(&assignment.playground_id),
+            Some(&assignment.workspace_id),
             None,
             &assignment.expected_index_version,
         )
@@ -1672,7 +1701,7 @@ impl<C: AgentSessionClient + 'static> SessionExecutionBridge<C> {
         tenant_id: &TenantId,
         job_id: &JobId,
         artifact_id: &ArtifactId,
-        playground_id: Option<&PlaygroundId>,
+        workspace_id: Option<&WorkspaceId>,
         snapshot_id: Option<&SnapshotId>,
         index_version: &WireIndexVersion,
     ) -> AgentResult<AuthoritativeIndexSnapshot> {
@@ -1687,7 +1716,7 @@ impl<C: AgentSessionClient + 'static> SessionExecutionBridge<C> {
                     tenant_id: tenant_id.clone(),
                     job_id: job_id.clone(),
                     artifact_id: artifact_id.clone(),
-                    playground_id: playground_id.cloned(),
+                    workspace_id: workspace_id.cloned(),
                     snapshot_id: snapshot_id.cloned(),
                     index_version: index_version.clone(),
                     page_number,
@@ -1966,7 +1995,7 @@ impl<C: AgentSessionClient + 'static> ExecutionBridge for SessionExecutionBridge
             &assignment.tenant_id,
             &assignment.job_id,
             &assignment.artifact_id,
-            Some(&assignment.playground_id),
+            Some(&assignment.workspace_id),
             None,
             index_version,
         )?;
@@ -2069,7 +2098,7 @@ impl<C: AgentSessionClient + 'static> ExecutionBridge for SessionExecutionBridge
                     tenant_id: tenant_id.clone(),
                     job_id: job_id.clone(),
                     artifact_id: artifact_id.clone(),
-                    playground_id: None,
+                    workspace_id: None,
                     snapshot_id: Some(snapshot_id.clone()),
                     index_version: index_version.clone(),
                     page_number,
@@ -2323,10 +2352,11 @@ mod tests {
     use crate::QueuedAgentReport;
     use neoengram_domain::core::{ContentDigest, LogicalPath, ObjectId};
     use neoengram_domain::protocol::{
-        AgentId, AgentMountId, ArtifactId, AssignmentGeneration, AssignmentId, MessageId,
-        MountGeneration, OwnerGeneration, PlaygroundId, PrincipalId, PrincipalKind, PrincipalRef,
-        ProjectId, RequestId, SessionGeneration, SessionId, StorageVolumeId, WireChunkRef,
-        WireChunkingStrategy, AGENT_JOB_METADATA_PAGE_STAGE_PATH,
+        AgentId, AgentMountId, ArtifactId, AssignmentGeneration, AssignmentId, Generation,
+        MessageId, MountGeneration, OwnerGeneration, PrincipalId, PrincipalKind, PrincipalRef,
+        ProjectId, RequestId, SessionGeneration, SessionId, StorageVolumeId, TaskExecutionFence,
+        TaskId, WireChunkRef, WireChunkingStrategy, WorkspaceId,
+        AGENT_JOB_METADATA_PAGE_STAGE_PATH,
     };
     use tempfile::TempDir;
 
@@ -2668,7 +2698,7 @@ mod tests {
                     && report.bytes_completed.get() == 0
         ));
         assert!(mount
-            .join("playgrounds/project-a/artifact-a/playground-a")
+            .join("workspaces/project-a/artifact-a/workspace-a")
             .is_dir());
     }
 
@@ -2695,7 +2725,7 @@ mod tests {
                 if report.error.code.as_str() == "WORKSPACE_MATERIALIZER_INVALID_STATE"
                     && report.final_state == JobState::Failed
         ));
-        assert!(!mount.join("playgrounds").exists());
+        assert!(!mount.join("workspaces").exists());
     }
 
     #[test]
@@ -2861,9 +2891,16 @@ mod tests {
     ) -> WorkspaceMaterializeAssignment {
         let project_id = ProjectId::new("project-a").unwrap();
         let artifact_id = ArtifactId::new("artifact-a").unwrap();
-        let playground_id = PlaygroundId::new("playground-a").unwrap();
+        let workspace_id = WorkspaceId::new("workspace-a").unwrap();
         let mut assignment = WorkspaceMaterializeAssignment {
             job_id: neoengram_domain::protocol::JobId::new("job-materialize-a").unwrap(),
+            task_fence: TaskExecutionFence::new(
+                TaskId::new("task-job-materialize-a").unwrap(),
+                Generation::new(1),
+                "materialize",
+                Generation::new(1),
+                Generation::new(1),
+            ),
             assignment_id: AssignmentId::new("assignment-materialize-a").unwrap(),
             assignment_generation: AssignmentGeneration::new(1),
             agent_id: AgentId::new("agent-a").unwrap(),
@@ -2875,12 +2912,12 @@ mod tests {
             tenant_id: TenantId::new("tenant-a").unwrap(),
             project_id,
             artifact_id,
-            playground_id,
+            workspace_id,
             storage_volume_id: StorageVolumeId::new("volume-a").unwrap(),
             agent_mount_id: AgentMountId::new("mount-a").unwrap(),
             mount_generation: MountGeneration::new(1),
             owner_generation: OwnerGeneration::new(1),
-            relative_root: LogicalPath::parse("playgrounds/project-a/artifact-a/playground-a")
+            relative_root: LogicalPath::parse("workspaces/project-a/artifact-a/workspace-a")
                 .unwrap(),
             base_commit_id,
             base_index_version: base_commit_id

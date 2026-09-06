@@ -33,10 +33,10 @@ describe('resource lifecycle control operations', () => {
     };
     const created = await createDeletion(request);
     expect(created.data.deletion.state).toBe('recoverable');
-    expect(created.data.replayed).toBe(false);
+    expect(created.data.request_replayed).toBe(false);
 
     const replay = await createDeletion(request);
-    expect(replay.data.replayed).toBe(true);
+    expect(replay.data.request_replayed).toBe(true);
     expect(replay.data.deletion.deletion_id).toBe(created.data.deletion.deletion_id);
 
     const listed = await queryDeletionList({ tenant_id: 'tenant-a', states: ['recoverable'] });

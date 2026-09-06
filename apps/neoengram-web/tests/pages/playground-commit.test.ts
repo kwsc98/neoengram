@@ -6,18 +6,18 @@ import { createMemoryHistory, createRouter } from 'vue-router';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import ApiProblemAlert from '@/components/ApiProblemAlert.vue';
-import PlaygroundCommitPage from '@/pages/PlaygroundCommitPage.vue';
+import WorkspaceCommitPage from '@/pages/WorkspaceCommitPage.vue';
 import { useTenantsStore } from '@/stores/tenants';
 
 const api = vi.hoisted(() => ({
-  cancelPlaygroundPreCommit: vi.fn(),
-  commitPlayground: vi.fn(),
+  cancelWorkspacePreCommit: vi.fn(),
+  commitWorkspace: vi.fn(),
   queryApiVersion: vi.fn(),
-  queryPlayground: vi.fn(),
-  queryPlaygroundChangeList: vi.fn(),
-  queryPlaygroundPreCommit: vi.fn(),
-  restartPlaygroundPreCommit: vi.fn(),
-  startPlaygroundPreCommit: vi.fn(),
+  queryWorkspace: vi.fn(),
+  queryWorkspaceChangeList: vi.fn(),
+  queryWorkspacePreCommit: vi.fn(),
+  restartWorkspacePreCommit: vi.fn(),
+  startWorkspacePreCommit: vi.fn(),
 }));
 
 vi.mock('@/api/operations', () => api);
@@ -25,7 +25,7 @@ vi.mock('@/api/operations', () => api);
 const headCommitId = 'a'.repeat(64);
 const sourceIndexVersion = { revision: '2', digest: 'sha256:index' };
 
-function playground(
+function workspace(
   activePreCommitId?: string,
   indexVersion: { revision: string; digest: string } = sourceIndexVersion,
   storageAvailability: 'ready' | 'degraded' | 'unavailable' | 'unknown' = 'ready',
@@ -34,10 +34,10 @@ function playground(
     tenant_id: 'tenant-a',
     project_id: 'project-a',
     artifact_id: 'artifact-a',
-    playground_id: 'playground-a',
+    workspace_id: 'workspace-a',
     storage_volume_id: 'volume-a',
     region: 'region-a',
-    display_name: 'Playground A',
+    display_name: 'Workspace A',
     head_commit_id: headCommitId,
     index_version: indexVersion,
     state: 'ready' as const,
@@ -61,25 +61,25 @@ async function mountPage(
       capabilities: [
         'artifact_commit_graph',
         'commit_materialization_v2',
-        'playground_browser',
-        'playground_precommit',
+        'workspace_browser',
+        'workspace_precommit',
       ],
     },
     requestId: 'request-version',
   });
-  api.queryPlayground.mockResolvedValue({
+  api.queryWorkspace.mockResolvedValue({
     data: {
-      playground: playground(activePreCommitId, sourceIndexVersion, storageAvailability),
+      workspace: workspace(activePreCommitId, sourceIndexVersion, storageAvailability),
     },
-    requestId: 'request-playground',
+    requestId: 'request-workspace',
   });
-  api.queryPlaygroundPreCommit.mockResolvedValue({
+  api.queryWorkspacePreCommit.mockResolvedValue({
     data: {
       precommit: {
         tenant_id: 'tenant-a',
         project_id: 'project-a',
         artifact_id: 'artifact-a',
-        playground_id: 'playground-a',
+        workspace_id: 'workspace-a',
         precommit_id: 'precommit-a',
         precommit_request_id: 'request-a',
         attempt: 1,
@@ -98,7 +98,7 @@ async function mountPage(
     },
     requestId: 'request-precommit',
   });
-  api.queryPlaygroundChangeList.mockResolvedValue({
+  api.queryWorkspaceChangeList.mockResolvedValue({
     data: {
       source: 'precommit',
       precommit_id: 'precommit-a',
@@ -120,13 +120,13 @@ async function mountPage(
     history: createMemoryHistory(),
     routes: [
       {
-        path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/playgrounds/:playgroundId/commit',
-        component: PlaygroundCommitPage,
+        path: '/tenants/:tenantId/projects/:projectId/artifacts/:artifactId/workspaces/:workspaceId/commit',
+        component: WorkspaceCommitPage,
       },
     ],
   });
   await router.push(
-    `/tenants/tenant-a/projects/project-a/artifacts/artifact-a/playgrounds/playground-a/commit${routedPreCommitId ? `?precommit_id=${routedPreCommitId}` : ''}`,
+    `/tenants/tenant-a/projects/project-a/artifacts/artifact-a/workspaces/workspace-a/commit${routedPreCommitId ? `?precommit_id=${routedPreCommitId}` : ''}`,
   );
   await router.isReady();
   const queryClient = new QueryClient({
@@ -138,13 +138,13 @@ async function mountPage(
     {
       tenant_id: 'tenant-a',
       display_name: 'Tenant A',
-      permissions: ['playground.read', 'playground.create'],
+      permissions: ['workspace.read', 'workspace.create'],
       resource_version: '1',
       created_at_unix_ms: '1',
       updated_at_unix_ms: '2',
     },
   ];
-  const wrapper = shallowMount(PlaygroundCommitPage, {
+  const wrapper = shallowMount(WorkspaceCommitPage, {
     global: {
       plugins: [pinia, [VueQueryPlugin, { queryClient }], router],
       stubs: {
@@ -162,18 +162,18 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe('Playground Commit page recovery', () => {
+describe('Workspace Commit page recovery', () => {
   it('does not start a Pre-commit when the page is opened without an active id', async () => {
     const { wrapper, queryClient } = await mountPage();
 
-    expect(api.queryPlayground).toHaveBeenCalledWith(
+    expect(api.queryWorkspace).toHaveBeenCalledWith(
       'tenant-a',
       'project-a',
       'artifact-a',
-      'playground-a',
+      'workspace-a',
     );
-    expect(api.startPlaygroundPreCommit).not.toHaveBeenCalled();
-    expect(api.queryPlaygroundPreCommit).not.toHaveBeenCalled();
+    expect(api.startWorkspacePreCommit).not.toHaveBeenCalled();
+    expect(api.queryWorkspacePreCommit).not.toHaveBeenCalled();
 
     wrapper.unmount();
     queryClient.clear();
@@ -182,9 +182,9 @@ describe('Playground Commit page recovery', () => {
   it('does not query frozen changes while a running Pre-commit has no candidate', async () => {
     const { wrapper, queryClient } = await mountPage('precommit-a');
 
-    expect(api.queryPlaygroundPreCommit).toHaveBeenCalledWith('tenant-a', 'precommit-a');
-    expect(api.queryPlaygroundChangeList).not.toHaveBeenCalled();
-    expect(api.startPlaygroundPreCommit).not.toHaveBeenCalled();
+    expect(api.queryWorkspacePreCommit).toHaveBeenCalledWith('tenant-a', 'precommit-a');
+    expect(api.queryWorkspaceChangeList).not.toHaveBeenCalled();
+    expect(api.startWorkspacePreCommit).not.toHaveBeenCalled();
 
     wrapper.unmount();
     queryClient.clear();
@@ -199,24 +199,24 @@ describe('Playground Commit page recovery', () => {
       candidate_index_version: firstCandidate,
     });
 
-    expect(api.queryPlaygroundChangeList).toHaveBeenCalledTimes(1);
-    expect(api.queryPlaygroundChangeList).toHaveBeenLastCalledWith(
+    expect(api.queryWorkspaceChangeList).toHaveBeenCalledTimes(1);
+    expect(api.queryWorkspaceChangeList).toHaveBeenLastCalledWith(
       expect.objectContaining({
         tenant_id: 'tenant-a',
         project_id: 'project-a',
         artifact_id: 'artifact-a',
-        playground_id: 'playground-a',
+        workspace_id: 'workspace-a',
         precommit_id: 'precommit-a',
       }),
     );
 
-    api.queryPlaygroundPreCommit.mockResolvedValueOnce({
+    api.queryWorkspacePreCommit.mockResolvedValueOnce({
       data: {
         precommit: {
           tenant_id: 'tenant-a',
           project_id: 'project-a',
           artifact_id: 'artifact-a',
-          playground_id: 'playground-a',
+          workspace_id: 'workspace-a',
           precommit_id: 'precommit-a',
           precommit_request_id: 'request-a',
           attempt: 1,
@@ -243,12 +243,12 @@ describe('Playground Commit page recovery', () => {
     await refreshButton!.trigger('click');
     await flushPromises();
 
-    expect(api.queryPlaygroundChangeList).toHaveBeenCalledTimes(2);
+    expect(api.queryWorkspaceChangeList).toHaveBeenCalledTimes(2);
     const changeQueryKeys = queryClient
       .getQueryCache()
       .getAll()
       .filter(
-        (query) => query.queryKey[0] === 'playground-changes' && query.state.data !== undefined,
+        (query) => query.queryKey[0] === 'workspace-changes' && query.state.data !== undefined,
       )
       .map((query) => query.queryKey);
     expect(changeQueryKeys).toHaveLength(2);
@@ -258,7 +258,7 @@ describe('Playground Commit page recovery', () => {
     queryClient.clear();
   });
 
-  it('refreshes the Playground after cancel and starts redetection from the newer revision', async () => {
+  it('refreshes the Workspace after cancel and starts redetection from the newer revision', async () => {
     const nextIndexVersion = { revision: '3', digest: 'sha256:index-3' };
     const { wrapper, queryClient } = await mountPage('precommit-a', undefined, {
       state: 'ready',
@@ -266,27 +266,29 @@ describe('Playground Commit page recovery', () => {
       candidate_index_version: { revision: '3', digest: 'sha256:candidate-3' },
     });
     vi.spyOn(ElMessageBox, 'confirm').mockResolvedValue(undefined as never);
-    api.cancelPlaygroundPreCommit.mockResolvedValue({
+    api.cancelWorkspacePreCommit.mockResolvedValue({
       data: {
         precommit: {
           precommit_id: 'precommit-a',
           state: 'cancelled',
           data_layout: 'fast_cdc',
         },
-        playground: playground(undefined, nextIndexVersion),
-        replayed: false,
+        workspace: workspace(undefined, nextIndexVersion),
+        request_replayed: false,
+        execution_reused: false,
       },
       requestId: 'request-cancel',
     });
-    api.queryPlayground.mockResolvedValue({
-      data: { playground: playground(undefined, nextIndexVersion) },
-      requestId: 'request-playground-refresh',
+    api.queryWorkspace.mockResolvedValue({
+      data: { workspace: workspace(undefined, nextIndexVersion) },
+      requestId: 'request-workspace-refresh',
     });
-    api.startPlaygroundPreCommit.mockResolvedValue({
+    api.startWorkspacePreCommit.mockResolvedValue({
       data: {
         precommit: { precommit_id: 'precommit-b', state: 'running', data_layout: 'fast_cdc' },
-        playground: playground('precommit-b', nextIndexVersion),
-        replayed: false,
+        workspace: workspace('precommit-b', nextIndexVersion),
+        request_replayed: false,
+        execution_reused: false,
       },
       requestId: 'request-start',
     });
@@ -298,18 +300,18 @@ describe('Playground Commit page recovery', () => {
     await redetectButton!.trigger('click');
     await flushPromises();
 
-    expect(api.cancelPlaygroundPreCommit).toHaveBeenCalledTimes(1);
-    expect(api.startPlaygroundPreCommit).toHaveBeenCalledWith(
+    expect(api.cancelWorkspacePreCommit).toHaveBeenCalledTimes(1);
+    expect(api.startWorkspacePreCommit).toHaveBeenCalledWith(
       expect.objectContaining({ expected_index_version: nextIndexVersion }),
     );
-    const cancelOrder = api.cancelPlaygroundPreCommit.mock.invocationCallOrder[0]!;
-    const refreshedPlaygroundOrder = api.queryPlayground.mock.invocationCallOrder.find(
+    const cancelOrder = api.cancelWorkspacePreCommit.mock.invocationCallOrder[0]!;
+    const refreshedWorkspaceOrder = api.queryWorkspace.mock.invocationCallOrder.find(
       (order) => order > cancelOrder,
     );
-    const startOrder = api.startPlaygroundPreCommit.mock.invocationCallOrder[0]!;
-    expect(refreshedPlaygroundOrder).toBeDefined();
-    expect(cancelOrder).toBeLessThan(refreshedPlaygroundOrder!);
-    expect(refreshedPlaygroundOrder!).toBeLessThan(startOrder);
+    const startOrder = api.startWorkspacePreCommit.mock.invocationCallOrder[0]!;
+    expect(refreshedWorkspaceOrder).toBeDefined();
+    expect(cancelOrder).toBeLessThan(refreshedWorkspaceOrder!);
+    expect(refreshedWorkspaceOrder!).toBeLessThan(startOrder);
 
     wrapper.unmount();
     queryClient.clear();
@@ -321,8 +323,8 @@ describe('Playground Commit page recovery', () => {
       phase: 'idle',
     });
 
-    expect(api.queryPlaygroundPreCommit).toHaveBeenCalledWith('tenant-a', 'precommit-a');
-    expect(api.startPlaygroundPreCommit).not.toHaveBeenCalled();
+    expect(api.queryWorkspacePreCommit).toHaveBeenCalledWith('tenant-a', 'precommit-a');
+    expect(api.startWorkspacePreCommit).not.toHaveBeenCalled();
     expect(wrapper.text()).toContain('失败重试');
     expect(wrapper.text()).not.toContain('没有活动 Pre-commit');
 
@@ -330,12 +332,12 @@ describe('Playground Commit page recovery', () => {
     queryClient.clear();
   });
 
-  it('rejects a routed Pre-commit that belongs to another Playground scope', async () => {
+  it('rejects a routed Pre-commit that belongs to another Workspace scope', async () => {
     const { wrapper, queryClient } = await mountPage(undefined, 'precommit-a', {
-      playground_id: 'playground-b',
+      workspace_id: 'workspace-b',
     });
 
-    expect(api.queryPlaygroundChangeList).not.toHaveBeenCalled();
+    expect(api.queryWorkspaceChangeList).not.toHaveBeenCalled();
     const scopeAlert = wrapper
       .findAllComponents(ApiProblemAlert)
       .find((alert) => (alert.props('error') as Error | undefined)?.message.includes('不属于'));
@@ -364,7 +366,7 @@ describe('Playground Commit page recovery', () => {
     expect(storageAlert?.attributes('description')).toContain('中心保存的候选变化仍可审查和提交');
     expect(wrapper.text()).toContain('填写 Commit 信息');
     expect(wrapper.text()).not.toContain('重新检测');
-    expect(api.queryPlaygroundChangeList).toHaveBeenCalledTimes(1);
+    expect(api.queryWorkspaceChangeList).toHaveBeenCalledTimes(1);
 
     wrapper.unmount();
     queryClient.clear();
@@ -379,7 +381,7 @@ describe('Playground Commit page recovery', () => {
     );
 
     expect(wrapper.text()).not.toContain('失败重试');
-    expect(api.restartPlaygroundPreCommit).not.toHaveBeenCalled();
+    expect(api.restartWorkspacePreCommit).not.toHaveBeenCalled();
 
     wrapper.unmount();
     queryClient.clear();

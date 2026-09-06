@@ -12,13 +12,13 @@ use neoengram_central::{
 use neoengram_central::{
     ArtifactInitialization, ArtifactRecord, CatalogPvcReference, Clock, ControlCatalogRepository,
     ControlPlane, InMemoryComponents, IndexKey, IndexPublisher, JobKey, JobOperation,
-    JobRepository, PlaygroundRecord, PlaygroundState, PreCommitId, PreCommitRepository,
+    JobRepository, PreCommitId, PreCommitRepository,
     PreCommitStartRequest as DomainPreCommitStartRequest, StorageAccessMode, StorageBackendType,
-    StorageVolumeRecord, StorageVolumeState, TenantRecord,
+    StorageVolumeRecord, StorageVolumeState, TenantRecord, WorkspaceRecord, WorkspaceState,
 };
 use neoengram_domain::protocol::{
-    ArtifactId, CommitDataLayout, EdgeClusterId, JobId, PlaygroundId, PrincipalKind, ProjectId,
-    RequestId, StorageVolumeId, TenantId, UnixMillis,
+    ArtifactId, CommitDataLayout, EdgeClusterId, JobId, PrincipalKind, ProjectId, RequestId,
+    StorageVolumeId, TenantId, UnixMillis, WorkspaceId,
 };
 
 mod support;
@@ -31,15 +31,15 @@ async fn precommit_actions_create_real_jobs_and_enforce_active_scope() {
 
     let started = fixture
         .catalog
-        .start_playground_precommit(&fixture.identity, request.clone())
+        .start_workspace_precommit(&fixture.identity, request.clone())
         .await
         .unwrap();
 
-    assert!(!started.replayed);
+    assert!(!started.request_replayed);
     assert_eq!(started.precommit.state, "running");
     assert_eq!(started.precommit.phase, "queued");
     assert_eq!(
-        started.playground.active_precommit_id.as_deref(),
+        started.workspace.active_precommit_id.as_deref(),
         Some(started.precommit.precommit_id.as_str())
     );
     let precommit = fixture
@@ -68,10 +68,10 @@ async fn precommit_actions_create_real_jobs_and_enforce_active_scope() {
 
     let replayed = fixture
         .catalog
-        .start_playground_precommit(&fixture.identity, request)
+        .start_workspace_precommit(&fixture.identity, request)
         .await
         .unwrap();
-    assert!(replayed.replayed);
+    assert!(replayed.request_replayed);
     assert_eq!(
         replayed.precommit.precommit_id,
         started.precommit.precommit_id
@@ -79,7 +79,7 @@ async fn precommit_actions_create_real_jobs_and_enforce_active_scope() {
 
     let conflict = fixture
         .catalog
-        .start_playground_precommit(
+        .start_workspace_precommit(
             &fixture.identity,
             fixture.start_request("precommit-request-b").await,
         )
@@ -103,7 +103,7 @@ async fn precommit_actions_create_real_jobs_and_enforce_active_scope() {
 
     let hidden = fixture
         .catalog
-        .query_playground_precommit(
+        .query_workspace_precommit(
             &AuthenticatedIdentity::new("user-b", PrincipalKind::User, "test", "subject-b")
                 .unwrap(),
             QueryPreCommitRequest {
@@ -117,7 +117,7 @@ async fn precommit_actions_create_real_jobs_and_enforce_active_scope() {
 
     let cancelled = fixture
         .catalog
-        .cancel_playground_precommit(
+        .cancel_workspace_precommit(
             &fixture.identity,
             CancelPreCommitRequest {
                 tenant_id: fixture.tenant_id.to_string(),
@@ -128,11 +128,11 @@ async fn precommit_actions_create_real_jobs_and_enforce_active_scope() {
         .await
         .unwrap();
     assert_eq!(cancelled.precommit.state, "cancelled");
-    assert!(cancelled.playground.active_precommit_id.is_none());
+    assert!(cancelled.workspace.active_precommit_id.is_none());
 
     let restarted = fixture
         .catalog
-        .restart_playground_precommit(
+        .restart_workspace_precommit(
             &fixture.identity,
             RestartPreCommitRequest {
                 tenant_id: fixture.tenant_id.to_string(),
@@ -146,7 +146,7 @@ async fn precommit_actions_create_real_jobs_and_enforce_active_scope() {
     assert_eq!(restarted.precommit.attempt, 2);
     assert_eq!(restarted.precommit.state, "running");
     assert_eq!(
-        restarted.playground.active_precommit_id,
+        restarted.workspace.active_precommit_id,
         Some(restarted.precommit.precommit_id)
     );
 }
@@ -169,7 +169,7 @@ async fn coordinator_recovers_precommit_committed_before_its_job() {
             tenant_id: fixture.tenant_id.clone(),
             project_id: fixture.project_id.clone(),
             artifact_id: fixture.artifact_id.clone(),
-            playground_id: fixture.playground_id.clone(),
+            workspace_id: fixture.workspace_id.clone(),
             precommit_id,
             precommit_request_id: RequestId::new("precommit-recovery-request").unwrap(),
             source_index_version,
@@ -202,42 +202,42 @@ async fn coordinator_recovers_precommit_committed_before_its_job() {
 }
 
 #[tokio::test]
-async fn precommit_freezes_the_playground_head_not_the_artifact_head() {
+async fn precommit_freezes_the_workspace_head_not_the_artifact_head() {
     let fixture = fixture().await;
-    let playground_head = neoengram_domain::core::ContentDigest::from_bytes([0x11; 32]);
+    let workspace_head = neoengram_domain::core::ContentDigest::from_bytes([0x11; 32]);
     let artifact_head = neoengram_domain::core::ContentDigest::from_bytes([0x22; 32]);
     fixture
         .components
         .control_catalog
-        .advance_playground_commit(neoengram_central::AdvancePlaygroundCommitRequest {
+        .advance_workspace_commit(neoengram_central::AdvanceWorkspaceCommitRequest {
             tenant_id: fixture.tenant_id.clone(),
             project_id: fixture.project_id.clone(),
             artifact_id: fixture.artifact_id.clone(),
-            playground_id: fixture.playground_id.clone(),
+            workspace_id: fixture.workspace_id.clone(),
             expected_head_commit_id: None,
-            commit_id: playground_head,
+            commit_id: workspace_head,
             updated_at_unix_ms: UnixMillis::new(1_001),
         })
         .await
         .unwrap();
-    let sibling_id = PlaygroundId::new("playground-sibling").unwrap();
+    let sibling_id = WorkspaceId::new("workspace-sibling").unwrap();
     fixture
         .components
         .control_catalog
-        .insert_playground(PlaygroundRecord {
+        .insert_workspace(WorkspaceRecord {
             tenant_id: fixture.tenant_id.clone(),
             project_id: fixture.project_id.clone(),
             artifact_id: fixture.artifact_id.clone(),
-            playground_id: sibling_id.clone(),
+            workspace_id: sibling_id.clone(),
             storage_volume_id: StorageVolumeId::new("volume-a").unwrap(),
             region: "cn-shanghai".to_owned(),
             display_name: "Sibling".to_owned(),
-            base_commit_id: Some(playground_head),
-            head_commit_id: Some(playground_head),
-            state: PlaygroundState::Ready,
+            base_commit_id: Some(workspace_head),
+            head_commit_id: Some(workspace_head),
+            state: WorkspaceState::Ready,
             resource_version: 1,
             lifecycle: neoengram_domain::protocol::ResourceLifecycle::active(),
-            relative_root: "playgrounds/project-a/artifact-a/playground-sibling".to_owned(),
+            relative_root: "workspaces/project-a/artifact-a/workspace-sibling".to_owned(),
             created_at_unix_ms: UnixMillis::new(1_001),
             updated_at_unix_ms: UnixMillis::new(1_001),
         })
@@ -246,12 +246,12 @@ async fn precommit_freezes_the_playground_head_not_the_artifact_head() {
     fixture
         .components
         .control_catalog
-        .advance_playground_commit(neoengram_central::AdvancePlaygroundCommitRequest {
+        .advance_workspace_commit(neoengram_central::AdvanceWorkspaceCommitRequest {
             tenant_id: fixture.tenant_id.clone(),
             project_id: fixture.project_id.clone(),
             artifact_id: fixture.artifact_id.clone(),
-            playground_id: sibling_id,
-            expected_head_commit_id: Some(playground_head),
+            workspace_id: sibling_id,
+            expected_head_commit_id: Some(workspace_head),
             commit_id: artifact_head,
             updated_at_unix_ms: UnixMillis::new(1_002),
         })
@@ -260,7 +260,7 @@ async fn precommit_freezes_the_playground_head_not_the_artifact_head() {
 
     let started = fixture
         .catalog
-        .start_playground_precommit(
+        .start_workspace_precommit(
             &fixture.identity,
             fixture.start_request("precommit-request-branch").await,
         )
@@ -279,7 +279,7 @@ async fn precommit_freezes_the_playground_head_not_the_artifact_head() {
     assert_eq!(
         stored.frozen_head_commit_id,
         Some(neoengram_domain::core::CommitId::from_digest(
-            playground_head
+            workspace_head
         ))
     );
 }
@@ -295,8 +295,8 @@ async fn precommit_start_fails_closed_without_live_storage_availability() {
                 "user-a",
                 [fixture.tenant_id.to_string()],
                 [
-                    Permission::PlaygroundRead,
-                    Permission::PlaygroundCreate,
+                    Permission::WorkspaceRead,
+                    Permission::WorkspaceCreate,
                     Permission::CreateAddJob,
                 ],
             )
@@ -308,7 +308,7 @@ async fn precommit_start_fails_closed_without_live_storage_availability() {
     .with_coordinator(fixture.coordinator.clone());
 
     let error = catalog
-        .start_playground_precommit(
+        .start_workspace_precommit(
             &fixture.identity,
             fixture.start_request("precommit-request-no-registry").await,
         )
@@ -327,7 +327,7 @@ struct Fixture {
     tenant_id: TenantId,
     project_id: ProjectId,
     artifact_id: ArtifactId,
-    playground_id: PlaygroundId,
+    workspace_id: WorkspaceId,
 }
 
 impl Fixture {
@@ -336,7 +336,7 @@ impl Fixture {
             tenant_id: self.tenant_id.clone(),
             project_id: self.project_id.clone(),
             artifact_id: self.artifact_id.clone(),
-            playground_id: self.playground_id.clone(),
+            workspace_id: self.workspace_id.clone(),
         }
     }
 
@@ -358,7 +358,7 @@ impl Fixture {
             tenant_id: self.tenant_id.to_string(),
             project_id: self.project_id.to_string(),
             artifact_id: self.artifact_id.to_string(),
-            playground_id: self.playground_id.to_string(),
+            workspace_id: self.workspace_id.to_string(),
             precommit_request_id: request_id.to_owned(),
             expected_index_version: self.index_version().await,
             data_layout: DataLayout::FastCdc,
@@ -370,7 +370,7 @@ impl Fixture {
             tenant_id: self.tenant_id.to_string(),
             project_id: self.project_id.to_string(),
             artifact_id: self.artifact_id.to_string(),
-            playground_id: self.playground_id.to_string(),
+            workspace_id: self.workspace_id.to_string(),
             job_id: job_id.to_owned(),
             expected_index_version: self.index_version().await,
             deadline_unix_ms: "86401000".to_owned(),
@@ -385,7 +385,7 @@ async fn fixture() -> Fixture {
     let tenant_id = TenantId::new("tenant-a").unwrap();
     let project_id = ProjectId::new("project-a").unwrap();
     let artifact_id = ArtifactId::new("artifact-a").unwrap();
-    let playground_id = PlaygroundId::new("playground-a").unwrap();
+    let workspace_id = WorkspaceId::new("workspace-a").unwrap();
     components
         .control_catalog
         .insert_tenant(TenantRecord {
@@ -447,20 +447,20 @@ async fn fixture() -> Fixture {
         .unwrap();
     components
         .control_catalog
-        .insert_playground(PlaygroundRecord {
+        .insert_workspace(WorkspaceRecord {
             tenant_id: tenant_id.clone(),
             project_id: project_id.clone(),
             artifact_id: artifact_id.clone(),
-            playground_id: playground_id.clone(),
+            workspace_id: workspace_id.clone(),
             storage_volume_id: StorageVolumeId::new("volume-a").unwrap(),
             region: "cn-shanghai".to_owned(),
-            display_name: "Playground A".to_owned(),
+            display_name: "Workspace A".to_owned(),
             base_commit_id: None,
             head_commit_id: None,
-            state: PlaygroundState::Ready,
+            state: WorkspaceState::Ready,
             resource_version: 1,
             lifecycle: neoengram_domain::protocol::ResourceLifecycle::active(),
-            relative_root: "playgrounds/project-a/artifact-a/playground-a".to_owned(),
+            relative_root: "workspaces/project-a/artifact-a/workspace-a".to_owned(),
             created_at_unix_ms: UnixMillis::new(1_000),
             updated_at_unix_ms: UnixMillis::new(1_000),
         })
@@ -471,8 +471,8 @@ async fn fixture() -> Fixture {
             "user-a",
             [tenant_id.to_string()],
             [
-                Permission::PlaygroundRead,
-                Permission::PlaygroundCreate,
+                Permission::WorkspaceRead,
+                Permission::WorkspaceCreate,
                 Permission::CreateAddJob,
             ],
         )
@@ -512,6 +512,6 @@ async fn fixture() -> Fixture {
         tenant_id,
         project_id,
         artifact_id,
-        playground_id,
+        workspace_id,
     }
 }

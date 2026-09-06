@@ -74,9 +74,9 @@ const resourceLinks = computed(() => [
       ]
     : []),
   {
-    name: 'playground-list',
+    name: 'workspace-list',
     label: '工作区',
-    detail: '查看 Playground 与 Pre-commit 状态',
+    detail: '查看 Workspace 与 Pre-commit 状态',
     icon: Collection,
   },
   ...(supportsSnapshotMaterialize(version.value?.capabilities)

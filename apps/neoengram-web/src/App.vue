@@ -86,7 +86,7 @@ const navGroups = computed(() => {
         ...(artifactCatalogEnabled.value
           ? [{ name: 'artifact-list', label: '数据资产', icon: Box, params: { tenantId } }]
           : []),
-        { name: 'playground-list', label: '工作区', icon: Collection, params: { tenantId } },
+        { name: 'workspace-list', label: '工作区', icon: Collection, params: { tenantId } },
         ...(snapshotMaterializeEnabled.value
           ? [
               {
@@ -133,7 +133,7 @@ const activeMenu = computed(() => {
   if (name.startsWith('storage-volume-')) return 'storage-volume-list';
   if (name.startsWith('project-')) return 'project-list';
   if (name.startsWith('artifact-')) return 'artifact-list';
-  if (name.startsWith('playground-')) return 'playground-list';
+  if (name.startsWith('workspace-')) return 'workspace-list';
   if (name.startsWith('snapshot-')) return 'snapshot-list';
   if (name.startsWith('object-storage-')) return 'object-storage-list';
   if (name === 'recycle-bin') return 'recycle-bin';
@@ -160,7 +160,7 @@ function targetForTenantSwitch(): string {
   if (name.startsWith('storage-volume-')) return 'storage-volume-list';
   if (name.startsWith('project-')) return 'project-list';
   if (name.startsWith('artifact-')) return 'artifact-list';
-  if (name.startsWith('playground-')) return 'playground-list';
+  if (name.startsWith('workspace-')) return 'workspace-list';
   if (name.startsWith('snapshot-')) return 'snapshot-list';
   if (name.startsWith('object-storage-')) return 'object-storage-list';
   if (name === 'recycle-bin') return 'recycle-bin';
@@ -216,7 +216,7 @@ async function submitTenant(): Promise<void> {
       ...(form.description.trim() ? { description: form.description.trim() } : {}),
     });
     createOpen.value = false;
-    ElMessage.success(result.data.replayed ? '已返回现有租户' : '租户已创建');
+    ElMessage.success(result.data.request_replayed ? '已返回现有租户' : '租户已创建');
     await router.push({ name: 'tenant-overview', params: { tenantId } });
   } catch (error) {
     createError.value = error instanceof Error ? error.message : '创建租户失败';

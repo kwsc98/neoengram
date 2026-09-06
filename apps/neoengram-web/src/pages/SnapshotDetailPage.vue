@@ -328,7 +328,11 @@ async function replicateSnapshot(): Promise<void> {
   } else if (result.mode === 'in_flight') {
     ElMessage.info('该目标已有物化任务在执行');
   } else {
-    ElMessage.success(result.result?.data.replayed ? '已返回同一复制任务' : 'Commit 复制已排队');
+    ElMessage.success(
+      result.result && (result.result.data.request_replayed || result.result.data.execution_reused)
+        ? '已返回同一复制任务'
+        : 'Commit 复制已排队',
+    );
   }
   await replicationListQuery.refetch();
 }

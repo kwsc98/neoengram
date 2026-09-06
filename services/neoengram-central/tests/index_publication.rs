@@ -6,7 +6,7 @@ use neoengram_domain::core::{
     ChunkingStrategy, ContentDigest, FileRecord, IndexVersion, LogicalPath, Manifest, ManifestId,
 };
 use neoengram_domain::protocol::{
-    ArtifactId, DecimalU64, Extensions, IndexDeltaRecord, JobId, PlaygroundId, ProjectId, TenantId,
+    ArtifactId, DecimalU64, Extensions, IndexDeltaRecord, JobId, ProjectId, TenantId, WorkspaceId,
 };
 
 fn index_key() -> IndexKey {
@@ -14,7 +14,7 @@ fn index_key() -> IndexKey {
         tenant_id: TenantId::new("tenant-a").expect("valid tenant ID"),
         project_id: ProjectId::new("project-a").expect("valid project ID"),
         artifact_id: ArtifactId::new("artifact-a").expect("valid artifact ID"),
-        playground_id: PlaygroundId::new("playground-a").expect("valid playground ID"),
+        workspace_id: WorkspaceId::new("workspace-a").expect("valid workspace ID"),
     }
 }
 

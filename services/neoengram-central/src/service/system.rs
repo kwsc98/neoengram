@@ -36,15 +36,15 @@ impl SystemService {
             "artifact_commit_graph".to_owned(),
             "artifact_commit_diff".to_owned(),
             "managed_add".to_owned(),
-            "playground_browser".to_owned(),
+            "workspace_browser".to_owned(),
             "sqlite_authority".to_owned(),
         ];
         if self.storage_execution_enabled {
             capabilities.extend([
-                neoengram_domain::protocol::OPERATION_TASK_CAPABILITY_V1.to_owned(),
+                neoengram_domain::protocol::OPERATION_TASK_CAPABILITY_V2.to_owned(),
                 "commit_materialization_v2".to_owned(),
-                "playground_materialize".to_owned(),
-                "playground_precommit".to_owned(),
+                "workspace_materialize".to_owned(),
+                "workspace_precommit".to_owned(),
                 "commit_layout_selection_v2".to_owned(),
                 "snapshot_delivery_fuse_v2".to_owned(),
                 "snapshot_delivery_copy_v2".to_owned(),

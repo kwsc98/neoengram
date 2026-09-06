@@ -81,14 +81,21 @@ function materializationFromTask(task: TaskView): MaterializationView {
         ? 'waiting_for_sources'
         : task.state === 'succeeded'
           ? 'complete'
-          : task.state;
+          : task.state === 'cancelling'
+            ? 'waiting_for_sources'
+            : task.state;
   return {
     materialization_id: task.task_id,
     tenant_id: task.tenant_id,
-    ...(task.artifact_id === undefined ? {} : { artifact_id: task.artifact_id }),
-    object_namespace_id: task.object_namespace_id ?? task.artifact_id ?? 'unknown',
-    commit_id: task.commit_id ?? '',
-    target_storage_volume_id: task.storage_volume_id ?? '',
+    object_namespace_id:
+      task.resource_links.find((link) => link.resource_kind === 'object_namespace')?.resource_id ??
+      'unknown',
+    commit_id:
+      task.resource_links.find((link) => link.resource_kind === 'commit')?.resource_id ?? '',
+    target_storage_volume_id:
+      task.resource_links.find((link) => link.resource_kind === 'storage_volume')?.resource_id ??
+      '',
+    purpose: task.purpose ?? 'copy',
     plan_revision: task.attempt,
     coverage_goal: 'complete',
     state,
@@ -213,7 +220,7 @@ export function useCommitMaterialization(
         tenant_id: current.tenantId,
         object_namespace_id: current.objectNamespaceId,
         commit_id: current.commitId,
-        task_kind: ['commit.materialize'],
+        intent_kind: ['commit.materialize'],
         page_size: 100,
       }).then((result) => ({
         requestId: result.requestId,
@@ -350,6 +357,9 @@ export function useCommitMaterialization(
     actionOptions: {
       coverageGoal?: MaterializationCoverageGoal;
       requestId?: string;
+      purpose?: 'copy' | 'repair';
+      repairObservationDigest?: string;
+      targetPlacementGeneration?: string;
     } = {},
   ): Promise<ApiResult<CreateCommitMaterializationResponse>> {
     if (!enabled.value || !targetStorageVolumeId) {
@@ -372,6 +382,13 @@ export function useCommitMaterialization(
       object_namespace_id: current.objectNamespaceId,
       commit_id: current.commitId,
       target_storage_volume_id: targetStorageVolumeId,
+      purpose: actionOptions.purpose ?? 'copy',
+      ...(actionOptions.repairObservationDigest
+        ? { repair_observation_digest: actionOptions.repairObservationDigest }
+        : {}),
+      ...(actionOptions.targetPlacementGeneration
+        ? { target_placement_generation: actionOptions.targetPlacementGeneration }
+        : {}),
       coverage_goal: actionOptions.coverageGoal ?? 'complete',
       request_id: requestId,
     });

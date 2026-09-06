@@ -1,6 +1,6 @@
 # 当前实现基线
 
-> 核验日期：2026-09-04
+> 核验日期：2026-09-06
 >
 > 本文从当前源码、OpenAPI/action registry、测试和 Web 路由反推“现在能证明的产品行为”。
 > 它不是目标架构，也不替代 [`roadmap.md`](roadmap.md)。当本文与代码或测试冲突时，先修正本文；
@@ -25,15 +25,15 @@
 | 层 | 证据状态 | 已观察事实 | 尚未证明/未完成 |
 | --- | --- | --- | --- |
 | Domain 契约 | `已观察` | `ObjectNamespaceId`、对象级 `ObjectPlacement`、派生 `VolumeCommitCoverage`、`DurabilityPolicy`、`MaterializationJob/Batch/Object`、分页 `BatchManifest`、v2 Ticket/Receipt/Lease、统一 OperationTask 和四维 availability DTO 已进入 `neoengram-domain`，并有 schema golden | v1 wire/assignment/report 仅可作为私有拒绝/迁移残留，生产协议切换和源码删除仍待完成 |
-| Authority | `进行中` | SQLite `user_version=20`、v2 表、namespace 复合键、对象 Receipt 幂等/CAS、Coverage 重算、统一 OperationTask 和 InMemory/SQLite round-trip/replan 契约已有测试；Snapshot 创建原子绑定唯一 Delivery 目标 | v1 replication 内部 mapper/测试仍待删除且不参与 v20 调度；v19 及更早数据库与 v20 DDL 不兼容，必须显式 reset/inventory rebuild |
+| Authority | `进行中` | SQLite `user_version=21`、v2 表、namespace 复合键、对象 Receipt 幂等/CAS、Coverage 重算、统一 OperationTask 和 InMemory/SQLite round-trip/replan 契约已有测试；Snapshot 创建原子绑定唯一 Delivery 目标 | v1 replication 内部 mapper/测试仍待删除且不参与 v21 调度；v20 及更早数据库与 v21 DDL 不兼容，必须显式 reset/inventory rebuild |
 | Central planner/API | `进行中` | `/api/commit/materialize`、`/api/commit/coverage/query`、`/api/commit/availability/query` 与统一 `/api/task/*` 查询/重试/取消已进入 action registry/OpenAPI；planner 可计算缺失对象、按候选 placement 选择多源/fallback、复用目标 checkpoint | 配额/并发的完整运行编排、真实 source route 调度和跨节点计划版本收敛仍待完成 |
-| Agent/Gateway v2 数据面 | `进行中` | v2 ALPN `neoengram-transfer-v2`、Ticket/generation fence、分页 manifest、Agent source/target QUIC stream、Gateway `ConnectedTransferRelay`、目标 staging/checkpoint/receipt 和动态 `commit_materialization_v2` capability gate 已有代码与单元/协议测试；Agent 还提供只读 Volume integrity-check 和启动/周期 scrub | 真实跨 Gateway route 编排、三 Agent 多源失败恢复、背压/配额、生产凭据和跨节点 E2E 尚未验收 |
+| Agent/Gateway v2 数据面 | `进行中` | v2 ALPN `neoengram-transfer-v2`、Ticket/generation fence、分页 manifest、Agent source/target QUIC stream、Gateway `ConnectedTransferRelay`、目标 staging/checkpoint/receipt 和动态 `commit_materialization_v2` capability gate 已有代码与单元/协议测试；Gateway QUIC 入站按 Ticket 角色校验单一 SPIFFE URI SAN 的 trust domain、EdgeCluster/Pool/Agent scope 与 EKU，preflight 限定本集群 Agent；Source Agent 在 backend/resolver 前校验来访 Gateway Replica 的 URI/EKU/scope，replication 还要求 trust domain；Agent 提供只读 Volume integrity-check 和启动/周期 scrub | 真实跨 Gateway route 编排、三 Agent 多源失败恢复、背压/配额、生产凭据和跨节点 E2E 尚未验收 |
 | Readiness/读取面 | `进行中` | Workspace、SnapshotDelivery、S3 的 v2 门控代码要求目标完整 Coverage；availability 已拆分 `content_presence`、`source_serving`、`durability`、`target_coverage`、`view_readiness` | 三 Agent、多 Gateway、多源失败恢复、Lease/GC 竞态和跨节点 Ready E2E 尚未验收 |
 
 v2 的正式副本单位是已验证的对象级 `ObjectPlacement`，不是完整 Commit。Commit 仍是不可变逻辑
 `ObjectSet`；初期 `ObjectNamespaceId` 等于 `ArtifactId`，但协议、数据库键和租约仍必须显式携带 namespace。
 `VolumeCommitCoverage` 由对象证据派生，`partial` 不能使 Workspace、SnapshotDelivery 或 S3 Ready。
-旧 PlacementSet、单源 TransferTicket 和 replication API 不属于 v20 公开主链路；开发阶段升级通过显式 reset/inventory rebuild 完成，不提供旧协议兼容读取。
+旧 PlacementSet、单源 TransferTicket 和 replication API 不属于 v21 公开主链路；开发阶段升级通过显式 reset/inventory rebuild 完成，不提供旧协议兼容读取。
 
 ### 副本完整性检查与补齐（当前可证明能力）
 
@@ -76,15 +76,15 @@ Managed 中心模式：Web/automation -> Central public action API -> SQLite Aut
 | `Tenant` | 权限和可见性边界；列表、查询、创建已由 Central catalog 提供 | `services/neoengram-central/src/service/catalog.rs`、`tests/artifact_catalog.rs` | 成员/RoleBinding 管理不在公开 P0 API |
 | `Project` | Tenant 内 Artifact 分组；列表、创建有 public action | `src/controller/catalog.rs`、`src/service/catalog.rs` | 更新、删除和成员管理待实现 |
 | `Artifact` | 无固定 Volume/Region 的逻辑资产；当前 Central 只接受空初始化 | `src/catalog.rs`、`src/service/catalog.rs::create_artifact`、`tests/catalog_http.rs` | OpenAPI 保留 `derived` 初始化形状，但当前请求返回 `409 ARTIFACT_DERIVED_INITIALIZATION_UNSUPPORTED` |
-| `Commit` | 不可变内容图，当前单 parent；由 Playground commit 产生 | `src/service/workspace_commit.rs`、`tests/workspace_commit.rs` | 派生 Artifact root Commit 仍未实现；无 merge/rebase/命名 branch |
-| `Playground` | 一个 Artifact 在一个 StorageVolume 上的可写工作区；带 IndexVersion、base/head 和存储可达性 | `src/dto/catalog.rs`、`src/service/catalog.rs`、`tests/catalog_index_version.rs` | 依赖 Agent/Volume 的真实扫描和 mutation 需要启用 storage execution |
-| `Pre-commit` | Playground 的显式检查会话，独立 `start/query/restart/cancel`，有 `state + phase + attempt` | `src/service/catalog.rs`、`tests/playground_precommit.rs` | 页面刷新不应隐式创建会话；完整 Agent E2E 待验收 |
+| `Commit` | 不可变内容图，当前单 parent；由 Workspace commit 产生 | `src/service/workspace_commit.rs`、`tests/workspace_commit.rs` | 派生 Artifact root Commit 仍未实现；无 merge/rebase/命名 branch |
+| `Workspace` | 一个 Artifact 在一个 StorageVolume 上的可写工作区；带 IndexVersion、base/head 和存储可达性 | `src/dto/catalog.rs`、`src/service/catalog.rs`、`tests/catalog_index_version.rs` | 依赖 Agent/Volume 的真实扫描和 mutation 需要启用 storage execution |
+| `Pre-commit` | Workspace 的显式检查会话，独立 `start/query/restart/cancel`，有 `state + phase + attempt` | `src/service/catalog.rs`、`tests/playground_precommit.rs`（历史文件名） | 页面刷新不应隐式创建会话；完整 Agent E2E 待验收 |
 | `ObjectNamespaceId` | 对象权限和物理隔离的必填 namespace；当前初期值等于 `ArtifactId` | `crates/neoengram-domain/src/protocol/ids.rs`、materialization schema/tests | 旧 ObjectCatalog/replication 键尚未全部迁移到 namespace |
 | `ObjectPlacement` | 单个 namespace/object 在一个 Volume/generation 上经 Agent 校验并持久化的 Durable 事实 | `crates/neoengram-domain/src/protocol/materialization.rs`、Central placement repository/tests | v2 receipt 仍未接入真实 Agent/Gateway payload；旧 placement evidence 仍并存 |
 | `VolumeCommitCoverage` | 由对象 Placement 重算的目标 Volume `partial/complete` 覆盖摘要，不是独立耐久事实 | `materialization.rs`、`service/materialization.rs`、coverage tests | 覆盖重算尚未覆盖生产多 Volume/跨节点故障流程 |
 | `Snapshot` | 创建时固定 `artifact_id + commit_id` 及一个目标 EdgeCluster/StorageVolume/模式，并与唯一 Delivery 原子写入 `Creating` | `src/catalog.rs` 的 `SnapshotRecord`、`src/service/catalog.rs::create_snapshot`、`src/dto/snapshot.rs` | 只有关联 Delivery 完成 Coverage、物化和视图校验后才转为 `Ready`；失败进入 `Abnormal` |
 | `SnapshotDelivery` | Snapshot 在指定 StorageVolume 上的唯一物理只读投影，拥有 `delivery_id`、目标 Volume、模式和独立状态 | `src/catalog.rs` 的 `SnapshotDeliveryRecord`、`src/service/snapshot_delivery.rs`、`src/dto/snapshot_delivery.rs` | 每个 Snapshot 只能有一个 Delivery；`Ready` 前不可浏览、挂载或启用 S3；执行依赖 coordinator/Agent |
-| `OperationTask` | 所有写操作的统一生命周期和审计入口（即时操作也记录完整生命周期）；领域执行细节仍由 `control_jobs`、`materializations`、`precommit_records` 等记录 | `crates/neoengram-domain/src/protocol/task.rs`、`src/service/task.rs`、`tests/task_repository.rs` | 旧 Assignment/report 与 v1 replication 仅是私有源码残留且不参与 v20 调度；跨进程原子性和完整业务 E2E 尚未验收 |
+| `OperationTask` | 所有写操作的统一生命周期和审计入口（即时操作也记录完整生命周期）；以 `intent_kind`、`purpose`、主资源、执行身份和 `TaskStage` 阶段 DAG 表达一次根任务，领域执行细节仍由 `control_jobs`、`materializations`、`precommit_records` 等记录 | `crates/neoengram-domain/src/protocol/task.rs`、`src/service/task.rs`、`tests/task_repository.rs` | 旧 Assignment/report 与 v1 replication 仅是私有源码残留且不参与 v21 调度；跨进程原子性和完整业务 E2E 尚未验收 |
 | `StorageVolume` | 已登记的区域存储及健康、策略和 Owner 观测；不是 Artifact 身份 | `src/dto/mod.rs`、`src/service/enrollment.rs` | 真实 NFS/挂载和凭据需要 Agent enrollment 配置 |
 | `GatewayPool/Replica` | EdgeCluster 的控制入口和 Central 主动连接对象；不挂载 Volume、不保存对象权威 | `src/controller/gateway.rs`、`src/service/gateway.rs`、Gateway tests | readiness/failover/cutover 尚缺真实集群证据 |
 | `AgentInstance` | 获批 Volume-bound 执行器，维护本地 identity/Ledger/session 并执行 Volume I/O；启动和运行期间会对本地 CAS 做只读完整性 scrub | `services/neoengram-agent/src/agent_core/`、`services/neoengram-agent/src/volume_integrity.rs`、`neoengram-agent-api.yaml` | 手工 `integrity-check` 需独占 Agent 状态数据库；scrub 只上报健康观测，不直接改写对象。发现缺失/损坏后需显式重试对应 `commit.materialize` 任务并从其他健康 Placement 补齐；自动定时修复和真实跨节点执行仍未完成 |
@@ -155,16 +155,16 @@ CreateArtifact(initialization=derived) -> 409 ARTIFACT_DERIVED_INITIALIZATION_UN
 | 本地 `init/add/commit/checkout/export/fsck/gc/mount` | `已观察` | `apps/neoengram-cli/src/cli/`、`crates/neoengram-runtime/src/standalone_api.rs` | 不等于远端 push/fetch/clone |
 | Tenant/Project/Artifact catalog | `已观察` | Central controller/service、HTTP/catalog tests | 不等于完整成员/权限管理产品 |
 | Artifact 派生初始化 | `未实现` | OpenAPI `ArtifactInitialization.derived`；`services/neoengram-central/src/service/catalog.rs::create_artifact` | Central 在 authority 写入前返回 `409 ARTIFACT_DERIVED_INITIALIZATION_UNSUPPORTED`；不能声称已创建 derived root Commit |
-| Playground 查询、创建、文件/变化/元数据查询 | `已观察` | Central catalog service、Web real/mock pages | 不能把 Web Mock 当成真实 Agent 扫描 |
-| Pre-commit 与 Playground Commit | `已观察`（执行面有条件） | `/api/playground/precommit/*`、`/api/playground/commit/create` | 不等于生产级 Agent/Gateway E2E |
+| Workspace 查询、创建、文件/变化/元数据查询 | `已观察` | Central catalog service、Web real/mock pages | 不能把 Web Mock 当成真实 Agent 扫描 |
+| Pre-commit 与 Workspace Commit | `已观察`（执行面有条件） | `/api/workspace/precommit/*`、`/api/workspace/commit/create` | 不等于生产级 Agent/Gateway E2E |
 | Snapshot 创建/查询/列表 | `已观察` | `/api/snapshot/{create,query,list/query}` | 创建时绑定目标 Volume/模式并原子生成唯一 Delivery；Delivery 未 Ready 前 Snapshot 不可读 |
 | SnapshotDelivery query/list/retry/delete | `已观察`（Central/service 路径；执行面有条件） | `/api/snapshot/delivery/*`、Web Snapshot detail | 每个 Snapshot 仅一个 Delivery；需完整 Coverage、视图校验并启用 coordinator/Agent execution |
-| v1 Commit replication / Placement | `遗留（私有/不可调度）` | 旧 replication 实现、`service/placement.rs`、旧 Agent capability（公开 replication 路由已移除） | 仅记录历史完整 PlacementSet/单源语义；旧表和 mapper 不参与 v20 调度、Ready 或 v2 多源覆盖证据，旧协议直接拒绝 |
+| v1 Commit replication / Placement | `遗留（私有/不可调度）` | 旧 replication 实现、`service/placement.rs`、旧 Agent capability（公开 replication 路由已移除） | 仅记录历史完整 PlacementSet/单源语义；旧表和 mapper 不参与 v21 调度、Ready 或 v2 多源覆盖证据，旧协议直接拒绝 |
 | v2 Commit materialization / Coverage | `进行中` | `/api/commit/materialize`、`/api/commit/coverage/query`、`/api/commit/availability/query`、统一 `/api/task/*`；`service/materialization.rs`、v2 Authority tests；Agent/Gateway 已有 v2 payload executor、relay 和 receipt 发布路径 | Central planner/Authority 与本地协议可测；真实 route 编排、跨 Gateway/三 Agent、多源失败恢复和生产 E2E 尚未验收 |
 | S3 read-only Access Point | `进行中（门控已接入）` | `/api/s3/*`、Gateway S3 listener、SnapshotDelivery/Coverage gate | 仅 `SnapshotDelivery=Ready` 的 Snapshot 可创建或读取；还要求目标完整 Coverage、Ready GatewayPool、Agent route 和 signed ticket；不支持写入、不是中心对象存储权威；生产跨节点读取尚未验收 |
 | Resource deletion / retention hold | `已观察`（需生命周期 coordinator） | `/api/resource/*` | 不等于完整回收站运营和灾备 |
 | Agent enrollment/session/metadata transport | `已观察`（需 `--agent-enrollment-enabled`；已覆盖 channel EOF/写入传输失败、ACK 超时和旧 route/session fencing 进入有界重连，重连期间 readiness 降级、outbox 报告保留及不可用 Gateway route 的 retryable 503 映射） | Agent OpenAPI、Central registry handler、`approved_runtime`/registry handler 单元测试 | 不等于外部 issuer、真实 PVC 或完整双 Replica 断线恢复 E2E |
-| Gateway Registry/activation/mTLS/forwarding | `已观察`（协议和局部契约） | `services/neoengram-gateway`、Gateway controller | 不等于真实多副本 readiness/failover/cutover |
+| Gateway Registry/activation/mTLS/forwarding | `已观察`（协议和局部契约） | `services/neoengram-gateway`、Gateway controller；bootstrap durable request/digest fence、QUIC workload URI/EKU/scope 校验 | 不等于真实多副本 readiness/failover/cutover |
 | Web 真实模式 | `已观察`（页面/API 集成） | `apps/neoengram-web`，由 capabilities 控制 | 不等于所有 OpenAPI action 都有 Central handler |
 | Web MSW Mock | `已观察`（测试/演示） | `apps/neoengram-web/src/mocks` | 不得作为后端交付证据 |
 
@@ -172,7 +172,7 @@ CreateArtifact(initialization=derived) -> 409 ARTIFACT_DERIVED_INITIALIZATION_UN
 
 `SystemService::query_api_version` 根据运行时组合返回 capabilities：
 
-- 无 Agent enrollment 时仍有 `artifact_catalog`、Commit graph/diff、`managed_add`、`playground_browser` 和
+- 无 Agent enrollment 时仍有 `artifact_catalog`、Commit graph/diff、`managed_add`、`workspace_browser` 和
   `sqlite_authority` 基础能力；
 - `--agent-enrollment-enabled` 且 keyring/coordinator 初始化成功后，才声明 v2 materialize、
   pre-commit、SnapshotDelivery 模式等 storage execution 能力；
@@ -180,7 +180,8 @@ CreateArtifact(initialization=derived) -> 409 ARTIFACT_DERIVED_INITIALIZATION_UN
   外部 S3 secret envelope/KMS-HSM 适配；
 - Web 应按 capability 隐藏操作，而不是仅凭路由存在显示按钮。
 - 旧跨 Volume replication 仅保留为拒绝/显式迁移边界，不再注册公开 action；Central 统一通过
-  `/api/commit/materialize` 创建 MaterializationJob，并通过 `/api/task/*` 查询、重试和取消。
+  `/api/commit/materialize` 创建一个 `commit.materialize` 根任务，MaterializationJob 作为领域明细，并通过
+  `/api/task/*` 查询、重试和取消。
 - v2 Central planner 过滤 namespace、digest、size、encoding、generation、Volume/Agent/route 健康后选择多源和
   fallback。SQLite/InMemory 已验证对象 Receipt 幂等、同一对象竞争只保留一个 placement，以及重规划保留
   confirmed offset；真实 route/带宽调度和跨节点执行仍未验收。

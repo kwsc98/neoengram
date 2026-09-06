@@ -325,21 +325,22 @@
         "job_id": {
           "$ref": "#/$defs/JobId"
         },
-        "playground_id": {
-          "$ref": "#/$defs/PlaygroundId"
-        },
         "project_id": {
           "$ref": "#/$defs/ProjectId"
         },
         "tenant_id": {
           "$ref": "#/$defs/TenantId"
+        },
+        "workspace_id": {
+          "description": "Workspace identity. The Rust field name remains an internal migration detail; the v2 wire\ncontract accepts only `workspace_id` and deliberately has no `workspace_id` alias.",
+          "$ref": "#/$defs/WorkspaceId"
         }
       },
       "required": [
         "tenant_id",
         "project_id",
         "artifact_id",
-        "playground_id",
+        "workspace_id",
         "job_id",
         "base_index_version"
       ]
@@ -430,13 +431,6 @@
         "verified_at_unix_ms"
       ]
     },
-    "PlaygroundId": {
-      "description": "A validated playground ID wire identifier.",
-      "type": "string",
-      "maxLength": 128,
-      "minLength": 1,
-      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
-    },
     "ProjectId": {
       "description": "A validated project ID wire identifier.",
       "type": "string",
@@ -513,6 +507,13 @@
         "revision",
         "digest"
       ]
+    },
+    "WorkspaceId": {
+      "description": "A validated workspace ID wire identifier.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$"
     }
   }
 }

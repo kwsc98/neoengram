@@ -19,8 +19,6 @@ pub const AGENT_JOB_ASSIGNMENT_ACTION: &str = "agent.job.assignment";
 pub const AGENT_JOB_DECISION_ACTION: &str = "agent.job.decision";
 pub const AGENT_LIFECYCLE_ASSIGNMENT_ACTION: &str = "agent.lifecycle.assignment";
 pub const AGENT_JOB_REPORT_ACTION: &str = "agent.job.report.create";
-pub const AGENT_REPLICATION_ASSIGNMENT_ACTION: &str = "agent.replication.assignment";
-pub const AGENT_REPLICATION_REPORT_ACTION: &str = "agent.replication.report";
 pub const AGENT_MATERIALIZATION_ASSIGNMENT_ACTION: &str = "agent.materialization.assignment";
 pub const AGENT_MATERIALIZATION_REPORT_ACTION: &str = "agent.materialization.report";
 pub const AGENT_PROTOCOL_ERROR_ACTION: &str = "agent.protocol.error";
@@ -30,8 +28,6 @@ const CONTROL_ACTIONS: &[&str] = &[
     AGENT_JOB_DECISION_ACTION,
     AGENT_LIFECYCLE_ASSIGNMENT_ACTION,
     AGENT_JOB_REPORT_ACTION,
-    AGENT_REPLICATION_ASSIGNMENT_ACTION,
-    AGENT_REPLICATION_REPORT_ACTION,
     AGENT_MATERIALIZATION_ASSIGNMENT_ACTION,
     AGENT_MATERIALIZATION_REPORT_ACTION,
     AGENT_PROTOCOL_ERROR_ACTION,
@@ -339,50 +335,50 @@ pub const PUBLIC_ACTION_REGISTRY: &[PublicActionDescriptor] = &[
         "/api/artifact/commit/diff/query",
         "queryArtifactCommitDiff",
     ),
-    public_action("POST", "/api/playground/list/query", "queryPlaygroundList"),
-    public_action("POST", "/api/playground/query", "queryPlayground"),
-    public_action("POST", "/api/playground/create", "createPlayground"),
+    public_action("POST", "/api/workspace/list/query", "queryWorkspaceList"),
+    public_action("POST", "/api/workspace/query", "queryWorkspace"),
+    public_action("POST", "/api/workspace/create", "createWorkspace"),
     public_action(
         "POST",
-        "/api/playground/precommit/start",
-        "startPlaygroundPreCommit",
+        "/api/workspace/precommit/start",
+        "startWorkspacePreCommit",
     ),
     public_action(
         "POST",
-        "/api/playground/precommit/query",
-        "queryPlaygroundPreCommit",
+        "/api/workspace/precommit/query",
+        "queryWorkspacePreCommit",
     ),
     public_action(
         "POST",
-        "/api/playground/precommit/restart",
-        "restartPlaygroundPreCommit",
+        "/api/workspace/precommit/restart",
+        "restartWorkspacePreCommit",
     ),
     public_action(
         "POST",
-        "/api/playground/precommit/cancel",
-        "cancelPlaygroundPreCommit",
+        "/api/workspace/precommit/cancel",
+        "cancelWorkspacePreCommit",
     ),
     public_action(
         "POST",
-        "/api/playground/file/list/query",
-        "queryPlaygroundFileList",
+        "/api/workspace/file/list/query",
+        "queryWorkspaceFileList",
     ),
     public_action(
         "POST",
-        "/api/playground/change/list/query",
-        "queryPlaygroundChangeList",
+        "/api/workspace/change/list/query",
+        "queryWorkspaceChangeList",
     ),
     public_action(
         "POST",
-        "/api/playground/file/metadata/query",
-        "queryPlaygroundFileMetadata",
+        "/api/workspace/file/metadata/query",
+        "queryWorkspaceFileMetadata",
     ),
     public_action(
         "POST",
-        "/api/playground/dataset/profile/query",
-        "queryPlaygroundDatasetProfile",
+        "/api/workspace/dataset/profile/query",
+        "queryWorkspaceDatasetProfile",
     ),
-    public_action("POST", "/api/playground/commit/create", "commitPlayground"),
+    public_action("POST", "/api/workspace/commit/create", "commitWorkspace"),
     public_action("POST", "/api/snapshot/list/query", "querySnapshotList"),
     public_action("POST", "/api/snapshot/query", "querySnapshot"),
     public_action("POST", "/api/snapshot/create", "createSnapshot"),
@@ -406,7 +402,6 @@ pub const PUBLIC_ACTION_REGISTRY: &[PublicActionDescriptor] = &[
         "/api/snapshot/delivery/delete",
         "deleteSnapshotDelivery",
     ),
-    public_action("POST", "/api/workspace/create", "createWorkspace"),
     documented_action(
         "POST",
         "/api/snapshot/file/list/query",
@@ -435,6 +430,7 @@ pub const PUBLIC_ACTION_REGISTRY: &[PublicActionDescriptor] = &[
         "/api/s3/access-point/disable",
         "disableS3AccessPoint",
     ),
+    public_action("POST", "/api/s3/access-point/delete", "deleteS3AccessPoint"),
     public_action("POST", "/api/s3/credential/create", "createS3Credential"),
     public_action(
         "POST",

@@ -20,9 +20,9 @@ use neoengram_domain::protocol::{
     AssignmentGeneration, AssignmentId, AssignmentOperation, ControlMessage, DecimalU64,
     EdgeClusterId, Extensions, IndexDeltaRecord, JobPrepared, JobState, MetadataBatchDescriptor,
     MetadataBatchId, MetadataBatchPage, MetadataBatchRecords, MetadataBatchScope, MountGeneration,
-    ObjectReceiptId, ObjectReceiptRecord, OwnerGeneration, PlacementGeneration, PlaygroundId,
-    PrincipalId, PrincipalKind, PrincipalRef, ProjectId, RequestId, ResourceVersion,
-    SessionGeneration, StorageVolumeId, TenantId, UnixMillis, WireIndexVersion,
+    ObjectReceiptId, ObjectReceiptRecord, OwnerGeneration, PlacementGeneration, PrincipalId,
+    PrincipalKind, PrincipalRef, ProjectId, RequestId, ResourceVersion, SessionGeneration,
+    StorageVolumeId, TenantId, UnixMillis, WireIndexVersion, WorkspaceId,
 };
 use sqlx::{sqlite::SqliteConnectOptions, Connection, SqliteConnection};
 use tempfile::TempDir;
@@ -336,9 +336,9 @@ async fn sqlite_reports_corrupt_json_and_decimal_records() {
     execute_raw(
         decimal_directory.path(),
         "PRAGMA ignore_check_constraints = ON; \
-         INSERT INTO playground_indexes \
-         (tenant_id, project_id, artifact_id, playground_id, revision, digest) \
-         VALUES ('tenant-a', 'project-a', 'artifact-a', 'playground-a', '00', zeroblob(32))",
+         INSERT INTO workspace_indexes \
+         (tenant_id, project_id, artifact_id, workspace_id, revision, digest) \
+         VALUES ('tenant-a', 'project-a', 'artifact-a', 'workspace-a', '00', zeroblob(32))",
     )
     .await;
     let reopened = open_sqlite_authority(SqliteAuthorityConfig::new(decimal_directory.path()))
@@ -537,9 +537,9 @@ async fn sqlite_u64_max_revision_replays_exhaustion() {
     initialize_and_close(directory.path()).await;
     let empty_digest = IndexVersion::from_snapshot(u64::MAX, &[]).unwrap().digest;
     let sql = format!(
-        "INSERT INTO playground_indexes \
-         (tenant_id, project_id, artifact_id, playground_id, revision, digest) \
-         VALUES ('tenant-a', 'project-a', 'artifact-a', 'playground-a', '{}', X'{}')",
+        "INSERT INTO workspace_indexes \
+         (tenant_id, project_id, artifact_id, workspace_id, revision, digest) \
+         VALUES ('tenant-a', 'project-a', 'artifact-a', 'workspace-a', '{}', X'{}')",
         u64::MAX,
         empty_digest
     );
@@ -577,7 +577,7 @@ async fn run_contract(store: AuthorityStore) -> ContractFixture {
         tenant_id: spec.tenant_id.clone(),
         project_id: spec.project_id.clone(),
         artifact_id: spec.artifact_id.clone(),
-        playground_id: spec.playground_id.clone(),
+        workspace_id: spec.workspace_id.clone(),
     };
     let control = ControlPlane::new(
         Arc::new(AllowAllAuthorizer),
@@ -786,6 +786,7 @@ async fn run_contract(store: AuthorityStore) -> ContractFixture {
     let publication_digest = ContentDigest::hash(b"publication-candidate");
     publishing_job.prepared = Some(JobPrepared {
         job_id: publishing_job.spec.job_id.clone(),
+        task_fence: assignment.task_fence.clone(),
         assignment_id: assignment.assignment_id.clone(),
         assignment_generation: assignment.assignment_generation,
         base_index_version: spec.expected_index_version.clone(),
@@ -1131,7 +1132,7 @@ fn job_spec(tenant: &str, job: &str) -> AddJobSpec {
         tenant_id: TenantId::new(tenant).unwrap(),
         project_id: ProjectId::new("project-a").unwrap(),
         artifact_id: ArtifactId::new("artifact-a").unwrap(),
-        playground_id: PlaygroundId::new("playground-a").unwrap(),
+        workspace_id: WorkspaceId::new("workspace-a").unwrap(),
         expected_index_version: WireIndexVersion::from(
             IndexVersion::from_snapshot(0, &[]).unwrap(),
         ),
@@ -1140,6 +1141,7 @@ fn job_spec(tenant: &str, job: &str) -> AddJobSpec {
         deadline_unix_ms: UnixMillis::new(10_000),
         paths: vec![LogicalPath::parse("dataset/file.bin").unwrap()],
         all: false,
+        operation_task_id: None,
         extensions: Extensions::new(),
     };
     spec.request_digest = spec.computed_request_digest().unwrap();
@@ -1169,7 +1171,7 @@ fn metadata_batch(spec: &AddJobSpec) -> (MetadataBatchDescriptor, MetadataBatchP
         tenant_id: spec.tenant_id.clone(),
         project_id: spec.project_id.clone(),
         artifact_id: spec.artifact_id.clone(),
-        playground_id: spec.playground_id.clone(),
+        workspace_id: spec.workspace_id.clone(),
         job_id: spec.job_id.clone(),
         base_index_version: spec.expected_index_version.clone(),
         extensions: Extensions::new(),
@@ -1201,7 +1203,7 @@ fn index_key(tenant: &str) -> IndexKey {
         tenant_id: TenantId::new(tenant).unwrap(),
         project_id: ProjectId::new("project-a").unwrap(),
         artifact_id: ArtifactId::new("artifact-a").unwrap(),
-        playground_id: PlaygroundId::new("playground-a").unwrap(),
+        workspace_id: WorkspaceId::new("workspace-a").unwrap(),
     }
 }
 

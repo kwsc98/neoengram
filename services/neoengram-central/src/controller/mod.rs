@@ -220,7 +220,7 @@ mod action_registry_tests {
             ProjectApiClient::descriptor().unwrap(),
             StorageVolumeApiClient::descriptor().unwrap(),
             ArtifactApiClient::descriptor().unwrap(),
-            PlaygroundApiClient::descriptor().unwrap(),
+            WorkspaceApiClient::descriptor().unwrap(),
             SnapshotApiClient::descriptor().unwrap(),
             PlacementApiClient::descriptor().unwrap(),
             S3ApiClient::descriptor().unwrap(),
