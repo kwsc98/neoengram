@@ -60,7 +60,7 @@ libc.workspace = true
 futures.workspace = true
 hyper = { version = "1.11", features = ["server"] }
 neoengram-central = { path = "../../services/neoengram-central" }
-rcgen = { version = "0.13.2", features = ["x509-parser"] }
+rcgen = { version = "0.14.9", features = ["x509-parser"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "net"] }
 
