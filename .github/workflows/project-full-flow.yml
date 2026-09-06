@@ -20,7 +20,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
       - name: Install Rust 1.97.1
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@1.120.0
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
       - name: Install Node.js 22.12.0

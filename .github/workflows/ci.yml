@@ -19,7 +19,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
       - name: Install Rust 1.97.1
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@1.120.0
         with:
           components: rustfmt, clippy
       - name: Install Node.js 22.12.0
@@ -119,7 +119,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
       - name: Install Rust 1.97.1
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@1.120.0
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
       - name: Run default-feature tests
@@ -160,7 +160,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
       - name: Install Rust 1.97.1
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@1.120.0
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
       - name: Run all-feature tests
@@ -195,7 +195,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
       - name: Install Rust 1.97.1
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@1.120.0
       - name: Check minimum supported Rust version
         run: cargo check --workspace --all-targets --all-features --locked
 
@@ -206,7 +206,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
       - name: Install Rust 1.97.1
-        uses: dtolnay/rust-toolchain@1.97.1
+        uses: dtolnay/rust-toolchain@1.120.0
         with:
           components: rustfmt, clippy
       - name: Install Node.js 22.12.0
