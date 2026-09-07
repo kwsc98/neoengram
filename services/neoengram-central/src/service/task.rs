@@ -972,16 +972,46 @@ impl TaskService {
         let tenant_id = parse_tenant(&request.tenant_id)?;
         self.authorize(identity, Permission::TaskManage, &tenant_id)?;
         let task_id = parse_task_id(&request.task_id)?;
-        let current = self
+        let mut current = self
             .repository
             .get(&tenant_id, &task_id)
             .await
             .map_err(map_central_error)?
             .ok_or_else(not_found)?;
-        let expected = parse_expected_version(
+        let expected_from_request = request.expected_resource_version.is_some();
+        let mut expected = parse_expected_version(
             request.expected_resource_version.as_deref(),
             current.resource_version,
         )?;
+        if expected_from_request && expected != current.resource_version {
+            return Err(map_central_error(CentralError::new(
+                crate::CentralErrorCode::ConcurrentUpdate,
+                "operation task resource version changed",
+            )));
+        }
+        // Older Central versions could persist a source-waiting materialization as a running
+        // task. Repair that projection before applying the normal retry state machine so existing
+        // tasks remain actionable after an upgrade. This does not broaden retry semantics for
+        // unrelated running tasks.
+        if current.intent_kind == TaskIntent::CommitMaterialize {
+            if let Some(materialization) = &self.materialization {
+                if materialization
+                    .reconcile_stale_materialization_task(identity, &current)
+                    .await?
+                {
+                    current = self
+                        .repository
+                        .get(&tenant_id, &task_id)
+                        .await
+                        .map_err(map_central_error)?
+                        .ok_or_else(not_found)?;
+                    // The projection transition is an internal, fenced repair that happened
+                    // after the caller's version was validated above. Retry against its latest
+                    // version so an explicit version matching the pre-repair row remains usable.
+                    expected = current.resource_version;
+                }
+            }
+        }
         let result = self
             .repository
             .retry(

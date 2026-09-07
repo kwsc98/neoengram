@@ -459,6 +459,13 @@ Replica。Agent 预检同样要求本集群 Agent URI；Gateway Replica 对端�
 Replica ID 和双向 EKU；replication 配置缺少 trust domain 直接拒绝启动。身份、角色或 scope 不匹配在读取
 manifest/对象前 fail-closed，这些检查已有协议回归测试，但尚未通过真实跨 Gateway/Agent E2E 验收。
 
+为便于先验证业务编排，Agent、Gateway transfer 和 Central Gateway connector 共用
+`TransportValidationProfile`。默认 `strict` 保持上述 workload URI/EKU、角色 scope 和
+session/mount/route generation fence；显式 `development` 只允许 loopback 拓扑，并仅延后这些部署拥有的
+身份/代际门槛。两种 profile 都继续执行 CA/mTLS 链、ALPN、帧大小与顺序、deadline、Central 签名、租户/Volume/
+对象范围、manifest digest、Placement/backend 完整性。开发 profile 不是生产旁路，不能用于非 loopback listener、
+upstream 或 Agent 配置；真实跨 Gateway/Agent E2E 仍需在 strict 下单独验收。
+
 ## 10. S3 暴露（一期只读数据面）
 
 S3 是 Gateway 对外暴露固定版本的读取协议，不是 Central durability backend，也不改变 Volume-local

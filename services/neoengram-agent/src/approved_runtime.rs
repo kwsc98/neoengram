@@ -182,15 +182,13 @@ pub(crate) fn build_replication_network(
     let client_ca_file = config.replication.tls_ca_file.clone().ok_or_else(|| {
         AgentDaemonError::Configuration("replication TLS CA is not configured".to_owned())
     })?;
-    let gateway_workload_trust_domain = config
-        .gateway_workload_trust_domain
-        .clone()
-        .ok_or_else(|| {
-            AgentDaemonError::Configuration(
-                "replication requires gateway_workload_trust_domain for Gateway peer identity validation"
-                    .to_owned(),
-            )
-        })?;
+    let gateway_workload_trust_domain = config.gateway_workload_trust_domain.clone();
+    if config.validation_mode.is_strict() && gateway_workload_trust_domain.is_none() {
+        return Err(AgentDaemonError::Configuration(
+            "replication requires gateway_workload_trust_domain for Gateway peer identity validation"
+                .to_owned(),
+        ));
+    }
     let server_name = config
         .replication
         .gateway_endpoint
@@ -210,7 +208,13 @@ pub(crate) fn build_replication_network(
         client_ca_file,
         server_name,
     })
-    .map(|network| network.with_gateway_workload_trust_domain(gateway_workload_trust_domain))
+    .map(|network| {
+        let network = network.with_validation_mode(config.validation_mode);
+        match gateway_workload_trust_domain {
+            Some(trust_domain) => network.with_gateway_workload_trust_domain(trust_domain),
+            None => network,
+        }
+    })
     .map_err(|error| {
         AgentDaemonError::Configuration(format!(
             "replication QUIC network could not start: {error}"

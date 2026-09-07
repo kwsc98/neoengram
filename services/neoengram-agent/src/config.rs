@@ -7,7 +7,7 @@ use std::{
 
 use neoengram_domain::protocol::{
     AgentEnrollmentTokenId, ContentDigest, EdgeClusterId, PvcIdentityDigest, StorageVolumeId,
-    TenantId, VolumeMarkerId, CURRENT_WIRE_VERSION,
+    TenantId, TransportValidationProfile, VolumeMarkerId, CURRENT_WIRE_VERSION,
 };
 use serde::Deserialize;
 use url::Url;
@@ -24,6 +24,11 @@ const MAX_LOG_LEVEL_BYTES: usize = 128;
 pub struct AgentConfig {
     pub schema_version: u16,
     pub wire_version: u16,
+    /// Controls deployment-owned identity and generation fences.  Development is explicitly
+    /// loopback-only and keeps transport framing, TLS, deadlines, signatures, and object scope
+    /// validation enabled.
+    #[serde(default)]
+    pub validation_mode: ValidationMode,
     pub gateway_endpoint: Url,
     pub trust_bundle_file: PathBuf,
     /// SPIFFE trust domain expected in the Gateway server URI SAN.
@@ -93,8 +98,13 @@ impl AgentConfig {
             )));
         }
         validate_endpoint(&self.gateway_endpoint)?;
+        if self.validation_mode == ValidationMode::Development {
+            validate_development_validation_endpoints(self)?;
+        }
         validate_absolute_normal_path("trust_bundle_file", &self.trust_bundle_file)?;
-        if self.gateway_endpoint.scheme() == "https" && self.gateway_workload_trust_domain.is_none()
+        if self.validation_mode == ValidationMode::Strict
+            && self.gateway_endpoint.scheme() == "https"
+            && self.gateway_workload_trust_domain.is_none()
         {
             return Err(configuration(
                 "gateway_workload_trust_domain is required for HTTPS",
@@ -103,7 +113,10 @@ impl AgentConfig {
         if let Some(trust_domain) = &self.gateway_workload_trust_domain {
             validate_gateway_trust_domain(trust_domain)?;
         }
-        if self.replication.enabled && self.gateway_workload_trust_domain.is_none() {
+        if self.validation_mode == ValidationMode::Strict
+            && self.replication.enabled
+            && self.gateway_workload_trust_domain.is_none()
+        {
             return Err(configuration(
                 "gateway_workload_trust_domain is required when replication is enabled",
             ));
@@ -137,6 +150,14 @@ impl AgentConfig {
         self.replication.listen_socket_addr()
     }
 }
+
+/// Deployment validation profile shared by the control and object transports.
+///
+/// `Strict` is the production default. `Development` can only be used with loopback endpoints;
+/// it relaxes deployment-owned SPIFFE/role and route-generation fences while leaving cryptographic
+/// transport authentication and protocol/capability checks active.
+/// Backwards-compatible Agent name for the shared transport validation profile.
+pub type ValidationMode = TransportValidationProfile;
 
 /// Optional Agent QUIC transport configuration. A target Agent connects only to its target
 /// Gateway; the source endpoint remains a listener reached through both configured Gateways.
@@ -498,6 +519,43 @@ pub(crate) fn validate_development_directory_probe_endpoint(
     Ok(())
 }
 
+fn validate_development_validation_endpoints(config: &AgentConfig) -> AgentDaemonResult<()> {
+    if !has_loopback_host(&config.gateway_endpoint) {
+        return Err(configuration(
+            "development validation requires a loopback gateway_endpoint",
+        ));
+    }
+    for (name, endpoint) in [
+        (
+            "replication.listen_endpoint",
+            config.replication.listen_endpoint.as_ref(),
+        ),
+        (
+            "replication.gateway_endpoint",
+            config.replication.gateway_endpoint.as_ref(),
+        ),
+    ] {
+        if let Some(endpoint) = endpoint {
+            let host = endpoint.host_str().ok_or_else(|| {
+                configuration(format!(
+                    "development validation requires {name} to have a loopback IP host"
+                ))
+            })?;
+            let address = host.parse::<IpAddr>().map_err(|_| {
+                configuration(format!(
+                    "development validation requires {name} to have a loopback IP host"
+                ))
+            })?;
+            if !address.is_loopback() {
+                return Err(configuration(format!(
+                    "development validation requires {name} to use a loopback IP host"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn has_loopback_host(endpoint: &Url) -> bool {
     match endpoint.host() {
         Some(url::Host::Ipv4(address)) => address.is_loopback(),
@@ -617,6 +675,32 @@ logging:
 
         config.gateway_endpoint = Url::parse("http://127.0.0.1:8080/").unwrap();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn development_validation_is_loopback_only_and_does_not_require_spiffe_identity() {
+        let mut config: AgentConfig = serde_yaml::from_str(VALID_CONFIG).unwrap();
+        config.validation_mode = ValidationMode::Development;
+        config.gateway_endpoint = Url::parse("https://127.0.0.1:8443/").unwrap();
+        config.gateway_workload_trust_domain = None;
+        config.central_command_trust_bundle_file =
+            Some(PathBuf::from("/etc/neoengram/central-command-trust.json"));
+        config.replication.enabled = true;
+        config.replication.listen_endpoint = Some(Url::parse("quic://127.0.0.1:9191").unwrap());
+        config.replication.gateway_endpoint = Some(Url::parse("quic://127.0.0.1:9292").unwrap());
+        config.replication.tls_certificate_file =
+            Some(PathBuf::from("/etc/neoengram/transfer-cert.pem"));
+        config.replication.tls_private_key_file =
+            Some(PathBuf::from("/etc/neoengram/transfer-key.pem"));
+        config.replication.tls_ca_file = Some(PathBuf::from("/etc/neoengram/transfer-ca.pem"));
+        config.validate().unwrap();
+
+        config.replication.gateway_endpoint = Some(Url::parse("quic://192.0.2.10:9292").unwrap());
+        assert!(config.validate().is_err());
+
+        config.replication.gateway_endpoint = Some(Url::parse("quic://127.0.0.1:9292").unwrap());
+        config.gateway_endpoint = Url::parse("https://gateway.example.internal/").unwrap();
+        assert!(config.validate().is_err());
     }
 
     #[test]

@@ -740,8 +740,13 @@ impl S3ReadChannelRegistry {
         let Some(session) = session.filter(|session| session.alive.load(Ordering::Acquire)) else {
             return Err(S3ControlError::Unavailable);
         };
+        let development = self
+            .inner
+            .tunnel
+            .transfer_validation_mode()
+            .is_development();
         if session.agent_connection_id != ticket.agent_connection_id
-            || session.route_generation != ticket.route_generation
+            || (!development && session.route_generation != ticket.route_generation)
         {
             return Err(S3ControlError::Unavailable);
         }
@@ -1174,6 +1179,18 @@ mod tests {
         }))
     }
 
+    fn development_tunnel() -> Arc<GatewayTunnel> {
+        Arc::new(GatewayTunnel::with_validation_mode(
+            GatewayIdentity {
+                edge_cluster_id: EdgeClusterId::new("cluster-a").unwrap(),
+                gateway_pool_id: GatewayPoolId::new("pool-a").unwrap(),
+                gateway_replica_id: GatewayReplicaId::new("replica-a").unwrap(),
+                software_version: "test".to_owned(),
+            },
+            neoengram_domain::protocol::TransportValidationProfile::Development,
+        ))
+    }
+
     fn hello(generation: u64) -> S3ReadChannelHello {
         S3ReadChannelHello {
             agent_id: AgentId::new("agent-a").unwrap(),
@@ -1529,6 +1546,35 @@ mod tests {
             Ok(_) => panic!("fenced route unexpectedly opened"),
         };
         assert_eq!(fenced_error, S3ControlError::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn development_profile_survives_route_generation_renewal() {
+        let tunnel = development_tunnel();
+        let route = tunnel
+            .install_test_agent_route(AgentId::new("agent-a").unwrap(), SessionGeneration::new(7))
+            .await;
+        let registry = S3ReadChannelRegistry::new(tunnel.clone());
+        let (outgoing, mut outgoing_rx) = mpsc::channel(8);
+        registry
+            .install(Arc::new(AgentReadSession::new(
+                1,
+                &hello(7),
+                route,
+                RouteGeneration::new(1),
+                outgoing,
+                tunnel,
+            )))
+            .await;
+
+        let mut renewed = ticket(7);
+        renewed.route_generation = RouteGeneration::new(99);
+        let read = S3ObjectReader::open(&registry, renewed).await.unwrap();
+        assert!(matches!(
+            S3ReadChannelFrame::decode(&outgoing_rx.recv().await.unwrap()).unwrap(),
+            S3ReadChannelFrame::Read(S3ReadFrame::Open(_))
+        ));
+        drop(read);
     }
 
     #[tokio::test]

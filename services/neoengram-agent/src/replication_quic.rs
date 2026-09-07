@@ -36,7 +36,7 @@ use x509_parser::{
 
 use crate::{
     CentralCommandTrustBundle, InMemoryPlacementInventory, LocalPlacementInventory,
-    SharedSessionFence,
+    SharedSessionFence, ValidationMode,
 };
 
 /// A transfer frame must make progress within a bounded interval. QUIC's connection idle
@@ -270,6 +270,7 @@ pub struct QuicTransferNetwork {
     /// configured through [`Self::with_gateway_workload_trust_domain`] so the existing public
     /// network config struct remains source-compatible for embedded callers.
     gateway_workload_trust_domain: Option<Arc<str>>,
+    validation_mode: ValidationMode,
 }
 
 impl QuicTransferNetwork {
@@ -358,6 +359,7 @@ impl QuicTransferNetwork {
             gateway_endpoint: config.gateway_endpoint,
             server_name: Arc::from(config.server_name.as_str()),
             gateway_workload_trust_domain: None,
+            validation_mode: ValidationMode::Strict,
         })
     }
 
@@ -369,6 +371,19 @@ impl QuicTransferNetwork {
     pub fn with_gateway_workload_trust_domain(mut self, trust_domain: impl Into<Arc<str>>) -> Self {
         self.gateway_workload_trust_domain = Some(trust_domain.into());
         self
+    }
+
+    /// Applies the same validation profile to both the source listener and target client.
+    /// Development is only constructible from a loopback-validated Agent configuration.
+    #[must_use]
+    pub fn with_validation_mode(mut self, mode: ValidationMode) -> Self {
+        self.validation_mode = mode;
+        self
+    }
+
+    #[must_use]
+    pub fn validation_mode(&self) -> ValidationMode {
+        self.validation_mode
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, QuicTransferError> {
@@ -512,6 +527,7 @@ impl QuicTransferNetwork {
             let local_agent_id = local_agent_id.clone();
             let local_storage_volume_id = local_storage_volume_id.clone();
             let gateway_workload_trust_domain = self.gateway_workload_trust_domain.clone();
+            let validation_mode = self.validation_mode;
             let session_fence = session_fence.clone();
             let execution = Arc::clone(&execution);
             let source_resolver = Arc::clone(&source_resolver);
@@ -535,6 +551,7 @@ impl QuicTransferNetwork {
                         Some(storage_volume_id) => identity.with_storage_volume(storage_volume_id),
                         None => identity,
                     }
+                    .with_validation_mode(validation_mode)
                     .with_session_mount(
                         current_session.session_generation.get(),
                         local_mount_generation.get(),
@@ -580,6 +597,7 @@ impl QuicTransferNetwork {
                         Some(identity),
                         peer_certificates.as_deref(),
                         gateway_workload_trust_domain.as_deref(),
+                        validation_mode,
                         source_resolver,
                     )
                     .await
@@ -603,6 +621,7 @@ pub struct QuicTransferIdentity {
     storage_volume_id: Option<StorageVolumeId>,
     generations: Option<(u64, u64, u64)>,
     session_mount: Option<(u64, u64)>,
+    validation_mode: ValidationMode,
 }
 
 impl QuicTransferIdentity {
@@ -613,7 +632,14 @@ impl QuicTransferIdentity {
             storage_volume_id: None,
             generations: None,
             session_mount: None,
+            validation_mode: ValidationMode::Strict,
         }
+    }
+
+    #[must_use]
+    pub fn with_validation_mode(mut self, mode: ValidationMode) -> Self {
+        self.validation_mode = mode;
+        self
     }
 
     #[must_use]
@@ -652,23 +678,25 @@ impl QuicTransferIdentity {
                 "ticket source Volume does not match local Volume".into(),
             ));
         }
-        if let Some((session, mount, route)) = self.generations {
-            if ticket.source_session_generation.get() != session
-                || ticket.source_mount_generation.get() != mount
-                || ticket.source_route_generation.get() != route
-            {
-                return Err(QuicTransferError::Protocol(
-                    "ticket source route generation is stale".into(),
-                ));
+        if self.validation_mode.is_strict() {
+            if let Some((session, mount, route)) = self.generations {
+                if ticket.source_session_generation.get() != session
+                    || ticket.source_mount_generation.get() != mount
+                    || ticket.source_route_generation.get() != route
+                {
+                    return Err(QuicTransferError::Protocol(
+                        "ticket source route generation is stale".into(),
+                    ));
+                }
             }
-        }
-        if let Some((session, mount)) = self.session_mount {
-            if ticket.source_session_generation.get() != session
-                || ticket.source_mount_generation.get() != mount
-            {
-                return Err(QuicTransferError::Protocol(
-                    "ticket source session or mount generation is stale".into(),
-                ));
+            if let Some((session, mount)) = self.session_mount {
+                if ticket.source_session_generation.get() != session
+                    || ticket.source_mount_generation.get() != mount
+                {
+                    return Err(QuicTransferError::Protocol(
+                        "ticket source session or mount generation is stale".into(),
+                    ));
+                }
             }
         }
         Ok(())
@@ -687,22 +715,25 @@ impl QuicTransferIdentity {
                 "ticket target Volume does not match local Volume".into(),
             ));
         }
-        if let Some((session, mount, route)) = self.generations {
-            if ticket.session_generation.get() != session
-                || ticket.mount_generation.get() != mount
-                || ticket.route_generation.get() != route
-            {
-                return Err(QuicTransferError::Protocol(
-                    "ticket target route generation is stale".into(),
-                ));
+        if self.validation_mode.is_strict() {
+            if let Some((session, mount, route)) = self.generations {
+                if ticket.session_generation.get() != session
+                    || ticket.mount_generation.get() != mount
+                    || ticket.route_generation.get() != route
+                {
+                    return Err(QuicTransferError::Protocol(
+                        "ticket target route generation is stale".into(),
+                    ));
+                }
             }
-        }
-        if let Some((session, mount)) = self.session_mount {
-            if ticket.session_generation.get() != session || ticket.mount_generation.get() != mount
-            {
-                return Err(QuicTransferError::Protocol(
-                    "ticket target session or mount generation is stale".into(),
-                ));
+            if let Some((session, mount)) = self.session_mount {
+                if ticket.session_generation.get() != session
+                    || ticket.mount_generation.get() != mount
+                {
+                    return Err(QuicTransferError::Protocol(
+                        "ticket target session or mount generation is stale".into(),
+                    ));
+                }
             }
         }
         Ok(())
@@ -724,23 +755,25 @@ impl QuicTransferIdentity {
                 "materialization source Volume does not match local Volume".into(),
             ));
         }
-        if let Some((session, mount, route)) = self.generations {
-            if ticket.source.session_generation.get() != session
-                || ticket.source.mount_generation.get() != mount
-                || ticket.source.route_generation.get() != route
-            {
-                return Err(QuicTransferError::Protocol(
-                    "materialization source route generation is stale".into(),
-                ));
+        if self.validation_mode.is_strict() {
+            if let Some((session, mount, route)) = self.generations {
+                if ticket.source.session_generation.get() != session
+                    || ticket.source.mount_generation.get() != mount
+                    || ticket.source.route_generation.get() != route
+                {
+                    return Err(QuicTransferError::Protocol(
+                        "materialization source route generation is stale".into(),
+                    ));
+                }
             }
-        }
-        if let Some((session, mount)) = self.session_mount {
-            if ticket.source.session_generation.get() != session
-                || ticket.source.mount_generation.get() != mount
-            {
-                return Err(QuicTransferError::Protocol(
-                    "materialization source session or mount generation is stale".into(),
-                ));
+            if let Some((session, mount)) = self.session_mount {
+                if ticket.source.session_generation.get() != session
+                    || ticket.source.mount_generation.get() != mount
+                {
+                    return Err(QuicTransferError::Protocol(
+                        "materialization source session or mount generation is stale".into(),
+                    ));
+                }
             }
         }
         Ok(())
@@ -762,23 +795,25 @@ impl QuicTransferIdentity {
                 "materialization target Volume does not match local Volume".into(),
             ));
         }
-        if let Some((session, mount, route)) = self.generations {
-            if ticket.target.session_generation.get() != session
-                || ticket.target.mount_generation.get() != mount
-                || ticket.target.route_generation.get() != route
-            {
-                return Err(QuicTransferError::Protocol(
-                    "materialization target route generation is stale".into(),
-                ));
+        if self.validation_mode.is_strict() {
+            if let Some((session, mount, route)) = self.generations {
+                if ticket.target.session_generation.get() != session
+                    || ticket.target.mount_generation.get() != mount
+                    || ticket.target.route_generation.get() != route
+                {
+                    return Err(QuicTransferError::Protocol(
+                        "materialization target route generation is stale".into(),
+                    ));
+                }
             }
-        }
-        if let Some((session, mount)) = self.session_mount {
-            if ticket.target.session_generation.get() != session
-                || ticket.target.mount_generation.get() != mount
-            {
-                return Err(QuicTransferError::Protocol(
-                    "materialization target session or mount generation is stale".into(),
-                ));
+            if let Some((session, mount)) = self.session_mount {
+                if ticket.target.session_generation.get() != session
+                    || ticket.target.mount_generation.get() != mount
+                {
+                    return Err(QuicTransferError::Protocol(
+                        "materialization target session or mount generation is stale".into(),
+                    ));
+                }
             }
         }
         Ok(())
@@ -1902,6 +1937,7 @@ async fn serve_quic_unified_source_connection<F1, F2>(
     identity: Option<QuicTransferIdentity>,
     peer_certificates: Option<&[CertificateDer<'static>]>,
     gateway_workload_trust_domain: Option<&str>,
+    validation_mode: ValidationMode,
     source_resolver: Arc<dyn SourcePlacementResolver>,
 ) -> Result<(), QuicTransferError>
 where
@@ -1913,29 +1949,35 @@ where
     let first = read_frame(&mut recv).await?;
     match first {
         frame @ TransferFrame::OpenMaterializationSigned(_) => {
-            // Materialization is a production v2 path and must never fall back to the legacy
-            // identity-free behavior. Rustls authenticates the transport certificate, while this
-            // application fence binds the Gateway workload to the ticket's source scope before
-            // the backend/resolver factories are called.
-            let peer_certificates = peer_certificates.ok_or_else(|| {
-                QuicTransferError::PeerIdentity(
-                    "Gateway did not present a workload certificate".to_owned(),
-                )
-            })?;
-            let trust_domain = gateway_workload_trust_domain.ok_or_else(|| {
-                QuicTransferError::PeerIdentity(
-                    "Gateway workload trust domain is not configured".to_owned(),
-                )
-            })?;
+            // Rustls always authenticates the mTLS chain. Strict mode additionally binds the
+            // Gateway workload URI/EKU to the source ticket. Development is loopback-only and
+            // defers that deployment-owned fence while retaining the signed ticket and all
+            // frame/object checks below.
             let TransferFrame::OpenMaterializationSigned(signed) = &frame else {
                 unreachable!("source frame was matched above")
             };
-            validate_gateway_source_peer_certificate(
-                Some(peer_certificates),
-                trust_domain,
-                &signed.ticket.source.edge_cluster_id,
-                &signed.ticket.source.gateway_pool_id,
-            )?;
+            if validation_mode.is_strict() {
+                let peer_certificates = peer_certificates.ok_or_else(|| {
+                    QuicTransferError::PeerIdentity(
+                        "Gateway did not present a workload certificate".to_owned(),
+                    )
+                })?;
+                let trust_domain = gateway_workload_trust_domain.ok_or_else(|| {
+                    QuicTransferError::PeerIdentity(
+                        "Gateway workload trust domain is not configured".to_owned(),
+                    )
+                })?;
+                validate_gateway_source_peer_certificate(
+                    Some(peer_certificates),
+                    trust_domain,
+                    &signed.ticket.source.edge_cluster_id,
+                    &signed.ticket.source.gateway_pool_id,
+                )?;
+            } else if peer_certificates.is_none_or(|certificates| certificates.is_empty()) {
+                return Err(QuicTransferError::PeerIdentity(
+                    "Gateway did not present a workload certificate".to_owned(),
+                ));
+            }
             serve_quic_materialization_source_stream_with_factory_from_first(
                 send,
                 recv,
@@ -2727,6 +2769,12 @@ mod tests {
             .clone()
             .with_storage_volume(StorageVolumeId::new("volume-other").unwrap());
         assert!(wrong_target_volume.check_target(&transfer).is_err());
+        let development = QuicTransferIdentity::new(AgentId::new("agent-target").unwrap())
+            .with_validation_mode(ValidationMode::Development)
+            .with_generations(99, 99, 99);
+        development
+            .check_target(&replaced_mount)
+            .expect("development profile defers deployment-owned identity fences");
         let mut unauthorized = transfer;
         unauthorized.allowed_objects.clear();
         assert!(validate_ticket_set(&unauthorized, &set).is_err());

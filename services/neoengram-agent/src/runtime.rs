@@ -171,9 +171,14 @@ where
     P: MountProbe + Clone,
 {
     let trust_bundle = crate::tls::GatewayTrustBundle::load(&config.trust_bundle_file)?;
+    // In development, loopback endpoint validation still applies but deployment-owned Gateway
+    // SPIFFE identity binding is deferred. The TLS CA, mTLS, ALPN, H2 framing, and request
+    // signatures remain active in the transport clients.
     let gateway_identity = config
-        .gateway_workload_trust_domain
-        .as_ref()
+        .validation_mode
+        .is_strict()
+        .then_some(config.gateway_workload_trust_domain.as_ref())
+        .flatten()
         .map(|trust_domain| GatewayServerIdentity {
             trust_domain: trust_domain.clone(),
             edge_cluster_id: config.edge_cluster_id.to_string(),
@@ -2030,6 +2035,7 @@ mod tests {
         AgentConfig {
             schema_version: 1,
             wire_version: 1,
+            validation_mode: crate::ValidationMode::Strict,
             gateway_endpoint: url::Url::parse("http://127.0.0.1:8080/").unwrap(),
             trust_bundle_file: root.join("gateway-ca.pem"),
             gateway_workload_trust_domain: None,

@@ -20,9 +20,9 @@ use neoengram_domain::protocol::materialization::{
 use neoengram_domain::protocol::{
     object_read_lease_id, staging_lease_id, AgentId, ArtifactId, CommitObject, DecimalU64,
     Generation, MaterializationBatchId, MaterializationId, ObjectNamespaceId, ObjectSet,
-    ObjectTicketId, OperationTask, PlacementGeneration, RequestId, StorageVolumeId, TaskAttemptId,
-    TaskId, TaskIntent, TaskPurpose, TaskResourceKind, TaskResourceRole, TaskScope, TaskState,
-    TenantId, UnixMillis,
+    ObjectTicketId, OperationTask, PlacementGeneration, RequestId, StageState, StorageVolumeId,
+    TaskActor, TaskAttemptId, TaskId, TaskIntent, TaskIssue, TaskProgressSummary, TaskPurpose,
+    TaskResourceKind, TaskResourceRole, TaskScope, TaskState, TenantId, UnixMillis,
 };
 
 use crate::dto::{
@@ -33,7 +33,7 @@ use crate::dto::{
     QueryCommitCoverageRequest, QueryCommitCoverageResponse, QueryCommitMaterializationListRequest,
     QueryCommitMaterializationListResponse, QueryCommitMaterializationRequest,
     QueryCommitMaterializationResponse, RetryCommitMaterializationRequest,
-    RetryCommitMaterializationResponse, VolumeCommitCoverageView,
+    RetryCommitMaterializationResponse, TaskView, VolumeCommitCoverageView,
 };
 use crate::error::{application_error, invalid_request, map_central_error};
 use crate::identity::{AuthenticatedIdentity, Permission};
@@ -162,6 +162,21 @@ fn state_name(state: MaterializationJobState) -> &'static str {
         MaterializationJobState::Stalled => "stalled",
         MaterializationJobState::Failed => "failed",
         MaterializationJobState::Cancelled => "cancelled",
+    }
+}
+
+fn materialization_task_state(state: MaterializationJobState) -> TaskState {
+    match state {
+        MaterializationJobState::Queued => TaskState::Queued,
+        MaterializationJobState::Planning | MaterializationJobState::Materializing => {
+            TaskState::Running
+        }
+        MaterializationJobState::WaitingForSources => TaskState::Waiting,
+        MaterializationJobState::Verifying => TaskState::Verifying,
+        MaterializationJobState::Complete => TaskState::Succeeded,
+        MaterializationJobState::Stalled => TaskState::Stalled,
+        MaterializationJobState::Failed => TaskState::Failed,
+        MaterializationJobState::Cancelled => TaskState::Cancelled,
     }
 }
 
@@ -1296,6 +1311,256 @@ impl CatalogService {
         Ok((next_job, object_tasks, batches, coverage))
     }
 
+    /// Projects a materialization plan into the public operation task immediately after the
+    /// durable plan CAS.  Agent reports use the same projection later, but a plan can legitimately
+    /// wait for a source before any Agent report exists; leaving the root task queued/running with
+    /// pending stages makes that state indistinguishable from a broken transfer.
+    async fn synchronize_materialization_task_projection(
+        &self,
+        job: &MaterializationJob,
+        identity: &AuthenticatedIdentity,
+        task: Option<TaskView>,
+    ) -> Result<Option<TaskView>, Error> {
+        let Some(coordinator) = &self.task_coordinator else {
+            return Ok(task);
+        };
+        let Some(task) = task else {
+            return Ok(None);
+        };
+        let task_id = TaskId::new(task.task_id.clone())
+            .map_err(|error| invalid_request(format!("task_id: {error}")))?;
+        let tenant_id = TenantId::new(task.tenant_id.clone())
+            .map_err(|error| invalid_request(format!("tenant_id: {error}")))?;
+        let actor = TaskActor::Principal(identity.principal().clone());
+        let desired = materialization_task_state(job.state);
+        // Waiting-for-sources is recoverable even when an older Job row did not persist its
+        // diagnostic text. Keep a retryable issue on the task projection so the unified retry
+        // action remains available after upgrading such rows.
+        let issue = match (job.state, job.issue.as_ref()) {
+            (MaterializationJobState::WaitingForSources, message) => Some(TaskIssue {
+                code: "MATERIALIZATION_WAITING_FOR_SOURCES".to_owned(),
+                message: message.cloned().unwrap_or_else(|| {
+                    "materialization is waiting for a healthy source or target route".to_owned()
+                }),
+                retryable: true,
+                detail: None,
+            }),
+            (MaterializationJobState::Stalled, Some(message)) => Some(TaskIssue {
+                code: "MATERIALIZATION_STALLED".to_owned(),
+                message: message.clone(),
+                retryable: true,
+                detail: None,
+            }),
+            (MaterializationJobState::Failed, Some(message)) => Some(TaskIssue {
+                code: "MATERIALIZATION_FAILED".to_owned(),
+                message: message.clone(),
+                retryable: false,
+                detail: None,
+            }),
+            (_, Some(message)) => Some(TaskIssue {
+                code: "MATERIALIZATION_ISSUE".to_owned(),
+                message: message.clone(),
+                retryable: true,
+                detail: None,
+            }),
+            _ => None,
+        };
+
+        let targets: &[(&str, StageState)] = match job.state {
+            MaterializationJobState::Queued => &[],
+            MaterializationJobState::Planning => &[
+                ("validate", StageState::Succeeded),
+                ("plan", StageState::Running),
+            ],
+            MaterializationJobState::WaitingForSources => &[
+                ("validate", StageState::Succeeded),
+                ("plan", StageState::Succeeded),
+                ("transfer", StageState::Waiting),
+            ],
+            MaterializationJobState::Materializing => &[
+                ("validate", StageState::Succeeded),
+                ("plan", StageState::Succeeded),
+                ("transfer", StageState::Running),
+            ],
+            MaterializationJobState::Verifying => &[
+                ("validate", StageState::Succeeded),
+                ("plan", StageState::Succeeded),
+                ("transfer", StageState::Succeeded),
+                ("verify", StageState::Verifying),
+            ],
+            MaterializationJobState::Complete => &[
+                ("validate", StageState::Succeeded),
+                ("plan", StageState::Succeeded),
+                ("transfer", StageState::Succeeded),
+                ("verify", StageState::Succeeded),
+                ("publish_coverage", StageState::Succeeded),
+                ("finalize", StageState::Succeeded),
+            ],
+            MaterializationJobState::Stalled => &[
+                ("validate", StageState::Succeeded),
+                ("plan", StageState::Succeeded),
+                ("transfer", StageState::Stalled),
+            ],
+            MaterializationJobState::Failed => &[
+                ("validate", StageState::Succeeded),
+                ("plan", StageState::Succeeded),
+                ("transfer", StageState::Failed),
+            ],
+            MaterializationJobState::Cancelled => &[],
+        };
+
+        for (stage_key, target) in targets {
+            loop {
+                let current = coordinator
+                    .repository()
+                    .stages(&tenant_id, &task_id)
+                    .await
+                    .map_err(map_central_error)?
+                    .into_iter()
+                    .find(|stage| stage.stage_key == *stage_key);
+                let Some(current) = current else {
+                    break;
+                };
+                if current.state == *target
+                    || (current.state.is_success() && *target == StageState::Succeeded)
+                {
+                    break;
+                }
+                let next = match (current.state, *target) {
+                    (StageState::Pending, _) => StageState::Ready,
+                    (StageState::Ready, _) => StageState::Running,
+                    (StageState::Running, target) => target,
+                    (StageState::Waiting, target) if target != StageState::Waiting => target,
+                    (StageState::Verifying, target) if target != StageState::Verifying => target,
+                    (StageState::Stalled, StageState::Running) => StageState::Running,
+                    _ => break,
+                };
+                coordinator
+                    .transition_stage(
+                        &task_id,
+                        &tenant_id,
+                        stage_key,
+                        next,
+                        if matches!(next, StageState::Failed | StageState::Stalled) {
+                            issue.clone()
+                        } else {
+                            None
+                        },
+                    )
+                    .await
+                    .map_err(map_central_error)?;
+            }
+        }
+
+        coordinator
+            .update_progress(
+                &task_id,
+                &tenant_id,
+                TaskProgressSummary::new(
+                    job.verified_object_count.get(),
+                    job.object_count.get(),
+                    job.verified_bytes.get(),
+                    job.total_bytes.get(),
+                ),
+            )
+            .await
+            .map_err(map_central_error)?;
+
+        let mut current = coordinator
+            .repository()
+            .get(&tenant_id, &task_id)
+            .await
+            .map_err(map_central_error)?
+            .ok_or_else(|| invalid_request("operation task disappeared"))?;
+        if !current.state.is_terminal() && (current.state != desired || current.issue != issue) {
+            if desired == TaskState::Succeeded {
+                current = coordinator
+                    .complete_immediate(&current, actor.clone())
+                    .await
+                    .map_err(map_central_error)?;
+            } else {
+                if desired == TaskState::Waiting && current.state == TaskState::Stalled {
+                    coordinator
+                        .transition(
+                            &task_id,
+                            &tenant_id,
+                            TaskState::Running,
+                            actor.clone(),
+                            Some("materialization resumed".to_owned()),
+                        )
+                        .await
+                        .map_err(map_central_error)?;
+                }
+                current = coordinator
+                    .transition_with_issue(
+                        &task_id,
+                        &tenant_id,
+                        desired,
+                        actor,
+                        issue,
+                        Some(format!("materialization state: {:?}", job.state)),
+                    )
+                    .await
+                    .map_err(map_central_error)?;
+            }
+        }
+        let execution_reused = task.execution_reused;
+        let mut view = super::task::task_view(&current);
+        view.execution_reused |= execution_reused;
+        Ok(Some(view))
+    }
+
+    /// Repairs the task projection written by older materialization implementations. Those
+    /// versions persisted a source-waiting Job but advanced its OperationTask to `running`, which
+    /// made the task ineligible for the public retry action. Keep this narrow and idempotent: only
+    /// a Commit materialization task whose durable Job is waiting for sources is repaired.
+    pub(crate) async fn reconcile_stale_materialization_task(
+        &self,
+        identity: &AuthenticatedIdentity,
+        task: &OperationTask,
+    ) -> Result<bool, Error> {
+        if task.intent_kind != TaskIntent::CommitMaterialize
+            || !matches!(task.state, TaskState::Running | TaskState::Waiting)
+        {
+            return Ok(false);
+        }
+        let namespace = task.object_namespace_id.clone().or_else(|| {
+            task.resource_links
+                .iter()
+                .find(|link| link.resource_kind == TaskResourceKind::ObjectNamespace)
+                .and_then(|link| ObjectNamespaceId::new(link.resource_id.clone()).ok())
+        });
+        let detail_id = task.detail_id.clone().or_else(|| {
+            task.resource_links
+                .iter()
+                .find(|link| link.resource_kind == TaskResourceKind::Materialization)
+                .map(|link| link.resource_id.clone())
+        });
+        let (Some(namespace), Some(detail_id)) = (namespace, detail_id) else {
+            return Ok(false);
+        };
+        let Some(repository) = &self.placement else {
+            return Ok(false);
+        };
+        let materialization_id = parse_materialization_id(detail_id)?;
+        let Some(job) = repository
+            .get_materialization(&task.tenant_id, &namespace, &materialization_id)
+            .await
+            .map_err(map_central_error)?
+        else {
+            return Ok(false);
+        };
+        if job.operation_task_id != task.task_id
+            || job.state != MaterializationJobState::WaitingForSources
+        {
+            return Ok(false);
+        }
+        let task_view = super::task::task_view(task);
+        self.synchronize_materialization_task_projection(&job, identity, Some(task_view))
+            .await?;
+        Ok(true)
+    }
+
     pub async fn materialize_commit(
         &self,
         identity: &AuthenticatedIdentity,
@@ -1916,13 +2181,8 @@ impl CatalogService {
             self.operation_result(
                 &previous_task,
                 identity,
-                self.transition_operation_task(
-                    task,
-                    TaskState::Running,
-                    identity,
-                    Some("materialization plan accepted".to_owned()),
-                )
-                .await,
+                self.synchronize_materialization_task_projection(&stored, identity, task)
+                    .await,
             )
             .await?
         };
@@ -2298,6 +2558,26 @@ impl CatalogService {
                 coverage.total_bytes.get(),
             );
             if goal_satisfied {
+                // The public task retry endpoint resets the task stages before invoking this
+                // planner. A complete, still-satisfied materialization is a semantic no-op, but
+                // its successful stage projection must be rebuilt before TaskService can finish
+                // the retried attempt without violating the task DAG invariant.
+                if let Some(coordinator) = &self.task_coordinator {
+                    if let Some(operation_task) = coordinator
+                        .repository()
+                        .get(&tenant_id, &current.operation_task_id)
+                        .await
+                        .map_err(map_central_error)?
+                    {
+                        let task = super::task::task_view(&operation_task);
+                        self.synchronize_materialization_task_projection(
+                            &current,
+                            identity,
+                            Some(task),
+                        )
+                        .await?;
+                    }
+                }
                 return Ok(RetryCommitMaterializationResponse {
                     materialization: view(&current, &object_set),
                     // The retry request is a fresh request identity. A complete, still-satisfied
@@ -2372,6 +2652,19 @@ impl CatalogService {
             MaterializationPlanInsertOutcome::Inserted(stored) => (stored, false),
             MaterializationPlanInsertOutcome::Existing(stored) => (stored, true),
         };
+        if let Some(coordinator) = &self.task_coordinator {
+            if let Some(operation_task) = coordinator
+                .repository()
+                .get(&tenant_id, &stored_job.operation_task_id)
+                .await
+                .map_err(map_central_error)?
+            {
+                let task = super::task::task_view(&operation_task);
+                let _ = self
+                    .synchronize_materialization_task_projection(&stored_job, identity, Some(task))
+                    .await?;
+            }
+        }
         Ok(RetryCommitMaterializationResponse {
             materialization: view(&stored_job, &object_set),
             request_replayed: replayed,
@@ -2388,15 +2681,29 @@ impl CatalogService {
         identity: &AuthenticatedIdentity,
         task: &OperationTask,
     ) -> Result<RetryCommitMaterializationResponse, Error> {
+        // Query dimensions and detail fields are intentionally local projections and are omitted
+        // from the durable OperationTask payload. Older rows (and rows loaded through the task
+        // repository) may therefore expose them only through their typed resource links.
         let namespace = task
             .object_namespace_id
             .clone()
+            .or_else(|| {
+                task.resource_links
+                    .iter()
+                    .find(|link| link.resource_kind == TaskResourceKind::ObjectNamespace)
+                    .and_then(|link| ObjectNamespaceId::new(link.resource_id.clone()).ok())
+            })
             .ok_or_else(|| invalid_request("materialization task has no object namespace"))?;
         let materialization_id = task
             .detail_id
-            .as_deref()
-            .ok_or_else(|| invalid_request("materialization task has no detail_id"))?
-            .to_owned();
+            .clone()
+            .or_else(|| {
+                task.resource_links
+                    .iter()
+                    .find(|link| link.resource_kind == TaskResourceKind::Materialization)
+                    .map(|link| link.resource_id.clone())
+            })
+            .ok_or_else(|| invalid_request("materialization task has no detail_id"))?;
         let repository = self.placement.as_ref().ok_or_else(|| {
             application_error(
                 ErrorCategory::Unavailable,

@@ -66,6 +66,12 @@ struct TransferUpstreamRoute {
     upstream: SocketAddr,
 }
 
+fn parse_transfer_validation_mode(
+    value: &str,
+) -> Result<transfer_quic::TransferValidationMode, String> {
+    value.parse().map_err(|error: String| error)
+}
+
 fn parse_transfer_upstream_route(value: &str) -> Result<TransferUpstreamRoute, String> {
     let (agent_id, upstream) = value
         .split_once('=')
@@ -165,6 +171,16 @@ struct GatewayConfig {
     /// Optional current route generation for the endpoint selected by transfer_relay_role.
     #[arg(long, env = "NEOENGRAM_GATEWAY_TRANSFER_ROUTE_GENERATION")]
     transfer_route_generation: Option<u64>,
+    /// Application-level transfer checks. Development is loopback-only and keeps TLS/frame
+    /// protection while deferring workload URI/EKU/generation admission until the data path works.
+    #[arg(
+        long = "validation-mode",
+        visible_alias = "transfer-validation-mode",
+        env = "NEOENGRAM_GATEWAY_TRANSFER_VALIDATION_MODE",
+        default_value = "strict",
+        value_parser = parse_transfer_validation_mode
+    )]
+    transfer_validation_mode: transfer_quic::TransferValidationMode,
     /// Optional browser/S3 listener. Existing workload-only deployments remain unchanged until
     /// this address is configured explicitly.
     #[arg(long, env = "NEOENGRAM_GATEWAY_PUBLIC_LISTEN")]
@@ -305,6 +321,28 @@ impl GatewayConfig {
         }
         if self.transfer_relay_role.is_some() && self.transfer_listen.is_none() {
             return Err("transfer listener is required when transfer relay is configured".into());
+        }
+        if self.transfer_validation_mode == transfer_quic::TransferValidationMode::Development {
+            let non_loopback = [
+                Some(self.agent_listen),
+                Some(self.control_listen),
+                Some(self.peer_listen),
+                self.transfer_listen,
+                self.transfer_upstream,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|address| !address.ip().is_loopback())
+                || self
+                    .transfer_upstream_routes
+                    .iter()
+                    .any(|route| !route.upstream.ip().is_loopback());
+            if non_loopback {
+                return Err(
+                    "development transfer validation requires loopback Gateway transfer endpoints"
+                        .into(),
+                );
+            }
         }
         if self
             .transfer_upstream
@@ -717,6 +755,16 @@ async fn run(config: GatewayConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
     } else {
         None
     };
+    let transfer_role = config
+        .transfer_relay_role
+        .unwrap_or(transfer_quic::TransferRelayRole::Target);
+    let transfer_agent_client_tls = if config.transfer_listen.is_some()
+        && transfer_role == transfer_quic::TransferRelayRole::Source
+    {
+        Some(config.transfer_transport.load_agent_client_config()?)
+    } else {
+        None
+    };
     let public_tls = match (
         config.public_tls_certificate_file.as_deref(),
         config.public_tls_private_key_file.as_deref(),
@@ -751,12 +799,11 @@ async fn run(config: GatewayConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
         allow_loopback_http,
     ));
     let mut transfer_fence = transfer_quic::QuicTransferFence::for_role(
-        config
-            .transfer_relay_role
-            .unwrap_or(transfer_quic::TransferRelayRole::Target),
+        transfer_role,
         identity.gateway_pool_id.clone(),
         identity.edge_cluster_id.clone(),
     );
+    transfer_fence = transfer_fence.with_validation_mode(config.transfer_validation_mode);
     if let Some(trust_domain) = config.workload_trust_domain.as_deref() {
         transfer_fence = transfer_fence.with_workload_trust_domain(trust_domain);
     }
@@ -828,13 +875,18 @@ async fn run(config: GatewayConfig) -> Result<(), Box<dyn Error + Send + Sync>> 
                 let directory = transfer_upstreams
                     .clone()
                     .expect("transfer upstream directory is created with transfer listener");
-                let connector = transfer_quic::QuinnTransferConnectionFactory::bind_with_directory(
-                    config.transfer_upstream,
-                    Arc::<str>::from(server_name),
-                    client_tls,
-                    directory,
-                )
-                .map_err(std::io::Error::other)?;
+                let connector =
+                    transfer_quic::QuinnTransferConnectionFactory::bind_with_directory_and_role(
+                        config.transfer_upstream,
+                        Arc::<str>::from(server_name),
+                        client_tls,
+                        transfer_agent_client_tls,
+                        transfer_role,
+                        config.transfer_validation_mode,
+                        config.workload_trust_domain.clone().map(Arc::<str>::from),
+                        directory,
+                    )
+                    .map_err(std::io::Error::other)?;
                 listener = listener.with_relay(Arc::new(
                     transfer_quic::ConnectedTransferRelay::new(Arc::new(connector)),
                 ));
@@ -2211,6 +2263,51 @@ mod tests {
         config.transfer_mount_generation = None;
         config.transfer_route_generation = None;
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn development_transfer_validation_is_loopback_only_for_every_hop() {
+        let mut config = GatewayConfig::try_parse_from([
+            "neoengram-gateway",
+            "--edge-cluster-id",
+            "cluster-a",
+            "--gateway-pool-id",
+            "pool-a",
+            "--gateway-replica-id",
+            "replica-a",
+            "--transfer-listen",
+            "127.0.0.1:8084",
+            "--transfer-relay-role",
+            "target",
+            "--transfer-upstream",
+            "127.0.0.1:8184",
+            "--transfer-upstream-server-name",
+            "localhost",
+            "--transfer-tls-certificate-file",
+            "/transfer-listener.crt",
+            "--transfer-tls-private-key-file",
+            "/transfer-listener.key",
+            "--transfer-tls-client-ca-file",
+            "/transfer-ca.crt",
+            "--workload-trust-domain",
+            "mesh.example.test",
+            "--transfer-validation-mode",
+            "development",
+        ])
+        .unwrap();
+        config.agent_listen = "127.0.0.1:8081".parse().unwrap();
+        config.control_listen = "127.0.0.1:8082".parse().unwrap();
+        config.peer_listen = "127.0.0.1:8083".parse().unwrap();
+        assert!(config.validate().is_ok());
+
+        config.transfer_upstream = Some("192.0.2.10:8184".parse().unwrap());
+        assert!(config.validate().is_err());
+        config.transfer_upstream = Some("127.0.0.1:8184".parse().unwrap());
+        config.transfer_upstream_routes = vec![TransferUpstreamRoute {
+            agent_id: "agent-source".to_owned(),
+            upstream: "192.0.2.11:8185".parse().unwrap(),
+        }];
+        assert!(config.validate().is_err());
     }
 
     #[test]

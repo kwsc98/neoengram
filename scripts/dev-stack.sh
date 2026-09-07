@@ -30,6 +30,11 @@ DRY_RUN=0
 STARTUP_IN_PROGRESS=0
 GATEWAY_SOFTWARE_VERSION=
 GATEWAY_CAPABILITIES_JSON='["agent-control-v1","commit_materialization_v2","peer-forward-v1","route-lease-v1"]'
+WORKLOAD_TRUST_DOMAIN=development.neoengram.local
+COMMAND_TRUST_BUNDLE=
+TRANSFER_CA_CERT=
+TRANSFER_PLANE_CONFIGURED=0
+AGENT_IDS=()
 
 # Track topology options so a stopped custom stack can restore the values saved in stack.info
 # without preventing an explicit override for a deliberate new data directory.
@@ -107,7 +112,7 @@ Options:
                            (default: round-robin across Gateways; one value applies to all)
   --data-dir PATH          Persistent process/config/log directory (default: target/dev-stack)
   --central-port PORT      Central HTTP port (default: 8080)
-  --base-port PORT         First Gateway Agent port; each Gateway consumes 3 ports (default: 18080)
+  --base-port PORT         First Gateway Agent port; local data-plane ports are allocated after the Gateway ports (default: 18080)
   --central-token TOKEN    Development Bearer token (default: local-development-token)
   --tenant ID              Development tenant (default: tenant-local)
   --edge-cluster ID        EdgeCluster ID (default: edge-local)
@@ -356,13 +361,17 @@ validate_options() {
   [[ -n "$CENTRAL_TOKEN" && "$CENTRAL_TOKEN" != *[[:space:]]* ]] || die "--central-token must be non-empty and contain no whitespace"
   [[ -n "$REGION" && "$REGION" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || die "--region contains unsupported characters"
   [[ -n "$DISPLAY_NAME" && "$DISPLAY_NAME" != *$'\n'* && "$DISPLAY_NAME" != *$'\r'* ]] || die "--display-name must be non-empty and single-line"
-  local last_port=$(( BASE_PORT + GATEWAYS * 3 - 1 ))
+  # Reserve five slots per Gateway (HTTP agent/control/peer, QUIC transfer, and one spare),
+  # followed by one QUIC listener slot per volume-scoped Agent.
+  local last_port=$(( BASE_PORT + GATEWAYS * 5 + ${#DISK_PATHS[@]} ))
   (( last_port <= 65535 )) || die "--base-port and --gateways produce a port above 65535"
 }
 
 gateway_agent_port() { printf '%s\n' $(( BASE_PORT + ($1 - 1) * 3 )); }
 gateway_control_port() { printf '%s\n' $(( BASE_PORT + ($1 - 1) * 3 + 1 )); }
 gateway_peer_port() { printf '%s\n' $(( BASE_PORT + ($1 - 1) * 3 + 2 )); }
+gateway_transfer_port() { printf '%s\n' $(( BASE_PORT + GATEWAYS * 3 + ($1 - 1) )); }
+agent_transfer_port() { printf '%s\n' $(( BASE_PORT + GATEWAYS * 4 + ($1 - 1) )); }
 pid_file_for() { printf '%s/pids/%s.pid\n' "$DATA_DIR" "$1"; }
 log_file_for() { printf '%s/logs/%s.log\n' "$DATA_DIR" "$1"; }
 
@@ -608,6 +617,15 @@ write_enrollment_keyring() {
   chmod 600 "$path"
 }
 
+write_command_trust_bundle() {
+  local path="$1"
+  # This is the public SPKI for the fixed [0x42; 32] Ed25519 development signer in
+  # services/neoengram-central/src/main.rs. Agents only need this verification key.
+  umask 077
+  printf '%s\n' '{"schema_version":1,"keys":[{"key_id":"central-command-local","certificate_generation":"1","public_key_spki":"MCowBQYDK2VwAyEAIVL40Zt5HSRFMkLhXy6rbLfP-ntqXtMAl5YOBpiB2xI","state":"active"}]}' >"$path"
+  chmod 600 "$path"
+}
+
 write_dev_ca() {
   local key_path="$1" cert_path="$2"
   if [[ ! -s "$cert_path" || ! -s "$key_path" ]]; then
@@ -617,6 +635,15 @@ write_dev_ca() {
   fi
   [[ -s "$key_path" && -s "$cert_path" ]] || die "development CA files could not be created"
   chmod 600 "$key_path" "$cert_path"
+}
+
+extract_second_certificate() {
+  local chain="$1"
+  awk '
+    /-----BEGIN CERTIFICATE-----/ { certificate += 1 }
+    certificate == 2 { print }
+    /-----END CERTIFICATE-----/ && certificate == 2 { exit }
+  ' "$chain"
 }
 
 write_gateway_bootstrap_key() {
@@ -639,10 +666,15 @@ yaml_quote() {
 
 write_agent_config() {
   local path="$1" gateway_endpoint="$2" token_id="$3" bootstrap_token_file="$4" digest="$5" state_dir="$6" mount_path="$7" marker_file="$8" volume_id="$9"
-  local gateway_endpoint_yaml trust_bundle_yaml tenant_yaml edge_cluster_yaml volume_yaml digest_yaml region_yaml
+  local replication_enabled="${10:-false}" replication_listen="${11:-}" replication_gateway="${12:-}"
+  local replication_certificate="${13:-}" replication_private_key="${14:-}" replication_ca="${15:-}"
+  local gateway_endpoint_yaml trust_bundle_yaml command_trust_bundle_yaml tenant_yaml edge_cluster_yaml volume_yaml digest_yaml region_yaml
   local mount_path_yaml state_dir_yaml marker_file_yaml token_id_yaml bootstrap_token_file_yaml
+  local workload_trust_domain_yaml replication_listen_yaml replication_gateway_yaml replication_certificate_yaml
+  local replication_private_key_yaml replication_ca_yaml replication_yaml
   gateway_endpoint_yaml="$(yaml_quote "$gateway_endpoint")"
   trust_bundle_yaml="$(yaml_quote "$CA_CERT")"
+  command_trust_bundle_yaml="$(yaml_quote "$COMMAND_TRUST_BUNDLE")"
   tenant_yaml="$(yaml_quote "$TENANT_ID")"
   edge_cluster_yaml="$(yaml_quote "$EDGE_CLUSTER_ID")"
   volume_yaml="$(yaml_quote "$volume_id")"
@@ -653,15 +685,34 @@ write_agent_config() {
   marker_file_yaml="$(yaml_quote "$marker_file")"
   token_id_yaml="$(yaml_quote "$token_id")"
   bootstrap_token_file_yaml="$(yaml_quote "$bootstrap_token_file")"
+  workload_trust_domain_yaml="$(yaml_quote "$WORKLOAD_TRUST_DOMAIN")"
+  if [[ "$replication_enabled" == true ]]; then
+    replication_listen_yaml="$(yaml_quote "$replication_listen")"
+    replication_gateway_yaml="$(yaml_quote "$replication_gateway")"
+    replication_certificate_yaml="$(yaml_quote "$replication_certificate")"
+    replication_private_key_yaml="$(yaml_quote "$replication_private_key")"
+    replication_ca_yaml="$(yaml_quote "$replication_ca")"
+    replication_yaml="  enabled: true"
+    replication_yaml+=$'\n  listen_endpoint: '"${replication_listen_yaml}"
+    replication_yaml+=$'\n  gateway_endpoint: '"${replication_gateway_yaml}"
+    replication_yaml+=$'\n  tls_certificate_file: '"${replication_certificate_yaml}"
+    replication_yaml+=$'\n  tls_private_key_file: '"${replication_private_key_yaml}"
+    replication_yaml+=$'\n  tls_ca_file: '"${replication_ca_yaml}"
+  else
+    replication_yaml="  enabled: false"
+  fi
   mkdir -p "$state_dir" "$(dirname "$bootstrap_token_file")" "$(dirname "$path")"
   chmod 700 "$state_dir"
   cat >"$path" <<EOF
 schema_version: 1
 wire_version: 1
+validation_mode: development
 gateway_endpoint: ${gateway_endpoint_yaml}
 trust_bundle_file: ${trust_bundle_yaml}
+gateway_workload_trust_domain: ${workload_trust_domain_yaml}
+central_command_trust_bundle_file: ${command_trust_bundle_yaml}
 replication:
-  enabled: false
+${replication_yaml}
 tenant_id: ${tenant_yaml}
 edge_cluster_id: ${edge_cluster_yaml}
 storage_volume_id: ${volume_yaml}
@@ -864,6 +915,100 @@ approve_agent_enrollment() {
   die "Agent enrollment did not reach pending_approval within ${WAIT_SECONDS}s"
 }
 
+prepare_transfer_materials() {
+  local index state_db identity_json agent_id agent_dir cert_file key_file key_der_file digest gateway gateway_endpoint
+  local gateway_certificate gateway_issuer
+  gateway_certificate="${DATA_DIR}/gateways/gateway-1/certificate-chain.pem"
+  [[ -s "$gateway_certificate" ]] || die "gateway-1 activation certificate is missing; cannot configure transfer TLS"
+  TRANSFER_CA_CERT="${DATA_DIR}/keyring/transfer-ca.pem"
+  # Development workload issuance creates an independent issuer for each certificate request.
+  # The transfer listener authenticates both Agents and Gateway relay peers, so its CA bundle
+  # must include every issuer in the local stack rather than only gateway-1's issuer.
+  : >"$TRANSFER_CA_CERT"
+  for ((index = 1; index <= GATEWAYS; index++)); do
+    gateway_certificate="${DATA_DIR}/gateways/gateway-${index}/certificate-chain.pem"
+    [[ -s "$gateway_certificate" ]] || die "gateway-${index} activation certificate is missing; cannot configure transfer TLS"
+    gateway_issuer="$(extract_second_certificate "$gateway_certificate")"
+    [[ -n "$gateway_issuer" ]] || die "gateway-${index} activation certificate did not contain a transfer CA"
+    printf '%s\n' "$gateway_issuer" >>"$TRANSFER_CA_CERT"
+  done
+  [[ -s "$TRANSFER_CA_CERT" ]] || die "Gateway activation certificate did not contain a transfer CA"
+  chmod 600 "$TRANSFER_CA_CERT"
+
+  AGENT_IDS=()
+  for ((index = 1; index <= ${#DISK_PATHS[@]}; index++)); do
+    agent_dir="${DATA_DIR}/agents/agent-${index}"
+    state_db="${agent_dir}/state/agent-state.sqlite3"
+    [[ -s "$state_db" ]] || die "Agent ${index} identity database is missing"
+    identity_json="$(sqlite3 "$state_db" 'SELECT payload FROM system_identity WHERE singleton = 1;' 2>/dev/null || true)"
+    agent_id="$(jq -r '.value.approved.agent_id // empty' <<<"$identity_json")"
+    [[ -n "$agent_id" ]] || die "Agent ${index} has no approved Agent ID"
+    AGENT_IDS[$index]="$agent_id"
+    cert_file="${agent_dir}/replication-certificate-chain.pem"
+    key_file="${agent_dir}/replication-private-key.pem"
+    key_der_file="${agent_dir}/replication-private-key.der"
+    jq -r '.value.certificate.certificate_chain_pem[]' <<<"$identity_json" >"$cert_file"
+    # The Agent issuer is also a trust anchor for Gateway-side mTLS. Append it after extracting
+    # the identity so the same bundle can authenticate every local transfer peer.
+    gateway_issuer="$(extract_second_certificate "$cert_file")"
+    [[ -n "$gateway_issuer" ]] || die "Agent ${index} certificate did not contain a transfer CA"
+    printf '%s\n' "$gateway_issuer" >>"$TRANSFER_CA_CERT"
+    jq -r '.value.private_key[]' <<<"$identity_json" | perl -ne 'chomp; print pack("C", 0 + $_);' >"$key_der_file"
+    openssl pkey -inform DER -in "$key_der_file" -out "$key_file" >/dev/null 2>&1 || die "Agent ${index} private key could not be converted to PEM"
+    [[ -s "$cert_file" && -s "$key_file" ]] || die "Agent ${index} identity did not contain transfer TLS material"
+    chmod 600 "$cert_file" "$key_der_file" "$key_file"
+    digest="$(jq -r '.volume_descriptor_digest' "${agent_dir}/enrollment-token.json")"
+    gateway="$(disk_gateway_for "$index")"
+    gateway_endpoint="http://127.0.0.1:$(gateway_agent_port "$gateway")/"
+    write_agent_config "${agent_dir}/agent.yaml" "$gateway_endpoint" \
+      "$(jq -r '.token_id' "${agent_dir}/enrollment-token.json")" \
+      "${agent_dir}/bootstrap-token" "$digest" "${agent_dir}/state" \
+      "$(disk_path_for "$index")" "$(disk_path_for "$index")/.neoengram-volume-marker" \
+      "$(volume_id_for "$index")" true \
+      "quic://127.0.0.1:$(agent_transfer_port "$index")" \
+      "quic://127.0.0.1:$(gateway_transfer_port "$gateway")" \
+      "$cert_file" "$key_file" "$TRANSFER_CA_CERT"
+  done
+}
+
+start_transfer_gateway() {
+  local index="$1" replica_id="gateway-${1}" replica_dir="${DATA_DIR}/gateways/gateway-${1}"
+  local agent_port control_port peer_port transfer_port cert_file key_file relay_role upstream_server_name
+  local route_index
+  local -a routes=()
+  agent_port="$(gateway_agent_port "$index")"
+  control_port="$(gateway_control_port "$index")"
+  peer_port="$(gateway_peer_port "$index")"
+  transfer_port="$(gateway_transfer_port "$index")"
+  cert_file="${replica_dir}/certificate-chain.pem"
+  key_file="${replica_dir}/bootstrap-key.pem"
+  [[ "$(cat "${replica_dir}/state")" == active ]] || die "${replica_id} is not active"
+  [[ -s "$cert_file" && -s "$key_file" && -s "$TRANSFER_CA_CERT" ]] || die "${replica_id} transfer TLS material is incomplete"
+  if (( index == 1 )); then
+    relay_role=source
+    upstream_server_name=127.0.0.1
+    for ((route_index = 1; route_index <= ${#DISK_PATHS[@]}; route_index++)); do
+      routes+=(--transfer-upstream-route "${AGENT_IDS[$route_index]}=127.0.0.1:$(agent_transfer_port "$route_index")")
+    done
+  else
+    relay_role=target
+    upstream_server_name=127.0.0.1
+    # Target Gateways take the next hop to the single source Gateway. The source Agent
+    # identity remains in the signed ticket and is selected by the source Gateway's directory.
+    for ((route_index = 1; route_index <= ${#DISK_PATHS[@]}; route_index++)); do
+      routes+=(--transfer-upstream-route "${AGENT_IDS[$route_index]}=127.0.0.1:$(gateway_transfer_port 1)")
+    done
+  fi
+  start_process "$replica_id" "$GATEWAY_BIN" --edge-cluster-id "$EDGE_CLUSTER_ID" --gateway-pool-id "$POOL_ID" --gateway-replica-id "$replica_id" \
+    --agent-listen "127.0.0.1:${agent_port}" --control-listen "127.0.0.1:${control_port}" --peer-listen "127.0.0.1:${peer_port}" \
+    --transfer-listen "127.0.0.1:${transfer_port}" --transfer-relay-role "$relay_role" \
+    --transfer-validation-mode development \
+    --transfer-upstream-server-name "$upstream_server_name" "${routes[@]}" \
+    --transfer-tls-certificate-file "$cert_file" --transfer-tls-private-key-file "$key_file" \
+    --transfer-tls-client-ca-file "$TRANSFER_CA_CERT" --workload-trust-domain "$WORKLOAD_TRUST_DOMAIN" \
+    --central-upstream "$CENTRAL_URL" --log 'neoengram_gateway=info'
+}
+
 write_stack_info() {
   local index disk_total="${#DISK_PATHS[@]}"
   {
@@ -898,7 +1043,7 @@ start_stack() {
   load_saved_topology
   validate_options
   if (( DRY_RUN == 1 )); then print_dry_run; return 0; fi
-  require_cmd curl; require_cmd jq; require_cmd openssl; require_cmd cargo; require_cmd perl
+  require_cmd curl; require_cmd jq; require_cmd sqlite3; require_cmd openssl; require_cmd cargo; require_cmd perl
   DATA_DIR="$(normalize_directory data-dir "$DATA_DIR" 1)"
   for ((index = 1; index <= ${#DISK_PATHS[@]}; index++)); do
     DISK_PATHS[$((index - 1))]="$(normalize_directory "disk-${index}" "$(disk_path_for "$index")" 1)"
@@ -910,7 +1055,9 @@ start_stack() {
   chmod 700 "$DATA_DIR" "${DATA_DIR}/keyring" "${DATA_DIR}/gateways" "${DATA_DIR}/agents" "${DATA_DIR}/logs" "${DATA_DIR}/pids"
   write_enrollment_keyring "${DATA_DIR}/keyring/enrollment-keyring.json"
   write_dev_ca "${DATA_DIR}/keyring/dev-ca-key.pem" "${DATA_DIR}/keyring/dev-ca.pem"
-  CA_CERT="${DATA_DIR}/keyring/dev-ca.pem"; CENTRAL_URL="http://127.0.0.1:${CENTRAL_PORT}"; export CENTRAL_URL CA_CERT
+  COMMAND_TRUST_BUNDLE="${DATA_DIR}/keyring/central-command-trust.json"
+  write_command_trust_bundle "$COMMAND_TRUST_BUNDLE"
+  CA_CERT="${DATA_DIR}/keyring/dev-ca.pem"; CENTRAL_URL="http://127.0.0.1:${CENTRAL_PORT}"; export CENTRAL_URL CA_CERT COMMAND_TRUST_BUNDLE
   STARTUP_IN_PROGRESS=1
   start_process central "$CENTRAL_BIN" --bind "127.0.0.1:${CENTRAL_PORT}" --authority-dir "${DATA_DIR}/authority" \
     --agent-enrollment-enabled --agent-enrollment-keyring-file "${DATA_DIR}/keyring/enrollment-keyring.json" \
@@ -938,6 +1085,23 @@ start_stack() {
       log "Agent ${index} enrollment is pending approval; rerun with --auto-approve for local approval"
     fi
   done
+  if (( AUTO_APPROVE == 1 && ${#DISK_PATHS[@]} > 0 )); then
+    # Enrollment establishes the Agent URI used by transfer mTLS. Reconfigure the approved
+    # identities only after Central has assigned those IDs, then restart the local data plane.
+    for ((index = 1; index <= ${#DISK_PATHS[@]}; index++)); do stop_process "agent-${index}"; done
+    prepare_transfer_materials
+    TRANSFER_PLANE_CONFIGURED=1
+    for ((index = 1; index <= GATEWAYS; index++)); do
+      stop_process "gateway-${index}"
+      start_transfer_gateway "$index"
+      wait_http "http://127.0.0.1:$(gateway_agent_port "$index")/health/live" "$WAIT_SECONDS" || die "gateway-${index} did not become live after transfer setup"
+      wait_http "http://127.0.0.1:$(gateway_agent_port "$index")/health/ready" "$WAIT_SECONDS" || die "gateway-${index} control session is not ready after transfer setup"
+    done
+    for ((index = 1; index <= ${#DISK_PATHS[@]}; index++)); do
+      start_process "agent-${index}" "$AGENT_BIN" run --config "${DATA_DIR}/agents/agent-${index}/agent.yaml" --development-directory-probe
+      wait_agent_ready "${DATA_DIR}/agents/agent-${index}/state" "$AGENT_BIN" "$WAIT_SECONDS" || die "Agent ${index} did not become ready with replication enabled; see $(log_file_for "agent-${index}")"
+    done
+  fi
   write_stack_info; STARTUP_IN_PROGRESS=0
   log "stack started; Central: ${CENTRAL_URL}"
   log "use 'bash scripts/dev-stack.sh status --data-dir ${DATA_DIR}' to inspect processes"

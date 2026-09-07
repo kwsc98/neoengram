@@ -29,9 +29,10 @@ use neoengram_domain::protocol::{
     GatewayOpaqueBytes, GatewayPeerDirectory, GatewayPeerForwardAccepted,
     GatewayPeerForwardRequest, GatewayPoolId, GatewayReplicaHeartbeat, GatewayReplicaHello,
     GatewayReplicaId, GatewayRouteLeaseGranted, GatewayRouteLeaseRequest, GatewayS3ReadRevocation,
-    MessageId, RequestId, RouteGeneration, SequenceNumber, SessionGeneration, TraceId, UnixMillis,
-    AGENT_ROUTE_LEASE_RENEW_INTERVAL_MS, AGENT_ROUTE_LEASE_TTL_MS, CURRENT_WIRE_VERSION,
-    MAX_CONTROL_MESSAGE_BYTES, MAX_GATEWAY_STREAM_CHUNK_BYTES, MAX_METADATA_PAGE_BYTES,
+    MessageId, RequestId, RouteGeneration, SequenceNumber, SessionGeneration, TraceId,
+    TransportValidationProfile, UnixMillis, AGENT_ROUTE_LEASE_RENEW_INTERVAL_MS,
+    AGENT_ROUTE_LEASE_TTL_MS, CURRENT_WIRE_VERSION, MAX_CONTROL_MESSAGE_BYTES,
+    MAX_GATEWAY_STREAM_CHUNK_BYTES, MAX_METADATA_PAGE_BYTES,
 };
 use tokio::{
     sync::{broadcast, mpsc, oneshot, watch, Mutex, OwnedSemaphorePermit},
@@ -350,6 +351,23 @@ impl GatewayTunnel {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_validation_mode(
+        identity: GatewayIdentity,
+        validation_mode: TransportValidationProfile,
+    ) -> Self {
+        let fence = QuicTransferFence::new(
+            identity.gateway_pool_id.clone(),
+            identity.edge_cluster_id.clone(),
+        )
+        .with_validation_mode(validation_mode);
+        Self::with_peer_forwarder_and_transfer_fence(
+            identity,
+            Arc::new(UnavailablePeerForwarder),
+            Some(fence),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_peer_forwarder_and_transfer_fence(
         identity: GatewayIdentity,
         peer_forwarder: Arc<dyn PeerForwarder>,
@@ -628,6 +646,7 @@ impl GatewayTunnel {
         if self.is_draining() {
             return false;
         }
+        let development = self.transfer_validation_mode().is_development();
         let now = now_unix_ms();
         self.state
             .routes
@@ -636,8 +655,8 @@ impl GatewayTunnel {
             .get(connection_id)
             .is_some_and(|route| {
                 &route.agent_id == agent_id
-                    && route.session_generation == session_generation
-                    && route.route_generation == route_generation
+                    && (development || route.session_generation == session_generation)
+                    && (development || route.route_generation == route_generation)
                     && route.lease_expires_at_unix_ms.get() > now.get()
             })
     }
@@ -655,6 +674,7 @@ impl GatewayTunnel {
         {
             return false;
         }
+        let development = self.transfer_validation_mode().is_development();
         let now = now_unix_ms();
         self.state
             .routes
@@ -663,10 +683,17 @@ impl GatewayTunnel {
             .get(&ticket.agent_connection_id)
             .is_some_and(|route| {
                 route.agent_id == ticket.agent_id
-                    && route.session_generation == ticket.session_generation
-                    && route.route_generation == ticket.route_generation
+                    && (development || route.session_generation == ticket.session_generation)
+                    && (development || route.route_generation == ticket.route_generation)
                     && route.lease_expires_at_unix_ms.get() > now.get()
             })
+    }
+
+    pub(crate) fn transfer_validation_mode(&self) -> TransportValidationProfile {
+        self.state.transfer_fence.as_ref().map_or(
+            TransportValidationProfile::Strict,
+            QuicTransferFence::validation_mode,
+        )
     }
 
     #[cfg(test)]

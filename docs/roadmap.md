@@ -26,6 +26,8 @@ G2 的 P2P 对象物化 v2 已进入 Domain、Authority、Central planner/API、
 及 availability 维度已有代码、schema 和 InMemory/SQLite 契约测试。当前仍是迁移中状态：v1 replication/PlacementSet
 表和 mapper、旧 Assignment/report 路径仅作为私有拒绝/迁移残留；真实跨 Gateway route、三 Agent 多源失败恢复、背压/配额、
 生产凭据和跨节点 E2E 尚未验收。路线中的“已实现”不包含这些未验收部分。
+传输层现在提供显式 `strict`/loopback-only `development` 校验 profile；development 仅用于打通本地编排，
+不改变 ticket、签名、帧、期限、对象完整性和 Central authority 校验，也不构成生产数据面证据。
 
 ## 1. 产品目标
 
@@ -260,6 +262,7 @@ feature。core 执行可验证 package，CLI 因依赖 workspace-private crates 
    Receipt/CAS/重规划契约以及 Agent/Gateway 的 source/target stream、bounded relay、目标 staging/checkpoint 已有
    代码和测试；v1 replication 表/mapper、旧 Assignment/report 仅作为私有迁移残留，v2 主链路不读取它们。真实跨 Gateway route、生产
    凭据、背压/配额、durability receipt 的跨节点闭环、fetch/clone/push/pull 或三 Agent 多源失败恢复仍待验收。
+   loopback development profile 只降低部署身份/generation 造成的编排噪声，不能替代 strict 验收。
 3. **文件语义不完整**：当前模型未保存 POSIX mode、符号链接、xattr、ACL 或 sparse 信息。
 4. **规模热点仍存在**：Standalone 的部分 SQLite/worktree workspace snapshot 和 GC 仍可能物化完整索引或引用集；
    loose object 目录仍是平铺扫描，完整文件缓存没有 quota/lease；远端分页、租约和 GC 尚未实现。

@@ -39,7 +39,7 @@ pub use client::{EnrollmentClient, EnrollmentClientError, ReqwestEnrollmentClien
 pub use command_trust::CentralCommandTrustBundle;
 pub use config::{
     AgentConfig, LoggingConfig, LoggingFormat, PvcReference, RegistrationConfig, ReplicationConfig,
-    SessionConfig, StorageAccessMode, StorageBackendType, StorageConfig,
+    SessionConfig, StorageAccessMode, StorageBackendType, StorageConfig, ValidationMode,
 };
 pub use error::{AgentDaemonError, AgentDaemonResult};
 pub use execution::{

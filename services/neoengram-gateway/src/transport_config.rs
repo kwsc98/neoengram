@@ -7,8 +7,12 @@ use std::{
 
 use clap::Args;
 use neoengram_domain::protocol::MATERIALIZATION_TRANSFER_ALPN_V2;
-use rustls::{client::ClientConfig, server::WebPkiClientVerifier, RootCertStore, ServerConfig};
-use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+use rustls::{
+    client::{danger::ServerCertVerifier, ClientConfig},
+    server::{danger::ClientCertVerifier, WebPkiClientVerifier},
+    RootCertStore, ServerConfig,
+};
+use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use x509_parser::{
     extensions::GeneralName,
     prelude::{FromDer, X509Certificate},
@@ -122,6 +126,15 @@ impl GatewayTransferTlsConfig {
         &self,
     ) -> Result<Arc<ClientConfig>, GatewayTransportConfigError> {
         self.as_workload_transport().load_quic_client_config()
+    }
+
+    /// Builds the outbound policy for a source Agent hop. Agent workload leaves intentionally
+    /// carry `clientAuth`: the ticket-bound SPIFFE identity is checked after QUIC connects, so
+    /// this verifier checks only the CA chain, validity window, and client-auth EKU here.
+    pub(crate) fn load_agent_client_config(
+        &self,
+    ) -> Result<Arc<ClientConfig>, GatewayTransportConfigError> {
+        self.as_workload_transport().load_quic_agent_client_config()
     }
 }
 
@@ -532,6 +545,53 @@ impl GatewayTransportConfig {
         Ok(Arc::new(client))
     }
 
+    pub(crate) fn load_quic_agent_client_config(
+        &self,
+    ) -> Result<Arc<ClientConfig>, GatewayTransportConfigError> {
+        let (Some(certificate_path), Some(private_key_path), Some(ca_path)) = (
+            &self.tls_certificate_file,
+            &self.tls_private_key_file,
+            &self.tls_client_ca_file,
+        ) else {
+            return Err(GatewayTransportConfigError::MissingClientCa);
+        };
+        let certificate_pem =
+            read_bounded_file(certificate_path, "certificate", MAX_CERTIFICATE_CHAIN_BYTES)?;
+        let private_key_pem =
+            read_bounded_file(private_key_path, "private key", MAX_PRIVATE_KEY_BYTES)?;
+        let certificates = CertificateDer::pem_slice_iter(&certificate_pem)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| GatewayTransportConfigError::InvalidFile {
+                kind: "certificate",
+                message: error.to_string(),
+            })?;
+        if certificates.is_empty() {
+            return Err(GatewayTransportConfigError::EmptyCertificateChain);
+        }
+        let private_key = PrivateKeyDer::from_pem_slice(&private_key_pem)
+            .map_err(|_| GatewayTransportConfigError::MissingPrivateKey)?;
+        let roots = load_client_roots(ca_path)?;
+        let provider: Arc<rustls::crypto::CryptoProvider> =
+            rustls::crypto::aws_lc_rs::default_provider().into();
+        let client_auth =
+            WebPkiClientVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&provider))
+                .build()
+                .map_err(|error| {
+                    GatewayTransportConfigError::InvalidTlsIdentity(error.to_string())
+                })?;
+        let verifier = Arc::new(AgentServerCertificateVerifier { client_auth });
+        let mut client = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|error| GatewayTransportConfigError::InvalidTlsIdentity(error.to_string()))?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_client_auth_cert(certificates, private_key)
+            .map_err(|error| GatewayTransportConfigError::InvalidTlsIdentity(error.to_string()))?;
+        client.resumption = rustls::client::Resumption::disabled();
+        client.alpn_protocols = vec![MATERIALIZATION_TRANSFER_ALPN_V2.as_bytes().to_vec()];
+        Ok(Arc::new(client))
+    }
+
     /// Builds the server-only TLS policy used by the public console/S3 listener.  The public
     /// listener intentionally has no workload client-CA verifier; workload mTLS remains confined
     /// to the Agent, Central-control, and peer listeners above.
@@ -581,6 +641,62 @@ impl GatewayTransportConfig {
     ) -> Result<Option<Arc<ServerConfig>>, GatewayTransportConfigError> {
         self.load_server_configs(listeners)
             .map(|configs| configs[1].clone())
+    }
+}
+
+/// Adapts rustls' client-certificate path verifier for the Agent source-listener hop. This does
+/// not skip PKI validation: `WebPkiClientVerifier` still enforces the trust anchor, signatures,
+/// wall-clock validity, and `clientAuth` EKU. The application binds the authenticated leaf's sole
+/// SPIFFE URI to the signed transfer ticket immediately after the QUIC handshake.
+#[derive(Debug)]
+struct AgentServerCertificateVerifier {
+    client_auth: Arc<dyn ClientCertVerifier>,
+}
+
+impl ServerCertVerifier for AgentServerCertificateVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        self.client_auth
+            .verify_client_cert(end_entity, intermediates, now)?;
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signed: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.client_auth
+            .verify_tls12_signature(message, certificate, signed)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signed: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.client_auth
+            .verify_tls13_signature(message, certificate, signed)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.client_auth.supported_verify_schemes()
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        self.client_auth.requires_raw_public_keys()
+    }
+
+    fn root_hint_subjects(&self) -> Option<&[rustls::DistinguishedName]> {
+        Some(self.client_auth.root_hint_subjects())
     }
 }
 

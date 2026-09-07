@@ -18,7 +18,8 @@ use async_trait::async_trait;
 use neoengram_domain::protocol::{
     AgentId, EdgeClusterId, GatewayPoolId, MaterializationBatchTicket, RouteGeneration,
     SessionGeneration, SignedMaterializationBatchTicket, SignedTransferTicket, TransferFrame,
-    TransferFrameError, TransferTicket, MATERIALIZATION_TRANSFER_ALPN_V2, MAX_TRANSFER_FRAME_BYTES,
+    TransferFrameError, TransferTicket, TransportValidationProfile,
+    MATERIALIZATION_TRANSFER_ALPN_V2, MAX_TRANSFER_FRAME_BYTES,
 };
 use quinn::{Connection, Endpoint, Incoming, RecvStream, SendStream};
 use rustls_pki_types::CertificateDer;
@@ -72,6 +73,10 @@ pub(crate) enum QuicTransferError {
     Fenced(&'static str),
     #[error("QUIC TLS configuration is invalid: {0}")]
     Tls(#[from] quinn::crypto::rustls::NoInitialCipherSuite),
+    #[error("Agent transfer TLS client configuration is required for a source relay")]
+    MissingAgentClientConfig,
+    #[error("workload trust domain is required for outbound transfer identity validation")]
+    MissingWorkloadTrustDomain,
     #[error("QUIC transfer I/O timed out: {0}")]
     Timeout(&'static str),
     #[error("failed to bind QUIC listener: {0}")]
@@ -86,6 +91,14 @@ pub(crate) enum TransferRelayRole {
     Target,
     Source,
 }
+
+/// Controls application-level transfer admission checks. TLS is always enabled for a configured
+/// QUIC transfer listener; the development profile only relaxes the URI/EKU and generation fences
+/// so a loopback stack can exercise the object workflow before a full workload identity setup is
+/// available. Strict remains the default and is required for non-loopback deployments.
+/// Gateway-local name retained for source compatibility. The value is shared with Agent and
+/// Central so all transports describe the same strict/development boundary.
+pub(crate) type TransferValidationMode = TransportValidationProfile;
 
 /// Generation and identity fences applied before any object frame is accepted.  A listener has
 /// no storage handle; the caller can update this value when Central replaces a route/session.
@@ -107,6 +120,7 @@ struct TransferFenceState {
 #[derive(Debug, Clone)]
 pub(crate) struct QuicTransferFence {
     role: TransferRelayRole,
+    validation_mode: TransferValidationMode,
     gateway_pool_id: GatewayPoolId,
     edge_cluster_id: EdgeClusterId,
     /// SPIFFE trust domain used by the workload certificate identity fence. The Gateway binary
@@ -130,11 +144,23 @@ impl QuicTransferFence {
     ) -> Self {
         Self {
             role,
+            validation_mode: TransferValidationMode::Strict,
             gateway_pool_id,
             edge_cluster_id,
             workload_trust_domain: None,
             state: Arc::new(RwLock::new(TransferFenceState::default())),
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_validation_mode(mut self, mode: TransferValidationMode) -> Self {
+        self.validation_mode = mode;
+        self
+    }
+
+    #[must_use]
+    pub(crate) const fn validation_mode(&self) -> TransferValidationMode {
+        self.validation_mode
     }
 
     /// Binds transfer peer certificate validation to the configured SPIFFE trust domain.
@@ -314,6 +340,9 @@ impl QuicTransferFence {
     }
 
     fn validate(&self, ticket: &TransferTicket) -> Result<(), QuicTransferError> {
+        if self.validation_mode == TransferValidationMode::Development {
+            return Ok(());
+        }
         let (endpoint, session, mount, route, prefix) = match self.role {
             TransferRelayRole::Target => (
                 &ticket.target,
@@ -392,6 +421,9 @@ impl QuicTransferFence {
         ticket
             .validate()
             .map_err(|_| QuicTransferError::Fenced("materialization_ticket"))?;
+        if self.validation_mode == TransferValidationMode::Development {
+            return Ok(());
+        }
         let (agent_id, gateway_pool_id, edge_cluster_id, session, mount, route, prefix) =
             match self.role {
                 TransferRelayRole::Target => (
@@ -654,6 +686,16 @@ pub(crate) struct QuinnTransferConnectionFactory {
     upstream: Option<SocketAddr>,
     upstreams: TransferUpstreamDirectory,
     server_name: Arc<str>,
+    /// Standard Gateway-to-Gateway mTLS policy. This verifier enforces serverAuth and the
+    /// configured ServerName and is never used for a source Agent listener.
+    client_config: quinn::ClientConfig,
+    /// Agent source-listener policy. Agent leaves intentionally carry clientAuth only and do not
+    /// advertise the deployment's DNS/IP name. It is selected only for a Source relay, and the
+    /// resulting peer identity is bound to the signed ticket below.
+    agent_client_config: Option<quinn::ClientConfig>,
+    relay_role: Option<TransferRelayRole>,
+    validation_mode: TransferValidationMode,
+    workload_trust_domain: Option<Arc<str>>,
 }
 
 impl fmt::Debug for QuinnTransferConnectionFactory {
@@ -663,6 +705,11 @@ impl fmt::Debug for QuinnTransferConnectionFactory {
             .field("upstream", &self.upstream)
             .field("upstream_routes", &self.upstreams)
             .field("server_name", &self.server_name)
+            .field("relay_role", &self.relay_role)
+            .field(
+                "workload_trust_domain",
+                &self.workload_trust_domain.as_deref(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -696,6 +743,15 @@ impl QuinnTransferConnectionFactory {
         tls_config: Arc<rustls::ClientConfig>,
         upstreams: TransferUpstreamDirectory,
     ) -> Result<Self, QuicTransferError> {
+        Self::bind_with_directory_legacy(upstream, server_name, tls_config, upstreams)
+    }
+
+    fn bind_with_directory_legacy(
+        upstream: Option<SocketAddr>,
+        server_name: impl Into<Arc<str>>,
+        tls_config: Arc<rustls::ClientConfig>,
+        upstreams: TransferUpstreamDirectory,
+    ) -> Result<Self, QuicTransferError> {
         let bind_address = SocketAddr::new(
             match upstream
                 .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
@@ -706,18 +762,68 @@ impl QuinnTransferConnectionFactory {
             },
             0,
         );
-        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from((*tls_config).clone())?;
+        let client_config = quinn_client_config(tls_config)?;
         let mut endpoint = Endpoint::client(bind_address)?;
-        let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
-        let mut transport = quinn::TransportConfig::default();
-        transport.keep_alive_interval(Some(TRANSFER_KEEP_ALIVE_INTERVAL));
-        client_config.transport_config(Arc::new(transport));
-        endpoint.set_default_client_config(client_config);
+        endpoint.set_default_client_config(client_config.clone());
         Ok(Self {
             endpoint,
             upstream,
             upstreams,
             server_name: server_name.into(),
+            client_config,
+            agent_client_config: None,
+            relay_role: None,
+            validation_mode: TransferValidationMode::Strict,
+            workload_trust_domain: None,
+        })
+    }
+
+    /// Builds a role-aware connector for a production relay. Target Gateways use the standard
+    /// Gateway client policy for their source-Gateway hop. Source Gateways use the dedicated Agent
+    /// policy because the source Agent listener presents a clientAuth-only workload leaf. The
+    /// trust domain is mandatory here: without it, a CA-valid peer could not be bound to the
+    /// signed source endpoint and this constructor fails closed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bind_with_directory_and_role(
+        upstream: Option<SocketAddr>,
+        server_name: impl Into<Arc<str>>,
+        tls_config: Arc<rustls::ClientConfig>,
+        agent_tls_config: Option<Arc<rustls::ClientConfig>>,
+        relay_role: TransferRelayRole,
+        validation_mode: TransferValidationMode,
+        workload_trust_domain: Option<Arc<str>>,
+        upstreams: TransferUpstreamDirectory,
+    ) -> Result<Self, QuicTransferError> {
+        let workload_trust_domain = workload_trust_domain
+            .filter(|domain| !domain.is_empty())
+            .ok_or(QuicTransferError::MissingWorkloadTrustDomain)?;
+        if relay_role == TransferRelayRole::Source && agent_tls_config.is_none() {
+            return Err(QuicTransferError::MissingAgentClientConfig);
+        }
+        let bind_address = SocketAddr::new(
+            match upstream
+                .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+                .ip()
+            {
+                IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            },
+            0,
+        );
+        let client_config = quinn_client_config(tls_config)?;
+        let agent_client_config = agent_tls_config.map(quinn_client_config).transpose()?;
+        let mut endpoint = Endpoint::client(bind_address)?;
+        endpoint.set_default_client_config(client_config.clone());
+        Ok(Self {
+            endpoint,
+            upstream,
+            upstreams,
+            server_name: server_name.into(),
+            client_config,
+            agent_client_config,
+            relay_role: Some(relay_role),
+            validation_mode,
+            workload_trust_domain: Some(workload_trust_domain),
         })
     }
 
@@ -740,24 +846,89 @@ impl QuinnTransferConnectionFactory {
         &self,
         upstream: SocketAddr,
         deadline_unix_ms: u64,
+        expected_peer: Option<TransferPeerExpectation<'_>>,
     ) -> Result<Connection, QuicTransferError> {
         let remaining = deadline_unix_ms.saturating_sub(unix_millis_now());
         if remaining == 0 {
             return Err(QuicTransferError::Expired);
         }
-        let connecting = self.endpoint.connect(upstream, self.server_name.as_ref())?;
-        tokio::time::timeout(Duration::from_millis(remaining), connecting)
+        let config = match self.relay_role {
+            Some(TransferRelayRole::Source) => self
+                .agent_client_config
+                .clone()
+                .ok_or(QuicTransferError::MissingAgentClientConfig)?,
+            _ => self.client_config.clone(),
+        };
+        let connecting = self
+            .endpoint
+            .connect_with(config, upstream, self.server_name.as_ref())?;
+        let connection = tokio::time::timeout(Duration::from_millis(remaining), connecting)
             .await
             .map_err(|_| QuicTransferError::Deadline)?
-            .map_err(QuicTransferError::Connection)
+            .map_err(QuicTransferError::Connection)?;
+        if self.validation_mode == TransferValidationMode::Strict {
+            if let Some(expected_peer) = expected_peer {
+                let trust_domain = self
+                    .workload_trust_domain
+                    .as_deref()
+                    .ok_or(QuicTransferError::MissingWorkloadTrustDomain)?;
+                let peer_identity = connection.peer_identity();
+                let peer_certificates = peer_identity
+                    .as_deref()
+                    .and_then(|identity| identity.downcast_ref::<Vec<CertificateDer<'static>>>());
+                let peer_certificates =
+                    peer_certificates.ok_or(QuicTransferError::MissingPeerIdentity)?;
+                validate_transfer_peer_certificate_with_trust_domain(
+                    peer_certificates,
+                    trust_domain,
+                    expected_peer,
+                )?;
+            }
+        }
+        Ok(connection)
     }
+
+    fn outbound_peer_expectation<'a>(
+        &self,
+        source_edge_cluster_id: &'a EdgeClusterId,
+        source_gateway_pool_id: &'a GatewayPoolId,
+        source_agent_id: &'a AgentId,
+    ) -> Option<TransferPeerExpectation<'a>> {
+        match self.relay_role {
+            Some(TransferRelayRole::Source) => Some(TransferPeerExpectation::Agent {
+                edge_cluster_id: source_edge_cluster_id,
+                agent_id: Some(source_agent_id),
+            }),
+            Some(TransferRelayRole::Target) => Some(TransferPeerExpectation::Gateway {
+                edge_cluster_id: source_edge_cluster_id,
+                gateway_pool_id: source_gateway_pool_id,
+            }),
+            None => None,
+        }
+    }
+}
+
+fn quinn_client_config(
+    tls_config: Arc<rustls::ClientConfig>,
+) -> Result<quinn::ClientConfig, QuicTransferError> {
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from((*tls_config).clone())?;
+    let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(TRANSFER_KEEP_ALIVE_INTERVAL));
+    client_config.transport_config(Arc::new(transport));
+    Ok(client_config)
 }
 
 #[async_trait]
 impl TransferConnectionFactory for QuinnTransferConnectionFactory {
     async fn connect(&self, ticket: &TransferTicket) -> Result<Connection, QuicTransferError> {
         let upstream = self.resolve_upstream(&ticket.source.agent_id)?;
-        self.connect_upstream(upstream, ticket.deadline_unix_ms.get())
+        let expected_peer = self.outbound_peer_expectation(
+            &ticket.source.edge_cluster_id,
+            &ticket.source.gateway_pool_id,
+            &ticket.source.agent_id,
+        );
+        self.connect_upstream(upstream, ticket.deadline_unix_ms.get(), expected_peer)
             .await
     }
 
@@ -766,7 +937,12 @@ impl TransferConnectionFactory for QuinnTransferConnectionFactory {
         ticket: &MaterializationBatchTicket,
     ) -> Result<Connection, QuicTransferError> {
         let upstream = self.resolve_upstream(&ticket.source.agent_id)?;
-        self.connect_upstream(upstream, ticket.deadline_unix_ms.get())
+        let expected_peer = self.outbound_peer_expectation(
+            &ticket.source.edge_cluster_id,
+            &ticket.source.gateway_pool_id,
+            &ticket.source.agent_id,
+        );
+        self.connect_upstream(upstream, ticket.deadline_unix_ms.get(), expected_peer)
             .await
     }
 }
@@ -805,8 +981,8 @@ impl TransferRelay for ConnectedTransferRelay {
         let connection = self.connector.connect(&ticket.ticket).await?;
         let (mut peer_send, mut peer_recv) = connection.open_bi().await?;
         send_frame(&mut peer_send, &TransferFrame::OpenTransferSigned(ticket)).await?;
-        relay_frames(&mut recv, &mut send, &mut peer_recv, &mut peer_send).await?;
-        finish_relay_streams(&mut send, &mut peer_send).await
+        let terminal = relay_frames(&mut recv, &mut send, &mut peer_recv, &mut peer_send).await?;
+        finish_relay_streams(&mut send, &mut peer_send, terminal).await
     }
 
     async fn relay_materialization(
@@ -825,29 +1001,45 @@ impl TransferRelay for ConnectedTransferRelay {
             &TransferFrame::OpenMaterializationSigned(ticket),
         )
         .await?;
-        relay_frames(&mut recv, &mut send, &mut peer_recv, &mut peer_send).await?;
-        finish_relay_streams(&mut send, &mut peer_send).await
+        let terminal = relay_frames(&mut recv, &mut send, &mut peer_recv, &mut peer_send).await?;
+        finish_relay_streams(&mut send, &mut peer_send, terminal).await
     }
 }
 
 async fn finish_relay_streams(
     left_send: &mut SendStream,
     right_send: &mut SendStream,
+    terminal: RelayTerminalDirection,
 ) -> Result<(), QuicTransferError> {
-    // Finish both directions before waiting for acknowledgements. A peer can stop one stream as
-    // soon as it receives the terminal frame; retaining the second finish attempt ensures that a
-    // fast stop on one hop does not leave the other hop half-open.
-    let left_finish = left_send.finish().err();
-    let right_finish = right_send.finish().err();
-    let (left_stopped, right_stopped) =
-        tokio::try_join!(left_send.stopped(), right_send.stopped())?;
-    if let Some(code) = left_stopped.or(right_stopped) {
-        return Err(QuicTransferError::PeerStopped(code));
+    // Finish both directions, but wait only for the stream that carried the terminal application
+    // frame. Waiting on both directions creates a relay-to-relay shutdown cycle because the
+    // opposite receive future was intentionally cancelled once CloseTransfer/TransferError won.
+    let _ = left_send.finish();
+    let _ = right_send.finish();
+    let stopped = match terminal {
+        RelayTerminalDirection::LeftToRight => right_send.stopped().await,
+        RelayTerminalDirection::RightToLeft => left_send.stopped().await,
+    };
+    validate_terminal_delivery(stopped)
+}
+
+fn validate_terminal_delivery(
+    stopped: Result<Option<quinn::VarInt>, quinn::StoppedError>,
+) -> Result<(), QuicTransferError> {
+    match stopped {
+        Ok(None) => Ok(()),
+        // A receiver commonly drops its RecvStream immediately after consuming the terminal
+        // frame. Quinn reports that as STOP_SENDING(0), which is a clean application shutdown.
+        Ok(Some(code)) if code == 0_u32.into() => Ok(()),
+        Ok(Some(code)) => Err(QuicTransferError::PeerStopped(code)),
+        // The next relay hop drops its last connection handle after it has delivered the same
+        // terminal frame. Preserve that code-0 application close as successful drain while still
+        // rejecting transport loss, timeout, reset, and non-zero application closes.
+        Err(quinn::StoppedError::ConnectionLost(quinn::ConnectionError::ApplicationClosed(
+            close,
+        ))) if close.error_code == 0_u32.into() => Ok(()),
+        Err(error) => Err(QuicTransferError::Stopped(error)),
     }
-    if let Some(error) = left_finish.or(right_finish) {
-        return Err(error.into());
-    }
-    Ok(())
 }
 
 /// Policy listener.  It intentionally contains no storage handle or Central client.  Without a
@@ -1048,6 +1240,22 @@ fn validate_transfer_peer_certificate(
     fence: &QuicTransferFence,
     expectation: TransferPeerExpectation<'_>,
 ) -> Result<(), QuicTransferError> {
+    let trust_domain = fence
+        .workload_trust_domain
+        .as_deref()
+        .ok_or(QuicTransferError::InvalidPeerIdentity)?;
+    validate_transfer_peer_certificate_with_trust_domain(
+        peer_certificates,
+        trust_domain,
+        expectation,
+    )
+}
+
+fn validate_transfer_peer_certificate_with_trust_domain(
+    peer_certificates: &[CertificateDer<'static>],
+    trust_domain: &str,
+    expectation: TransferPeerExpectation<'_>,
+) -> Result<(), QuicTransferError> {
     let leaf = peer_certificates
         .first()
         .ok_or(QuicTransferError::MissingPeerIdentity)?;
@@ -1089,10 +1297,6 @@ fn validate_transfer_peer_certificate(
         return Err(QuicTransferError::InvalidPeerIdentity);
     }
     let url = Url::parse(value).map_err(|_| QuicTransferError::InvalidPeerIdentity)?;
-    let trust_domain = fence
-        .workload_trust_domain
-        .as_deref()
-        .ok_or(QuicTransferError::InvalidPeerIdentity)?;
     if url.scheme() != "spiffe"
         || !url.username().is_empty()
         || url.password().is_some()
@@ -1154,6 +1358,12 @@ fn validate_connection_handshake(
     ticket: &TransferTicket,
     fence: Option<&QuicTransferFence>,
 ) -> Result<(), QuicTransferError> {
+    // Keep the protocol-level shape check active in every profile. Development mode only defers
+    // deployment-owned identity and generation fences; it must not turn malformed capabilities
+    // into accepted transfer openings.
+    ticket
+        .validate()
+        .map_err(|_| QuicTransferError::Fenced("transfer_ticket"))?;
     let handshake = connection
         .handshake_data()
         .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
@@ -1168,7 +1378,9 @@ fn validate_connection_handshake(
     if peer_certificates.is_none() {
         return Err(QuicTransferError::MissingPeerIdentity);
     }
-    if let Some(fence) = fence {
+    if let Some(fence) =
+        fence.filter(|fence| fence.validation_mode == TransferValidationMode::Strict)
+    {
         validate_transfer_peer_certificate(
             peer_certificates.expect("peer identity was checked above"),
             fence,
@@ -1178,7 +1390,9 @@ fn validate_connection_handshake(
     if ticket.deadline_unix_ms.get() <= unix_millis_now() {
         return Err(QuicTransferError::Expired);
     }
-    if let Some(fence) = fence {
+    if let Some(fence) =
+        fence.filter(|fence| fence.validation_mode == TransferValidationMode::Strict)
+    {
         fence.validate(ticket)?;
     }
     Ok(())
@@ -1206,7 +1420,9 @@ fn validate_preflight_handshake(
     if peer_certificates.is_none() {
         return Err(QuicTransferError::MissingPeerIdentity);
     }
-    if let Some(fence) = fence {
+    if let Some(fence) =
+        fence.filter(|fence| fence.validation_mode == TransferValidationMode::Strict)
+    {
         validate_transfer_peer_certificate(
             peer_certificates.expect("peer identity was checked above"),
             fence,
@@ -1238,7 +1454,9 @@ fn validate_materialization_handshake(
     if peer_certificates.is_none() {
         return Err(QuicTransferError::MissingPeerIdentity);
     }
-    if let Some(fence) = fence {
+    if let Some(fence) =
+        fence.filter(|fence| fence.validation_mode == TransferValidationMode::Strict)
+    {
         validate_transfer_peer_certificate(
             peer_certificates.expect("peer identity was checked above"),
             fence,
@@ -1312,6 +1530,12 @@ async fn relay_direction(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelayTerminalDirection {
+    LeftToRight,
+    RightToLeft,
+}
+
 /// Relays one bounded control stream in both directions with QUIC backpressure.  The first side
 /// to close terminates the relay and the caller is responsible for closing the connection; this
 /// prevents a half-open source from keeping a target transfer alive indefinitely.
@@ -1320,12 +1544,18 @@ pub(crate) async fn relay_frames(
     left_send: &mut SendStream,
     right_recv: &mut RecvStream,
     right_send: &mut SendStream,
-) -> Result<(), QuicTransferError> {
+) -> Result<RelayTerminalDirection, QuicTransferError> {
     let left_to_right = relay_direction(left_recv, right_send);
     let right_to_left = relay_direction(right_recv, left_send);
     tokio::select! {
-        result = left_to_right => result,
-        result = right_to_left => result,
+        result = left_to_right => {
+            result?;
+            Ok(RelayTerminalDirection::LeftToRight)
+        },
+        result = right_to_left => {
+            result?;
+            Ok(RelayTerminalDirection::RightToLeft)
+        },
     }
 }
 
@@ -1488,6 +1718,51 @@ mod tests {
     };
     use rustls::{server::WebPkiClientVerifier, ClientConfig, RootCertStore, ServerConfig};
     use rustls_pki_types::PrivatePkcs8KeyDer;
+
+    #[test]
+    fn terminal_delivery_accepts_ack_and_normal_peer_shutdown() {
+        assert!(validate_terminal_delivery(Ok(None)).is_ok());
+        assert!(validate_terminal_delivery(Ok(Some(0_u32.into()))).is_ok());
+        assert!(
+            validate_terminal_delivery(Err(quinn::StoppedError::ConnectionLost(
+                quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                    error_code: 0_u32.into(),
+                    reason: bytes::Bytes::new(),
+                }),
+            )))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn terminal_delivery_rejects_abnormal_peer_shutdown() {
+        assert!(matches!(
+            validate_terminal_delivery(Ok(Some(7_u32.into()))),
+            Err(QuicTransferError::PeerStopped(code)) if code == 7_u32.into()
+        ));
+        assert!(matches!(
+            validate_terminal_delivery(Err(quinn::StoppedError::ConnectionLost(
+                quinn::ConnectionError::Reset,
+            ))),
+            Err(QuicTransferError::Stopped(
+                quinn::StoppedError::ConnectionLost(quinn::ConnectionError::Reset)
+            ))
+        ));
+        let abnormal_close = validate_terminal_delivery(Err(quinn::StoppedError::ConnectionLost(
+            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                error_code: 9_u32.into(),
+                reason: bytes::Bytes::new(),
+            }),
+        )));
+        assert!(matches!(
+            abnormal_close,
+            Err(QuicTransferError::Stopped(
+                quinn::StoppedError::ConnectionLost(quinn::ConnectionError::ApplicationClosed(
+                    quinn::ApplicationClose { error_code, .. }
+                ))
+            )) if error_code == 9_u32.into()
+        ));
+    }
 
     fn ticket() -> TransferTicket {
         let target_pool = GatewayPoolId::new("gateway-target").unwrap();

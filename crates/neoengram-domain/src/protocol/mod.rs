@@ -26,6 +26,7 @@ pub(crate) mod schema;
 pub mod task;
 mod transfer;
 pub(crate) mod validation;
+mod validation_profile;
 
 pub use crate::core::ContentDigest;
 pub use action_registry::*;
@@ -72,6 +73,7 @@ pub use schema::{
 };
 pub use transfer::*;
 pub use validation::decode_bounded_unique_json;
+pub use validation_profile::TransportValidationProfile;
 
 /// The only wire version emitted by the current protocol.
 pub const CURRENT_WIRE_VERSION: ProtocolVersion = ProtocolVersion::new(1);

@@ -27,8 +27,9 @@ use hyper::{
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use neoengram_domain::protocol::{
     CertificateGeneration, ContentDigest, GatewayControlFrame, GatewayControlMessage,
-    GatewayControlNdjsonDecoder, GatewayReplicaId, ProtocolVersion, RequestId, UnixMillis,
-    AGENT_ROUTE_LEASE_RENEW_INTERVAL_MS, AGENT_ROUTE_LEASE_TTL_MS, GATEWAY_CONTROL_CHANNEL_PATH,
+    GatewayControlNdjsonDecoder, GatewayReplicaId, ProtocolVersion, RequestId,
+    TransportValidationProfile, UnixMillis, AGENT_ROUTE_LEASE_RENEW_INTERVAL_MS,
+    AGENT_ROUTE_LEASE_TTL_MS, GATEWAY_CONTROL_CHANNEL_PATH,
 };
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName};
@@ -170,6 +171,7 @@ pub struct GatewayConnectorConfig {
     tls: Option<Arc<ClientConfig>>,
     workload_trust_domain: Option<Arc<str>>,
     allow_loopback_http: bool,
+    validation_profile: TransportValidationProfile,
 }
 
 impl fmt::Debug for GatewayConnectorConfig {
@@ -179,6 +181,7 @@ impl fmt::Debug for GatewayConnectorConfig {
             .field("tls_configured", &self.tls.is_some())
             .field("workload_trust_domain", &self.workload_trust_domain)
             .field("allow_loopback_http", &self.allow_loopback_http)
+            .field("validation_profile", &self.validation_profile)
             .finish()
     }
 }
@@ -192,6 +195,7 @@ impl GatewayConnectorConfig {
             tls: None,
             workload_trust_domain: None,
             allow_loopback_http: true,
+            validation_profile: TransportValidationProfile::Development,
         }
     }
 
@@ -290,7 +294,21 @@ impl GatewayConnectorConfig {
             tls: Some(Arc::new(tls)),
             workload_trust_domain: Some(Arc::<str>::from(workload_trust_domain)),
             allow_loopback_http,
+            validation_profile: TransportValidationProfile::Strict,
         })
+    }
+
+    /// Selects the shared transport profile. Development still requires a loopback endpoint and
+    /// leaves the TLS chain, server name, client certificate, frame, and deadline checks active.
+    #[must_use]
+    pub fn with_validation_profile(mut self, profile: TransportValidationProfile) -> Self {
+        self.validation_profile = profile;
+        self
+    }
+
+    #[must_use]
+    pub fn validation_profile(&self) -> TransportValidationProfile {
+        self.validation_profile
     }
 
     fn tls(&self) -> Option<Arc<ClientConfig>> {
@@ -673,6 +691,9 @@ impl ReplicaConnector {
             &self.replica.control_endpoint,
             self.config.allows_loopback_http(),
         )?;
+        if self.config.validation_profile().is_development() && !is_loopback_host(&endpoint) {
+            return Err(GatewayConnectorError::InsecureEndpoint);
+        }
         let host = endpoint_host(&endpoint).ok_or_else(|| {
             GatewayConnectorError::Endpoint("Gateway endpoint has no host".into())
         })?;
@@ -710,15 +731,22 @@ impl ReplicaConnector {
                 .map_err(|_| GatewayConnectorError::TlsHandshake("TLS handshake timed out".into()))?
                 .map_err(|error| GatewayConnectorError::TlsHandshake(error.to_string()))?;
                 let peer_certificates = tls_stream.get_ref().1.peer_certificates();
-                let identity = authenticated_replica_from_tls(
-                    &self.replica,
-                    peer_certificates,
-                    self.config.workload_trust_domain().ok_or_else(|| {
-                        GatewayConnectorError::TlsConfiguration(
-                            "workload trust domain is missing".into(),
-                        )
-                    })?,
-                )?;
+                let identity = if self.config.validation_profile().is_strict() {
+                    authenticated_replica_from_tls(
+                        &self.replica,
+                        peer_certificates,
+                        self.config.workload_trust_domain().ok_or_else(|| {
+                            GatewayConnectorError::TlsConfiguration(
+                                "workload trust domain is missing".into(),
+                            )
+                        })?,
+                    )?
+                } else {
+                    // Rustls still authenticates the CA chain, endpoint name, and Central client
+                    // certificate. Development only defers the registry-owned URI/generation
+                    // binding until the local workflow is proven.
+                    authenticated_replica_from_registry(&self.replica)?
+                };
                 let certificate_deadline = gateway_server_certificate_deadline(
                     peer_certificates,
                     self.replica.credential.certificate_not_after_unix_ms,

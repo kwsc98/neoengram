@@ -1400,7 +1400,12 @@ fn build_gateway_connector_config(
             .expect("validated Gateway workload trust domain"),
         config.development,
     )
-    .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+    .map_err(|error| RuntimeError::Configuration(error.to_string()))?
+    .with_validation_profile(if config.development {
+        neoengram_domain::protocol::TransportValidationProfile::Development
+    } else {
+        neoengram_domain::protocol::TransportValidationProfile::Strict
+    });
     Ok(Some(connector))
 }
 

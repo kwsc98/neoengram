@@ -521,7 +521,12 @@ impl TaskState {
                     | Self::Cancelling
             ) | (
                 Self::Waiting,
-                Self::Running | Self::Verifying | Self::Stalled | Self::Failed | Self::Cancelling
+                Self::Queued
+                    | Self::Running
+                    | Self::Verifying
+                    | Self::Stalled
+                    | Self::Failed
+                    | Self::Cancelling
             ) | (
                 Self::Verifying,
                 Self::Running | Self::Succeeded | Self::Stalled | Self::Failed | Self::Cancelling
@@ -2065,6 +2070,21 @@ mod tests {
         assert_eq!(task.task_id, TaskId::new("task-1").unwrap());
         assert_eq!(task.attempt.get(), 2);
         assert_eq!(task.state, TaskState::Queued);
+    }
+
+    #[test]
+    fn waiting_task_with_retryable_issue_can_retry() {
+        let mut task = task(TaskState::Waiting);
+        task.issue = Some(TaskIssue {
+            code: "source_unavailable".to_owned(),
+            message: "source route is not ready".to_owned(),
+            retryable: true,
+            detail: None,
+        });
+        task.retry(UnixMillis::new(2)).unwrap();
+        assert_eq!(task.state, TaskState::Queued);
+        assert_eq!(task.attempt.get(), 2);
+        assert!(task.issue.is_none());
     }
 
     #[test]
